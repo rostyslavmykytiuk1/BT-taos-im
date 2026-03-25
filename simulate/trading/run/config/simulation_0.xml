@@ -12,7 +12,7 @@
 		     <FeePolicy type="dynamic" historySlots="300"
                 makerFee="0.000" takerFee="0.00023" maxMakerRate="0.015" maxTakerRate="0.015"
                 targetMTR="0.4" shapeMakerFee="2" shapeMakerRebate="2"/>
-            <Books instanceCount="12" maxDepth="21" detailedDepth="5">
+            <Books instanceCount="13" maxDepth="21" detailedDepth="5">
                 <Processes>
                     <FundamentalPrice name="fundamental" seedInterval="30000000000" mu="0.0" sigma="0.034"
                         lambda="0.000206" muJump="0.0" sigmaJump="0.025" updatePeriod="30000000000"
