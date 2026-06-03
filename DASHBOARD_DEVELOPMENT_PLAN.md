@@ -242,14 +242,13 @@ Minimal **FastAPI** (or stdlib `http.server` + precomputed JSON for v0).
 
 | Endpoint | Returns |
 |----------|---------|
-| `GET /api/miners` | List UIDs with active `meta.json` |
-| `GET /api/{uid}/validators` | Validator keys for UID |
-| `GET /api/{uid}/{validator}/sims` | Simulation IDs |
-| `GET /api/{uid}/{validator}/{sim}/summary` | Latest `agent_summary` + card metrics |
-| `GET /api/{uid}/{validator}/{sim}/ohlcv?book=0&resolution=1s` | Aggregated candles from `snapshots.mid` |
-| `GET /api/{uid}/{validator}/{sim}/snapshots?book=0&from=&to=` | Raw series + signals |
-| `GET /api/{uid}/{validator}/{sim}/round_trips?book=` | Table data |
-| `GET /api/{uid}/{validator}/{sim}/trades?book=` | Parse `trades.csv` |
+| `GET /api/catalog` | List telemetry sessions (`uid`, `validator_id`, `simulation_id`) |
+| `GET /api/miners` | Deprecated alias of `/api/catalog` |
+| `GET /api/validators/{validator_id}/agents/{uid}/simulations/{simulation_id}/books/{book_id}/summary` | Latest snapshot + card metrics for one book |
+| `GET /api/validators/.../books/{book_id}/mid` | Mid price series + trade markers (`resolution`, `limit` query) |
+| `GET /api/validators/.../books/{book_id}/snapshots` | Signal series for one book |
+| `GET /api/validators/.../books/{book_id}/round_trips` | Round-trip table for one book |
+| `GET /api/validators/.../books/{book_id}/trades` | Market orders for one book |
 | `GET /events/stream?uid=` | **SSE** optional v1.1 — push on file mtime change |
 
 CORS enabled for local dev. Bind `127.0.0.1:8787` by default.

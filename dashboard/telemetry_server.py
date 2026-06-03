@@ -22,14 +22,21 @@ from chart_data import (
     format_round_trip,
     load_trades_for_api,
     quote_volume_from_trades_csv,
+    sim_time_label,
+    sim_seconds_from_ts_ns,
     telemetry_db,
+    visible_sim_range,
 )
 from taos.im.telemetry.paths import telemetry_root
-from taos.im.utils import duration_from_timestamp
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
-app = FastAPI(title="τaos Miner Telemetry", version="0.2.0")
+# /api/validators/{validator_id}/agents/{uid}/simulations/{simulation_id}/books/{book_id}/...
+BOOK_SCOPE = (
+    "/api/validators/{validator_id}/agents/{uid}/simulations/{simulation_id}/books/{book_id}"
+)
+
+app = FastAPI(title="τaos Miner Telemetry", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,11 +57,11 @@ def _row(r: sqlite3.Row | None) -> dict[str, Any]:
     return dict(r) if r else {}
 
 
-def _discover_miners() -> list[dict[str, Any]]:
+def _discover_catalog() -> list[dict[str, Any]]:
     root = telemetry_root()
     if not root.is_dir():
         return []
-    miners: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
     for uid_dir in sorted(root.iterdir()):
         if not uid_dir.is_dir() or not uid_dir.name.isdigit():
             continue
@@ -74,15 +81,15 @@ def _discover_miners() -> list[dict[str, Any]]:
                         meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     except json.JSONDecodeError:
                         pass
-                miners.append(
+                sessions.append(
                     {
                         "uid": uid,
-                        "validator_slug": val_dir.name,
+                        "validator_id": val_dir.name,
                         "simulation_id": sim_dir.name,
                         "agent_class": meta.get("agent_class"),
                     }
                 )
-    return miners
+    return sessions
 
 
 @app.get("/api/health")
@@ -90,34 +97,40 @@ def health() -> dict[str, str]:
     return {"status": "ok", "telemetry_root": str(telemetry_root())}
 
 
+@app.get("/api/catalog")
+def list_catalog() -> list[dict[str, Any]]:
+    return _discover_catalog()
+
+
 @app.get("/api/miners")
 def list_miners() -> list[dict[str, Any]]:
-    return _discover_miners()
+    """Deprecated alias for /api/catalog."""
+    return _discover_catalog()
 
 
-@app.get("/api/{uid}/{validator_slug}/{sim_id}/summary")
-def get_summary(uid: int, validator_slug: str, sim_id: str, book: int = 0) -> dict[str, Any]:
-    conn = _connect(telemetry_db(uid, validator_slug, sim_id))
+@app.get(f"{BOOK_SCOPE}/summary")
+def get_summary(
+    validator_id: str,
+    uid: int,
+    simulation_id: str,
+    book_id: int,
+) -> dict[str, Any]:
+    conn = _connect(telemetry_db(uid, validator_id, simulation_id))
     try:
         snap = conn.execute(
             "SELECT * FROM snapshots WHERE book_id = ? ORDER BY ts_ns DESC LIMIT 1",
-            (book,),
+            (book_id,),
         ).fetchone()
         summary = conn.execute(
             "SELECT * FROM agent_summary ORDER BY ts_ns DESC LIMIT 1"
         ).fetchone()
-        if book < 0:
-            rt = conn.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl), 0) AS total_pnl FROM round_trips"
-            ).fetchone()
-        else:
-            rt = conn.execute(
-                """
-                SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl), 0) AS total_pnl
-                FROM round_trips WHERE book_id = ?
-                """,
-                (book,),
-            ).fetchone()
+        rt = conn.execute(
+            """
+            SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl), 0) AS total_pnl
+            FROM round_trips WHERE book_id = ?
+            """,
+            (book_id,),
+        ).fetchone()
     finally:
         conn.close()
 
@@ -126,9 +139,9 @@ def get_summary(uid: int, validator_slug: str, sim_id: str, book: int = 0) -> di
     traded = snap_d.get("traded_volume")
     vol_cap = snap_d.get("volume_cap")
     if (traded is None or traded == 0) and vol_cap:
-        trades_path = find_trades_csv(uid, validator_slug, sim_id)
+        trades_path = find_trades_csv(uid, validator_id, simulation_id)
         if trades_path:
-            csv_vol = quote_volume_from_trades_csv(trades_path, uid, book)
+            csv_vol = quote_volume_from_trades_csv(trades_path, uid, book_id)
             if csv_vol > 0:
                 snap_d["traded_volume"] = csv_vol
                 snap_d["volume_remaining"] = max(0.0, float(vol_cap) - csv_vol)
@@ -136,7 +149,10 @@ def get_summary(uid: int, validator_slug: str, sim_id: str, book: int = 0) -> di
         snap_d["volume_remaining"] = max(0.0, float(vol_cap) - float(traded))
 
     return {
-        "book_id": book,
+        "validator_id": validator_id,
+        "uid": uid,
+        "simulation_id": simulation_id,
+        "book_id": book_id,
         "latest_snapshot": snap_d,
         "latest_summary": _row(summary),
         "round_trips": rt_d,
@@ -144,27 +160,29 @@ def get_summary(uid: int, validator_slug: str, sim_id: str, book: int = 0) -> di
     }
 
 
-@app.get("/api/{uid}/{validator_slug}/{sim_id}/ohlcv")
-def get_ohlcv(
+@app.get(f"{BOOK_SCOPE}/mid")
+def get_mid(
+    validator_id: str,
     uid: int,
-    validator_slug: str,
-    sim_id: str,
-    book: int = 0,
+    simulation_id: str,
+    book_id: int,
     resolution: Annotated[int, Query(ge=1, le=3600)] = 1,
     limit: Annotated[int, Query(ge=10, le=10000)] = 5000,
 ) -> dict[str, Any]:
-    return build_mid_series(uid, validator_slug, sim_id, book, resolution, limit, _connect)
+    return build_mid_series(
+        uid, validator_id, simulation_id, book_id, resolution, limit, _connect
+    )
 
 
-@app.get("/api/{uid}/{validator_slug}/{sim_id}/snapshots")
+@app.get(f"{BOOK_SCOPE}/snapshots")
 def get_snapshots(
+    validator_id: str,
     uid: int,
-    validator_slug: str,
-    sim_id: str,
-    book: int = 0,
+    simulation_id: str,
+    book_id: int,
     limit: Annotated[int, Query(ge=1, le=5000)] = 500,
 ) -> list[dict[str, Any]]:
-    conn = _connect(telemetry_db(uid, validator_slug, sim_id))
+    conn = _connect(telemetry_db(uid, validator_id, simulation_id))
     try:
         rows = conn.execute(
             """
@@ -174,7 +192,7 @@ def get_snapshots(
             WHERE book_id = ?
             ORDER BY ts_ns DESC LIMIT ?
             """,
-            (book, limit),
+            (book_id, limit),
         ).fetchall()
     finally:
         conn.close()
@@ -183,57 +201,72 @@ def get_snapshots(
     for r in reversed(rows):
         d = dict(r)
         ts_ns = int(d.pop("ts_ns", 0) or 0)
-        d["closed_at"] = duration_from_timestamp(ts_ns) if ts_ns else ""
+        time_sec = sim_seconds_from_ts_ns(ts_ns) if ts_ns else 0
+        d["time_sec"] = time_sec
+        d["closed_at"] = sim_time_label(time_sec) if time_sec else ""
         out.append(d)
     return out
 
 
-@app.get("/api/{uid}/{validator_slug}/{sim_id}/round_trips")
+@app.get(f"{BOOK_SCOPE}/round_trips")
 def get_round_trips(
+    validator_id: str,
     uid: int,
-    validator_slug: str,
-    sim_id: str,
-    book: Annotated[int, Query()] = -1,
+    simulation_id: str,
+    book_id: int,
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
 ) -> list[dict[str, Any]]:
-    conn = _connect(telemetry_db(uid, validator_slug, sim_id))
+    conn = _connect(telemetry_db(uid, validator_id, simulation_id))
     try:
-        if book < 0:
-            rows = conn.execute(
-                "SELECT * FROM round_trips ORDER BY ts_close_ns DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT * FROM round_trips
-                WHERE book_id = ? ORDER BY ts_close_ns DESC LIMIT ?
-                """,
-                (book, limit),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT * FROM round_trips
+            WHERE book_id = ? ORDER BY ts_close_ns DESC LIMIT ?
+            """,
+            (book_id, limit),
+        ).fetchall()
     finally:
         conn.close()
 
+    t_min, t_max = visible_sim_range(uid, validator_id, simulation_id, book_id, 1, _connect)
     formatted = [format_round_trip(dict(r)) for r in rows]
+    if t_max > t_min:
+        formatted = [
+            row for row in formatted
+            if t_min <= int(row.get("time_sec") or 0) <= t_max
+        ]
     formatted.reverse()
     for i, row in enumerate(formatted, start=1):
         row["seq"] = i
     return formatted
 
 
-@app.get("/api/{uid}/{validator_slug}/{sim_id}/trades")
+@app.get(f"{BOOK_SCOPE}/trades")
 def get_trades(
+    validator_id: str,
     uid: int,
-    validator_slug: str,
-    sim_id: str,
-    book: Annotated[int, Query()] = -1,
+    simulation_id: str,
+    book_id: int,
     limit: Annotated[int, Query(ge=1, le=1000)] = 500,
 ) -> dict[str, Any]:
-    return load_trades_for_api(uid, validator_slug, sim_id, book, limit, _connect)
+    return load_trades_for_api(uid, validator_id, simulation_id, book_id, limit, _connect)
 
 
 @app.get("/")
 def index() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get(
+    "/validators/{validator_id}/agents/{uid}/simulations/{simulation_id}/books/{book_id}"
+)
+def dashboard_spa(
+    validator_id: str,
+    uid: int,
+    simulation_id: str,
+    book_id: int,
+) -> FileResponse:
+    """Serve the SPA shell for bookmarkable dashboard URLs."""
     return FileResponse(WEB_DIR / "index.html")
 
 

@@ -141,6 +141,10 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         self._volume_log[validator][book_id] = kept
         return sum(v for _, v in kept)
 
+    def update(self, state: MarketSimulationStateUpdate) -> None:
+        self._step_ts_ns = int(state.timestamp)
+        super().update(state)
+
     def onTrade(self, event: TradeEvent, validator: str = None) -> None:
         """Reconstruct our position + cost basis from each of our own fills."""
         if event.bookId is None:
@@ -152,8 +156,9 @@ class MomentumScalperAgent(FinanceSimulationAgent):
             direction = OrderDirection.SELL if event.side == OrderDirection.BUY else OrderDirection.BUY
         else:
             return
-        self._record_trade_volume(validator, event.bookId, event.quantity, event.price, event.timestamp)
-        self._apply_fill(validator, event.bookId, direction, event.quantity, event.price, event.timestamp)
+        ts_ns = getattr(self, "_step_ts_ns", None) or event.timestamp
+        self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
+        self._apply_fill(validator, event.bookId, direction, event.quantity, event.price, ts_ns)
 
     def _book_positions(self, validator: str) -> dict[int, _Position]:
         return self.positions.setdefault(validator, {})

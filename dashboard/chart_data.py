@@ -168,8 +168,11 @@ def chart_origin(
     resolution: int,
     connect_db,
 ) -> int:
+    """Earliest simulation second on the chart (absolute, not bucket-relative)."""
     buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
-    return min(buckets) if buckets else 0
+    if not buckets:
+        return 0
+    return min(buckets) * resolution
 
 
 def build_mid_series(
@@ -181,14 +184,14 @@ def build_mid_series(
     limit: int,
     connect_db,
 ) -> dict[str, Any]:
-    """Mid line: market prints backfill, telemetry mid overwrites, shared chart origin."""
+    """Mid line: market prints backfill, telemetry mid overwrites; times are sim seconds."""
     buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
     if not buckets:
         return {"mid": [], "origin": 0}
-    origin = min(buckets)
+    origin = chart_origin(uid, validator_slug, sim_id, book, resolution, connect_db)
     ordered = sorted(_forward_fill(buckets).items())[-limit:]
     return {
-        "mid": [{"time": (b * resolution) - origin, "value": p} for b, p in ordered],
+        "mid": [{"time": b * resolution, "value": p} for b, p in ordered],
         "origin": origin,
     }
 
@@ -414,22 +417,6 @@ def aggregate_taker_orders(rows: list[dict[str, Any]], uid: int) -> list[dict[st
     return [o.to_dict() for o in orders]
 
 
-def shift_orders_to_chart_origin(orders: list[dict[str, Any]], origin: int) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for o in orders:
-        t = o.get("time")
-        if t is None:
-            continue
-        rel = int(t) - origin
-        if rel < 0:
-            continue
-        row = dict(o)
-        row["time"] = rel
-        row["time_label"] = sim_time_label(int(t))
-        out.append(row)
-    return out
-
-
 def load_trades_for_api(
     uid: int,
     validator_slug: str,
@@ -450,13 +437,13 @@ def load_trades_for_api(
             rows.append(dict(row))
     rows.sort(key=trade_sort_key)
 
+    orders = [o for o in aggregate_taker_orders(rows, uid) if o.get("time") is not None]
     origin = chart_origin(uid, validator_slug, sim_id, max(book, 0), 1, connect_db)
-    orders = shift_orders_to_chart_origin(aggregate_taker_orders(rows, uid), origin)
 
     window = orders[-limit:]
     for i, order in enumerate(window, start=1):
         order["seq"] = i
-    return {"orders": list(reversed(window))}
+    return {"orders": list(reversed(window)), "origin": origin}
 
 
 def format_hold_s(seconds: float | None) -> str:
@@ -473,11 +460,28 @@ def format_hold_s(seconds: float | None) -> str:
     return f"{s:.1f}s"
 
 
+def visible_sim_range(
+    uid: int,
+    validator_slug: str,
+    sim_id: str,
+    book: int,
+    resolution: int,
+    connect_db,
+) -> tuple[int, int]:
+    buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
+    if not buckets:
+        return 0, 0
+    keys = sorted(_forward_fill(buckets))
+    return keys[0] * resolution, keys[-1] * resolution
+
+
 def format_round_trip(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     ts_ns = int(out.pop("ts_close_ns", 0) or 0)
     out.pop("id", None)
-    out["closed_at"] = duration_from_timestamp(ts_ns) if ts_ns else ""
+    time_sec = ts_ns // 1_000_000_000 if ts_ns else 0
+    out["time_sec"] = time_sec
+    out["closed_at"] = sim_time_label(time_sec) if time_sec else ""
     hold = out.pop("hold_s", None)
     out["hold"] = format_hold_s(hold) if hold is not None else ""
     for key in ("qty", "entry_avg", "exit_avg", "realized_pnl"):
