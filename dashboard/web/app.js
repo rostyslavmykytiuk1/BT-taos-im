@@ -1,21 +1,43 @@
 const API = "";
 const POLL_MS = 2000;
 
-let chart;
-let priceSeries;
-let miners = [];
-let activeTab = "round_trips";
-let pollTimer;
-let lastChartKey = null;
-
-const $ = (id) => document.getElementById(id);
-
 const MARKER_STYLE = {
   open_long: { position: "aboveBar", shape: "arrowUp", color: "#22c55e", size: 1 },
   open_short: { position: "aboveBar", shape: "arrowDown", color: "#ef4444", size: 1 },
   close_long: { position: "aboveBar", shape: "circle", color: "#22c55e", size: 1 },
   close_short: { position: "aboveBar", shape: "circle", color: "#ef4444", size: 1 },
 };
+
+const TABLE_COLUMNS = {
+  round_trips: [
+    "seq", "closed_at", "book_id", "side", "qty", "entry_avg", "exit_avg",
+    "realized_pnl", "hold", "reason",
+  ],
+  trades: [
+    "seq", "action", "time_label", "side", "price", "quantity",
+    "pos_before", "pos_after", "fills", "orderId",
+  ],
+  snapshots: [
+    "closed_at", "mid", "signal_trend_bps", "signal_flow", "signal_imb", "action", "pos_qty",
+  ],
+};
+
+const LINE_OPTS = {
+  lineWidth: 2,
+  lineType: LightweightCharts.LineType?.WithSteps ?? 1,
+  crosshairMarkerVisible: true,
+  lastValueVisible: true,
+  priceLineVisible: false,
+};
+
+let chart;
+let midSeries;
+let miners = [];
+let activeTab = "round_trips";
+let pollTimer;
+let lastChartKey = null;
+
+const $ = (id) => document.getElementById(id);
 
 function fmt(n, d = 4) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
@@ -52,15 +74,7 @@ function initChart() {
     grid: { vertLines: { color: "#2a3140" }, horzLines: { color: "#2a3140" } },
     timeScale: { timeVisible: true, secondsVisible: false },
   });
-  const lineType = LightweightCharts.LineType?.WithSteps ?? 1;
-  priceSeries = chart.addLineSeries({
-    color: "#3dd68c",
-    lineWidth: 2,
-    lineType,
-    crosshairMarkerVisible: true,
-    lastValueVisible: true,
-    priceLineVisible: true,
-  });
+  midSeries = chart.addLineSeries({ ...LINE_OPTS, color: "#f59e0b", priceLineVisible: true });
   const onResize = () => chart.applyOptions({ width: el.clientWidth });
   window.addEventListener("resize", onResize);
   onResize();
@@ -70,22 +84,13 @@ function chartKey(uid, validator, sim, book) {
   return `${uid}|${validator}|${sim}|${book}`;
 }
 
-function mergeLinePoints(ohlcv, orders) {
-  const byTime = new Map();
-  for (const c of ohlcv || []) {
-    if (c.time == null || c.close == null) continue;
-    byTime.set(c.time, { time: c.time, value: Number(c.close) });
-  }
-  for (const o of orders || []) {
-    if (!o.time || o.price == null) continue;
-    byTime.set(o.time, { time: o.time, value: Number(o.price) });
-  }
-  return [...byTime.values()].sort((a, b) => a.time - b.time);
+function midPoints(payload) {
+  return payload?.mid ?? [];
 }
 
-function markersFromOrders(orders) {
+function chartMarkers(orders) {
   return (orders || [])
-    .filter((o) => o.time > 0 && MARKER_STYLE[o.action])
+    .filter((o) => o.time != null && o.time >= 0 && MARKER_STYLE[o.action])
     .map((o) => {
       const s = MARKER_STYLE[o.action];
       return { time: o.time, position: s.position, shape: s.shape, color: s.color, size: s.size };
@@ -93,11 +98,53 @@ function markersFromOrders(orders) {
     .sort((a, b) => a.time - b.time);
 }
 
-function applyChartData(ohlcv, orders, fitView) {
-  priceSeries.setData(mergeLinePoints(ohlcv, orders));
-  priceSeries.setMarkers(markersFromOrders(orders));
-  if (!fitView) return;
-  requestAnimationFrame(() => chart.timeScale().fitContent());
+function updateChart(midPayload, orders, fitView) {
+  midSeries.setData(midPoints(midPayload));
+  midSeries.setMarkers(chartMarkers(orders));
+  if (fitView) requestAnimationFrame(() => chart.timeScale().fitContent());
+}
+
+function formatCell(row, col) {
+  const v = row[col];
+  if (v === null || v === undefined) return "";
+  if (col === "pos_before" || col === "pos_after") return Number(v).toFixed(3);
+  return String(v);
+}
+
+function renderTable(tab, data) {
+  const cols = TABLE_COLUMNS[tab] || [];
+  const rows = data[tab] || [];
+  const headers = { time_label: "time" };
+  const table = $("data-table");
+  table.querySelector("thead").innerHTML =
+    `<tr>${cols.map((c) => `<th>${headers[c] || c}</th>`).join("")}</tr>`;
+  table.querySelector("tbody").innerHTML = rows
+    .map((r) => `<tr>${cols.map((c) => `<td>${formatCell(r, c)}</td>`).join("")}</tr>`)
+    .join("");
+}
+
+function updateCards(summary) {
+  const snap = summary.latest_snapshot || {};
+  $("card-mid").textContent = fmt(snap.mid, 2);
+  $("card-spread").textContent = fmt(snap.spread_bps, 2);
+  $("card-pos").textContent =
+    snap.pos_qty != null ? `${fmt(snap.pos_qty, 3)} @ ${fmt(snap.pos_avg, 2)}` : "—";
+  $("card-base").textContent = snap.base_bal != null ? fmt(snap.base_bal, 4) : "—";
+  $("card-quote").textContent = snap.quote_bal != null ? fmt(snap.quote_bal, 2) : "—";
+  $("card-vol-traded").textContent = fmtVol(snap.traded_volume);
+  $("card-vol-cap").textContent = fmtVol(snap.volume_cap);
+  const volLeft = snap.volume_remaining;
+  $("card-vol-left").textContent = fmtVol(volLeft);
+  $("card-vol-left").className =
+    "value " +
+    (volLeft != null && snap.volume_cap != null && volLeft <= snap.volume_cap * 0.1 ? "negative" : "");
+  const upnl = snap.unrealized_pnl;
+  $("card-upnl").textContent = fmt(upnl, 2);
+  $("card-upnl").className = "value " + (upnl > 0 ? "positive" : upnl < 0 ? "negative" : "");
+  const rt = summary.round_trips || {};
+  $("card-rt").textContent = rt.n != null ? String(rt.n) : "—";
+  $("card-pnl-rt").textContent = fmt(summary.pnl_per_rt, 4);
+  $("card-step").textContent = fmt((summary.latest_summary || {}).loop_ms, 1);
 }
 
 async function loadMiners() {
@@ -134,7 +181,7 @@ async function refresh() {
   if (!uid || !validator || !sim) return;
   const base = `/api/${uid}/${validator}/${sim}`;
   try {
-    const [summary, ohlcv, roundTrips, { orders }, snapshots] = await Promise.all([
+    const [summary, midPayload, roundTrips, { orders }, snapshots] = await Promise.all([
       api(`${base}/summary?book=${book}`),
       api(`${base}/ohlcv?book=${book}&resolution=1&limit=5000`),
       api(`${base}/round_trips?book=${book}&limit=100`),
@@ -142,60 +189,16 @@ async function refresh() {
       api(`${base}/snapshots?book=${book}&limit=80`),
     ]);
 
-    const snap = summary.latest_snapshot || {};
-    $("card-mid").textContent = fmt(snap.mid, 2);
-    $("card-spread").textContent = fmt(snap.spread_bps, 2);
-    $("card-pos").textContent =
-      snap.pos_qty != null ? `${fmt(snap.pos_qty, 3)} @ ${fmt(snap.pos_avg, 2)}` : "—";
-    $("card-base").textContent = snap.base_bal != null ? fmt(snap.base_bal, 4) : "—";
-    $("card-quote").textContent = snap.quote_bal != null ? fmt(snap.quote_bal, 2) : "—";
-    $("card-vol-traded").textContent = fmtVol(snap.traded_volume);
-    $("card-vol-cap").textContent = fmtVol(snap.volume_cap);
-    const volLeft = snap.volume_remaining;
-    $("card-vol-left").textContent = fmtVol(volLeft);
-    $("card-vol-left").className =
-      "value " +
-      (volLeft != null && snap.volume_cap != null && volLeft <= snap.volume_cap * 0.1
-        ? "negative"
-        : "");
-    const upnl = snap.unrealized_pnl;
-    $("card-upnl").textContent = fmt(upnl, 2);
-    $("card-upnl").className = "value " + (upnl > 0 ? "positive" : upnl < 0 ? "negative" : "");
-
-    const rt = summary.round_trips || {};
-    $("card-rt").textContent = rt.n != null ? String(rt.n) : "—";
-    $("card-pnl-rt").textContent = fmt(summary.pnl_per_rt, 4);
-    $("card-step").textContent = fmt((summary.latest_summary || {}).loop_ms, 1);
-
+    updateCards(summary);
     const key = chartKey(uid, validator, sim, book);
     const fitView = key !== lastChartKey;
     lastChartKey = key;
-    applyChartData(ohlcv, orders, fitView);
-
-    renderTable(activeTab, { roundTrips, orders, snapshots });
+    updateChart(midPayload, orders, fitView);
+    renderTable(activeTab, { round_trips: roundTrips, trades: orders, snapshots });
     $("status").textContent = `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book}`;
   } catch (err) {
     $("status").textContent = `Error: ${err.message}`;
   }
-}
-
-function renderTable(tab, data) {
-  const cols =
-    tab === "round_trips"
-      ? ["seq", "closed_at", "book_id", "side", "qty", "entry_avg", "exit_avg", "realized_pnl", "hold", "reason"]
-      : tab === "trades"
-        ? ["seq", "action", "time_label", "side", "price", "quantity", "fills", "orderId"]
-        : ["closed_at", "mid", "signal_trend_bps", "signal_flow", "signal_imb", "action", "pos_qty"];
-  const rows =
-    tab === "round_trips" ? data.roundTrips : tab === "trades" ? data.orders : data.snapshots;
-
-  const table = $("data-table");
-  const headers = { time_label: "time" };
-  table.querySelector("thead").innerHTML =
-    `<tr>${cols.map((c) => `<th>${headers[c] || c}</th>`).join("")}</tr>`;
-  table.querySelector("tbody").innerHTML = rows
-    .map((r) => `<tr>${cols.map((c) => `<td>${r[c] ?? ""}</td>`).join("")}</tr>`)
-    .join("");
 }
 
 function setupTabs() {

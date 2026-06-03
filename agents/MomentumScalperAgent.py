@@ -28,12 +28,14 @@ book, keep losers tiny, stay well under the volume cap, never let one book throw
 
 Run (local proxy test):
   python MomentumScalperAgent.py --port 8901 --agent_id 0 \
-    --params quote_notional=1500 tp_bps=12 sl_bps=18 max_hold_s=120 \
-             signal_bps=6 imbalance_depth=5
+    --params quote_notional=2200 tp_bps=15 sl_bps=13 max_hold_s=90 \
+             signal_bps=9 stretch_bps=12 mean_window_s=90 min_flow_mult=0.5 \
+             cooldown_s=45 max_taker_fee=0.0003 imbalance_depth=5
 """
 
 import traceback
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 
 import bittensor as bt
 
@@ -59,16 +61,22 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         bt.logging.set_info()
 
         # --- strategy parameters (all overridable via --params) ---
-        self.quote_notional = self._param("quote_notional", 1500.0)   # QUOTE per entry
-        self.tp_bps = self._param("tp_bps", 12.0)                     # take-profit (bps)
-        self.sl_bps = self._param("sl_bps", 18.0)                     # stop-loss (bps)
-        self.max_hold_s = self._param("max_hold_s", 120.0)           # time stop (sim sec)
-        self.signal_bps = self._param("signal_bps", 6.0)            # min trend to act (bps)
+        self.quote_notional = self._param("quote_notional", 2200.0)   # QUOTE per entry
+        self.tp_bps = self._param("tp_bps", 15.0)                     # take-profit (bps)
+        self.sl_bps = self._param("sl_bps", 13.0)                     # stop-loss (bps) — tight tail
+        self.max_hold_s = self._param("max_hold_s", 90.0)            # time stop (sim sec)
+        self.signal_bps = self._param("signal_bps", 9.0)             # min trend to act (bps)
+        self.stretch_bps = self._param("stretch_bps", 12.0)           # skip entries into stretched moves
+        self.mean_window_s = self._param("mean_window_s", 90.0)
+        self.min_samples = int(self._param("min_samples", 6.0))
+        self.min_flow_mult = self._param("min_flow_mult", 0.5)     # min signed flow vs min order
+        self.cooldown_s = self._param("cooldown_s", 45.0)            # pause book after stop-loss
+        self.max_taker_fee = self._param("max_taker_fee", 0.0003)    # skip taker entries above this
         self.imbalance_depth = int(self._param("imbalance_depth", 5.0))
-        self.min_imbalance = self._param("min_imbalance", 0.10)     # required book skew
+        self.min_imbalance = self._param("min_imbalance", 0.12)    # required book skew
         self.min_order_size = self._param("min_order_size", 0.25)   # BASE
         self.turnover_cap = self._param("capital_turnover_cap", 10.0)
-        self.volume_safety = self._param("volume_safety", 0.6)      # use <= 60% of cap
+        self.volume_safety = self._param("volume_safety", 0.55)     # stay under validator cap
         # Default matches validator scoring.activity.trade_volume_assessment_period (24h sim).
         self.volume_assessment_ns = int(
             self._param("volume_assessment_ns", 86_400_000_000_000)
@@ -80,7 +88,12 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         self.signal_bps *= 0.9 + 0.2 * jitter
 
         # --- runtime state ---
+        self.mean_window_ns = int(self.mean_window_s * 1e9)
+        self.cooldown_ns = int(self.cooldown_s * 1e9)
+
         self.positions: dict[str, dict[int, _Position]] = {}
+        self._trade_prices: dict[str, dict[int, deque]] = {}
+        self._cooldown_until: dict[tuple[str, int], int] = {}
         self._sim_id: dict[str, str] = {}
         self._exit_reason: dict[tuple[str, int], str] = {}
         # (sim_ts_ns, quote_volume) per validator/book — state.accounts lacks traded_volume.
@@ -90,7 +103,8 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         bt.logging.info(
             f"[MomentumScalper uid={self.uid}] notional={self.quote_notional} "
             f"tp={self.tp_bps}bps sl={self.sl_bps}bps hold={self.max_hold_s}s "
-            f"signal={self.signal_bps:.2f}bps depth={self.imbalance_depth}"
+            f"signal={self.signal_bps:.2f}bps stretch={self.stretch_bps:.1f}bps "
+            f"cooldown={self.cooldown_s}s max_taker_fee={self.max_taker_fee}"
         )
 
     def _param(self, name: str, default: float) -> float:
@@ -105,6 +119,8 @@ class MomentumScalperAgent(FinanceSimulationAgent):
     def onStart(self, event: SimulationStartEvent) -> None:
         """New simulation run for some validator -> clear all tracked state."""
         self.positions.clear()
+        self._trade_prices.clear()
+        self._cooldown_until.clear()
         self._sim_id.clear()
         self._exit_reason.clear()
         self._volume_log.clear()
@@ -192,6 +208,37 @@ class MomentumScalperAgent(FinanceSimulationAgent):
             return None
         return 0.5 * (book.bids[0].price + book.asks[0].price)
 
+    @staticmethod
+    def _microprice(book) -> float | None:
+        if not book.bids or not book.asks:
+            return None
+        bid, ask = book.bids[0], book.asks[0]
+        denom = bid.quantity + ask.quantity
+        if denom <= 0:
+            return 0.5 * (bid.price + ask.price)
+        return (ask.price * bid.quantity + bid.price * ask.quantity) / denom
+
+    def _update_trade_history(self, validator: str, book_id: int, book, now: int) -> None:
+        dq = self._trade_prices.setdefault(validator, {}).setdefault(
+            book_id, deque(maxlen=500)
+        )
+        for event in book.events or []:
+            if getattr(event, "type", None) == "t" and event.price > 0:
+                dq.append((now, float(event.price)))
+        cutoff = now - self.mean_window_ns
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+    def _rolling_mean(self, validator: str, book_id: int) -> float | None:
+        dq = self._trade_prices.get(validator, {}).get(book_id)
+        if not dq or len(dq) < self.min_samples:
+            return None
+        return sum(p for _, p in dq) / len(dq)
+
+    def _on_cooldown(self, validator: str, book_id: int, now: int) -> bool:
+        until = self._cooldown_until.get((validator, book_id), 0)
+        return until > now
+
     def _book_imbalance(self, book) -> float:
         """(bid_qty - ask_qty)/(bid_qty + ask_qty) over the top `imbalance_depth`."""
         bq = sum(l.quantity for l in book.bids[: self.imbalance_depth])
@@ -223,6 +270,10 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         # Reset if this validator started serving a different simulation.
         if self._sim_id.get(validator) != cfg.simulation_id:
             self._book_positions(validator).clear()
+            self._trade_prices.pop(validator, None)
+            self._cooldown_until = {
+                k: v for k, v in self._cooldown_until.items() if k[0] != validator
+            }
             self._volume_log.pop(validator, None)
             self._sim_id[validator] = cfg.simulation_id
 
@@ -251,8 +302,11 @@ class MomentumScalperAgent(FinanceSimulationAgent):
     def _handle_book(self, response, validator, book_id, book,
                      price_dp, vol_dp, hold_ns, cap, now) -> None:
         mid = self._mid(book)
-        if mid is None or mid <= 0:
+        mark = self._microprice(book) or mid
+        if mid is None or mid <= 0 or mark is None:
             return
+
+        self._update_trade_history(validator, book_id, book, now)
 
         account = self.accounts.get(book_id)
         if account is None:
@@ -268,15 +322,16 @@ class MomentumScalperAgent(FinanceSimulationAgent):
         # ---- 1) Manage an open position: exit on tp / sl / time ----
         if abs(pos.qty) >= self.min_order_size / 2 and pos.avg > 0:
             if pos.qty > 0:
-                pnl_bps = (mid - pos.avg) / pos.avg * 1e4
+                pnl_bps = (mark - pos.avg) / pos.avg * 1e4
             else:
-                pnl_bps = (pos.avg - mid) / pos.avg * 1e4
+                pnl_bps = (pos.avg - mark) / pos.avg * 1e4
             timed_out = (now - pos.entry_ts) >= hold_ns if pos.entry_ts else False
             if pnl_bps >= self.tp_bps or pnl_bps <= -self.sl_bps or timed_out:
                 if pnl_bps >= self.tp_bps:
                     reason = "tp"
                 elif pnl_bps <= -self.sl_bps:
                     reason = "sl"
+                    self._cooldown_until[(validator, book_id)] = now + self.cooldown_ns
                 else:
                     reason = "time"
                 self._exit_reason[(validator, book_id)] = reason
@@ -295,14 +350,42 @@ class MomentumScalperAgent(FinanceSimulationAgent):
             )
             return
 
+        if self._on_cooldown(validator, book_id, now):
+            self._telemetry_snapshot(
+                validator, book_id, mid, bid, ask, pos, account, trend, flow, imb, "cooldown", cap, now
+            )
+            return
+
         if abs(trend) < self.signal_bps:
             self._telemetry_snapshot(
                 validator, book_id, mid, bid, ask, pos, account, trend, flow, imb, action, cap, now
             )
             return
 
-        long_ok = trend > 0 and imb >= self.min_imbalance and flow >= 0
-        short_ok = trend < 0 and imb <= -self.min_imbalance and flow <= 0
+        min_flow = self.min_flow_mult * self.min_order_size
+        if abs(flow) < min_flow:
+            self._telemetry_snapshot(
+                validator, book_id, mid, bid, ask, pos, account, trend, flow, imb, "weak_flow", cap, now
+            )
+            return
+
+        fees = account.fees
+        if fees is not None and fees.taker_fee_rate > self.max_taker_fee:
+            self._telemetry_snapshot(
+                validator, book_id, mid, bid, ask, pos, account, trend, flow, imb, "taker_fee", cap, now
+            )
+            return
+
+        mean_px = self._rolling_mean(validator, book_id)
+        stretch_up = mean_px * (1 + self.stretch_bps / 1e4) if mean_px else None
+        stretch_dn = mean_px * (1 - self.stretch_bps / 1e4) if mean_px else None
+
+        long_ok = trend > 0 and imb >= self.min_imbalance and flow >= min_flow
+        short_ok = trend < 0 and imb <= -self.min_imbalance and flow <= -min_flow
+        if stretch_up is not None and mid > stretch_up:
+            long_ok = False
+        if stretch_dn is not None and mid < stretch_dn:
+            short_ok = False
         if not (long_ok or short_ok):
             self._telemetry_snapshot(
                 validator, book_id, mid, bid, ask, pos, account, trend, flow, imb, action, cap, now
