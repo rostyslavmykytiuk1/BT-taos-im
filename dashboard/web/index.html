@@ -15,7 +15,7 @@
       <label>Validator ID <select id="sel-validator"></select></label>
       <label>Simulation <select id="sel-sim"></select></label>
       <label>Book ID <input id="inp-book" type="number" min="0" max="127" value="0" /></label>
-      <button id="btn-refresh" type="button">Refresh</button>
+      <button id="btn-refresh" type="button" class="btn-refresh" title="Reload chart and tables now">Refresh</button>
     </div>
   </header>
 
@@ -42,7 +42,13 @@
     </div>
   </section>
 
-  <section class="chart-panel">
+  <section class="chart-panel" id="chart-panel">
+    <div class="load-overlay" id="overlay-chart" aria-hidden="true">
+      <div class="load-box">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="load-label">Loading chart…</span>
+      </div>
+    </div>
     <div id="chart"></div>
     <div class="chart-legend" aria-hidden="true">
       <span class="leg leg-mid">— mid (bid+ask)/2</span>
@@ -59,7 +65,13 @@
     <button class="tab" data-tab="snapshots">Signals</button>
   </section>
 
-  <section class="table-panel">
+  <section class="table-panel" id="table-panel">
+    <div class="load-overlay load-overlay--table" id="overlay-table" aria-hidden="true">
+      <div class="load-box">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="load-label">Loading table…</span>
+      </div>
+    </div>
     <div class="table-wrap">
       <table id="data-table">
         <thead></thead>
@@ -68,7 +80,9 @@
     </div>
   </section>
 
-  <footer class="status" id="status">Loading…</footer>
+  <footer class="status" id="status">
+    <span id="status-text">Loading…</span>
+  </footer>
   <script src="/web/app.js"></script>
 </body>
 </html>

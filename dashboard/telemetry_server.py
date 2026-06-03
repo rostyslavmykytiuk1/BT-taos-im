@@ -174,6 +174,18 @@ def get_mid(
     )
 
 
+def _snapshot_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        ts_ns = int(d.pop("ts_ns", 0) or 0)
+        time_sec = sim_seconds_from_ts_ns(ts_ns) if ts_ns else 0
+        d["time_sec"] = time_sec
+        d["closed_at"] = sim_time_label(time_sec) if time_sec else ""
+        out.append(d)
+    return out
+
+
 @app.get(f"{BOOK_SCOPE}/snapshots")
 def get_snapshots(
     validator_id: str,
@@ -196,17 +208,7 @@ def get_snapshots(
         ).fetchall()
     finally:
         conn.close()
-
-    out: list[dict[str, Any]] = []
-    # Newest first (matches Signals table: read down = further into the past).
-    for r in rows:
-        d = dict(r)
-        ts_ns = int(d.pop("ts_ns", 0) or 0)
-        time_sec = sim_seconds_from_ts_ns(ts_ns) if ts_ns else 0
-        d["time_sec"] = time_sec
-        d["closed_at"] = sim_time_label(time_sec) if time_sec else ""
-        out.append(d)
-    return out
+    return _snapshot_rows(rows)
 
 
 @app.get(f"{BOOK_SCOPE}/round_trips")

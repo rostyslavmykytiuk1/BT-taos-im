@@ -2,7 +2,6 @@ const API = "";
 const POLL_MS = 2000;
 const DEFAULT_VALIDATOR_ID =
   "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF";
-/** UTC epoch anchor so Lightweight Charts shows sim HH:MM:SS, not 1970/local TZ. */
 const SIM_CHART_EPOCH = Date.UTC(2000, 0, 1) / 1000;
 
 const ROUTE_RE =
@@ -29,6 +28,14 @@ const TABLE_COLUMNS = {
   ],
 };
 
+const TABLE_HEADERS = {
+  time_label: "time",
+  closed_at: "sim_time",
+  signal_trend_bps: "trend_bps",
+  signal_flow: "dev_bps",
+  signal_imb: "imb",
+};
+
 const LINE_OPTS = {
   lineWidth: 2,
   lineType: LightweightCharts.LineType?.WithSteps ?? 1,
@@ -43,9 +50,50 @@ let miners = [];
 let activeTab = "round_trips";
 let pollTimer;
 let lastChartKey = null;
+let cachedTables = null;
 let applyingRoute = false;
+let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
+
+function setStatusText(msg, { error = false } = {}) {
+  const textEl = $("status-text");
+  if (textEl) textEl.textContent = msg;
+  $("status")?.classList.toggle("is-error", error);
+}
+
+function setLoadingUI(active) {
+  document.body.classList.toggle("is-loading", active);
+  for (const id of ["overlay-chart", "overlay-table"]) {
+    $(id)?.setAttribute("aria-hidden", active ? "false" : "true");
+  }
+  if (active) setStatusText("Loading data from API…");
+}
+
+function setRefreshButtonState(state) {
+  const btn = $("btn-refresh");
+  if (!btn) return;
+  btn.classList.remove("is-loading", "is-ok");
+  if (state === "loading") {
+    btn.disabled = true;
+    btn.classList.add("is-loading");
+    btn.textContent = "…";
+    btn.setAttribute("aria-busy", "true");
+    return;
+  }
+  btn.disabled = false;
+  btn.removeAttribute("aria-busy");
+  if (state === "ok") {
+    btn.classList.add("is-ok");
+    btn.textContent = "✓";
+    window.setTimeout(() => {
+      btn.classList.remove("is-ok");
+      btn.textContent = "Refresh";
+    }, 600);
+    return;
+  }
+  btn.textContent = "Refresh";
+}
 
 function fmt(n, d = 4) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
@@ -66,10 +114,16 @@ async function api(path) {
   return res.json();
 }
 
-function routePath({ validator_id, uid, simulation_id, book_id }) {
-  const v = encodeURIComponent(validator_id);
-  const s = encodeURIComponent(simulation_id);
-  return `/validators/${v}/agents/${uid}/simulations/${s}/books/${book_id}`;
+function encPathSegment(value) {
+  return encodeURIComponent(value);
+}
+
+function routePath(sel) {
+  return `/validators/${encPathSegment(sel.validator_id)}/agents/${sel.uid}/simulations/${encPathSegment(sel.simulation_id)}/books/${sel.book_id}`;
+}
+
+function bookApiPath(sel) {
+  return `/api/validators/${encPathSegment(sel.validator_id)}/agents/${sel.uid}/simulations/${encPathSegment(sel.simulation_id)}/books/${sel.book_id}`;
 }
 
 function parseRoute(pathname) {
@@ -93,30 +147,34 @@ function catalogHas(sel) {
 }
 
 function pickValidator(validators) {
-  if (validators.includes(DEFAULT_VALIDATOR_ID)) return DEFAULT_VALIDATOR_ID;
-  return validators[0];
+  return validators.includes(DEFAULT_VALIDATOR_ID) ? DEFAULT_VALIDATOR_ID : validators[0];
+}
+
+function fillSelect(id, values, selected) {
+  const el = $(id);
+  el.innerHTML = values.map((v) => `<option value="${v}">${v}</option>`).join("");
+  el.value = selected;
+}
+
+function validatorsForUid(uid) {
+  return [...new Set(miners.filter((m) => m.uid === uid).map((m) => m.validator_id))].sort();
+}
+
+function simsFor(uid, validator_id) {
+  return [
+    ...new Set(
+      miners.filter((m) => m.uid === uid && m.validator_id === validator_id).map((m) => m.simulation_id),
+    ),
+  ].sort();
 }
 
 function defaultSelection() {
   const uids = [...new Set(miners.map((m) => m.uid))].sort((a, b) => a - b);
   const uid = uids[0];
-  const validators = [
-    ...new Set(miners.filter((m) => m.uid === uid).map((m) => m.validator_id)),
-  ].sort();
+  const validators = validatorsForUid(uid);
   const validator_id = pickValidator(validators);
-  const sims = [
-    ...new Set(
-      miners
-        .filter((m) => m.uid === uid && m.validator_id === validator_id)
-        .map((m) => m.simulation_id),
-    ),
-  ].sort();
-  return {
-    uid,
-    validator_id,
-    simulation_id: sims[0],
-    book_id: 0,
-  };
+  const sims = simsFor(uid, validator_id);
+  return { uid, validator_id, simulation_id: sims[0], book_id: 0 };
 }
 
 function selection() {
@@ -128,80 +186,37 @@ function selection() {
   };
 }
 
-function bookApiPath({ validator_id, uid, simulation_id, book_id }) {
-  const v = encodeURIComponent(validator_id);
-  const s = encodeURIComponent(simulation_id);
-  return `/api/validators/${v}/agents/${uid}/simulations/${s}/books/${book_id}`;
-}
-
 function syncUrl(sel, replace) {
   const path = routePath(sel);
   if (location.pathname === path) return;
   const state = { ...sel };
-  if (replace) {
-    history.replaceState(state, "", path);
-  } else {
-    history.pushState(state, "", path);
-  }
-}
-
-function populateUidOptions() {
-  const uids = [...new Set(miners.map((m) => m.uid))].sort((a, b) => a - b);
-  $("sel-uid").innerHTML = uids.map((u) => `<option value="${u}">${u}</option>`).join("");
-}
-
-function validatorsForUid(uid) {
-  return [
-    ...new Set(miners.filter((m) => m.uid === uid).map((m) => m.validator_id)),
-  ].sort();
-}
-
-function simsFor(uid, validator_id) {
-  return [
-    ...new Set(
-      miners
-        .filter((m) => m.uid === uid && m.validator_id === validator_id)
-        .map((m) => m.simulation_id),
-    ),
-  ].sort();
+  if (replace) history.replaceState(state, "", path);
+  else history.pushState(state, "", path);
 }
 
 function applySelection(sel, { updateUrl, replaceUrl }) {
   applyingRoute = true;
-  populateUidOptions();
-  $("sel-uid").value = String(sel.uid);
+  fillSelect("sel-uid", [...new Set(miners.map((m) => m.uid))].sort((a, b) => a - b), sel.uid);
 
   const validators = validatorsForUid(sel.uid);
-  const validator_id = validators.includes(sel.validator_id)
-    ? sel.validator_id
-    : pickValidator(validators);
-  $("sel-validator").innerHTML = validators
-    .map((v) => `<option value="${v}">${v}</option>`)
-    .join("");
-  $("sel-validator").value = validator_id;
+  const validator_id = validators.includes(sel.validator_id) ? sel.validator_id : pickValidator(validators);
+  fillSelect("sel-validator", validators, validator_id);
 
   const sims = simsFor(sel.uid, validator_id);
   const simulation_id = sims.includes(sel.simulation_id) ? sel.simulation_id : sims[0];
-  $("sel-sim").innerHTML = sims.map((s) => `<option value="${s}">${s}</option>`).join("");
-  $("sel-sim").value = simulation_id;
+  fillSelect("sel-sim", sims, simulation_id);
 
-  const book_id = Number.isFinite(sel.book_id) ? sel.book_id : 0;
-  $("inp-book").value = String(book_id);
-
+  $("inp-book").value = String(Number.isFinite(sel.book_id) ? sel.book_id : 0);
   applyingRoute = false;
 
-  const resolved = { uid: sel.uid, validator_id, simulation_id, book_id };
+  const resolved = { uid: sel.uid, validator_id, simulation_id, book_id: parseInt($("inp-book").value, 10) };
   if (updateUrl) syncUrl(resolved, replaceUrl);
   return resolved;
 }
 
 function onUidChange() {
   const uid = parseInt($("sel-uid").value, 10);
-  const validators = validatorsForUid(uid);
-  $("sel-validator").innerHTML = validators
-    .map((v) => `<option value="${v}">${v}</option>`)
-    .join("");
-  $("sel-validator").value = pickValidator(validators);
+  fillSelect("sel-validator", validatorsForUid(uid), pickValidator(validatorsForUid(uid)));
   onValidatorChange();
 }
 
@@ -209,15 +224,14 @@ function onValidatorChange() {
   const uid = parseInt($("sel-uid").value, 10);
   const validator_id = $("sel-validator").value;
   const sims = simsFor(uid, validator_id);
-  $("sel-sim").innerHTML = sims.map((s) => `<option value="${s}">${s}</option>`).join("");
+  fillSelect("sel-sim", sims, sims[0]);
   onSelectionChange();
 }
 
 function onSelectionChange() {
   if (applyingRoute) return;
-  const sel = selection();
-  syncUrl(sel, false);
-  refresh();
+  syncUrl(selection(), false);
+  refresh({ withLoading: true });
 }
 
 function formatSimTimeSec(sec) {
@@ -251,9 +265,7 @@ function initChart() {
       secondsVisible: true,
       tickMarkFormatter: formatChartAxisTime,
     },
-    localization: {
-      timeFormatter: formatChartAxisTime,
-    },
+    localization: { timeFormatter: formatChartAxisTime },
   });
   midSeries = chart.addLineSeries({ ...LINE_OPTS, color: "#f59e0b", priceLineVisible: true });
   const onResize = () => chart.applyOptions({ width: el.clientWidth });
@@ -261,37 +273,23 @@ function initChart() {
   onResize();
 }
 
-function chartKey(uid, validator_id, simulation_id, book_id) {
-  return `${uid}|${validator_id}|${simulation_id}|${book_id}`;
-}
-
-function midPoints(payload) {
-  return (payload?.mid ?? []).map((p) => ({
-    time: toChartTime(p.time),
-    value: p.value,
-  }));
-}
-
-function chartMarkers(orders) {
-  return (orders || [])
-    .filter((o) => o.time != null && MARKER_STYLE[o.action])
-    .map((o) => {
-      const s = MARKER_STYLE[o.action];
-      return {
-        time: toChartTime(o.time),
-        position: s.position,
-        shape: s.shape,
-        color: s.color,
-        size: s.size,
-      };
-    })
-    .sort((a, b) => a.time - b.time);
+function chartKey(sel) {
+  return `${sel.uid}|${sel.validator_id}|${sel.simulation_id}|${sel.book_id}`;
 }
 
 function updateChart(midPayload, orders, fitView) {
-  midSeries.setData(midPoints(midPayload));
-  const markers = chartMarkers(orders);
-  midSeries.setMarkers(markers);
+  midSeries.setData(
+    (midPayload?.mid ?? []).map((p) => ({ time: toChartTime(p.time), value: p.value })),
+  );
+  midSeries.setMarkers(
+    (orders || [])
+      .filter((o) => o.time != null && MARKER_STYLE[o.action])
+      .map((o) => {
+        const s = MARKER_STYLE[o.action];
+        return { time: toChartTime(o.time), position: s.position, shape: s.shape, color: s.color, size: s.size };
+      })
+      .sort((a, b) => a.time - b.time),
+  );
   if (fitView) requestAnimationFrame(() => chart.timeScale().fitContent());
 }
 
@@ -309,24 +307,22 @@ function formatCell(row, col) {
 function renderTable(tab, data) {
   const cols = TABLE_COLUMNS[tab] || [];
   const rows = data[tab] || [];
-  const headers = {
-    time_label: "time",
-    // MeanReversionAgent maps dev_bps into signal_flow (see agent _snap).
-    signal_trend_bps: "trend_bps",
-    signal_flow: "dev_bps",
-    signal_imb: "imb",
-    closed_at: "sim_time",
-  };
   const table = $("data-table");
   table.querySelector("thead").innerHTML =
-    `<tr>${cols.map((c) => `<th>${headers[c] || c}</th>`).join("")}</tr>`;
-  table.querySelector("tbody").innerHTML = rows
-    .map((r) => `<tr>${cols.map((c) => `<td>${formatCell(r, c)}</td>`).join("")}</tr>`)
-    .join("");
-  if (tab === "snapshots") {
-    const wrap = document.querySelector(".table-wrap");
-    if (wrap) wrap.scrollTop = 0;
-  }
+    `<tr>${cols.map((c) => `<th>${TABLE_HEADERS[c] || c}</th>`).join("")}</tr>`;
+  table.querySelector("tbody").innerHTML = rows.length
+    ? rows.map((r) => `<tr>${cols.map((c) => `<td>${formatCell(r, c)}</td>`).join("")}</tr>`).join("")
+    : `<tr><td colspan="${cols.length}" class="empty-cell">No data</td></tr>`;
+  if (tab === "snapshots") document.querySelector(".table-wrap")?.scrollTo(0, 0);
+}
+
+function showTableLoading() {
+  const cols = TABLE_COLUMNS[activeTab] || ["…"];
+  const table = $("data-table");
+  table.querySelector("thead").innerHTML =
+    `<tr>${cols.map((c) => `<th>${TABLE_HEADERS[c] || c}</th>`).join("")}</tr>`;
+  table.querySelector("tbody").innerHTML =
+    `<tr><td colspan="${cols.length}" class="loading-cell">Loading…</td></tr>`;
 }
 
 function updateCards(summary) {
@@ -353,26 +349,49 @@ function updateCards(summary) {
   $("card-step").textContent = fmt((summary.latest_summary || {}).loop_ms, 1);
 }
 
-async function loadMiners() {
-  miners = await api("/api/catalog");
-  if (!miners.length) {
-    $("status").textContent =
-      "No telemetry found. Enable TAOS_TELEMETRY_ENABLED=1 and restart miner, or run dashboard/seed_demo.py";
-    return;
+function statusMessage(uid, book_id, snapshots) {
+  const stamp = new Date().toLocaleTimeString();
+  if (activeTab === "snapshots" && snapshots?.length) {
+    return `Updated ${stamp} · uid=${uid} book=${book_id} · latest signal ${snapshots[0].closed_at} (newest on top)`;
   }
-
-  const fromUrl = parseRoute(location.pathname);
-  const initial =
-    fromUrl && catalogHas(fromUrl) ? fromUrl : defaultSelection();
-  const replaceUrl = !fromUrl || !catalogHas(fromUrl);
-  applySelection(initial, { updateUrl: true, replaceUrl });
-  refresh();
+  return `Updated ${stamp} · uid=${uid} book=${book_id}`;
 }
 
-async function refresh() {
-  const { uid, validator_id, simulation_id, book_id } = selection();
-  if (!uid || !validator_id || !simulation_id) return;
-  const base = bookApiPath({ validator_id, uid, simulation_id, book_id });
+async function loadMiners() {
+  setStatusText("Loading catalog…");
+  try {
+    miners = await api("/api/catalog");
+  } catch (err) {
+    setStatusText(`Failed to load catalog: ${err.message}`, { error: true });
+    return;
+  }
+  if (!miners.length) {
+    setStatusText(
+      "No telemetry found. Enable TAOS_TELEMETRY_ENABLED=1 and restart miner, or run dashboard/seed_demo.py",
+      { error: true },
+    );
+    return;
+  }
+  const fromUrl = parseRoute(location.pathname);
+  const initial = fromUrl && catalogHas(fromUrl) ? fromUrl : defaultSelection();
+  applySelection(initial, { updateUrl: true, replaceUrl: !fromUrl || !catalogHas(fromUrl) });
+  await refresh({ withLoading: true });
+}
+
+async function refresh(opts = {}) {
+  const withLoading = Boolean(opts.withLoading);
+  const sel = selection();
+  if (!sel.uid || !sel.validator_id || !sel.simulation_id) return;
+  if (refreshInFlight) return;
+
+  refreshInFlight = true;
+  if (withLoading) {
+    setLoadingUI(true);
+    showTableLoading();
+    setRefreshButtonState("loading");
+  }
+
+  const base = bookApiPath(sel);
   try {
     const [summary, midPayload, roundTrips, { orders }, snapshots] = await Promise.all([
       api(`${base}/summary`),
@@ -383,34 +402,42 @@ async function refresh() {
     ]);
 
     updateCards(summary);
-    const key = chartKey(uid, validator_id, simulation_id, book_id);
-    const fitView = key !== lastChartKey;
-    lastChartKey = key;
+    const fitView = chartKey(sel) !== lastChartKey;
+    lastChartKey = chartKey(sel);
     updateChart(midPayload, orders, fitView);
-    renderTable(activeTab, { round_trips: roundTrips, trades: orders, snapshots });
-    const latestSig = snapshots.length ? snapshots[0].closed_at : "";
-    $("status").textContent =
-      activeTab === "snapshots" && latestSig
-        ? `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book_id} · latest signal ${latestSig} (newest row on top)`
-        : `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book_id}`;
+
+    cachedTables = { round_trips: roundTrips, trades: orders, snapshots };
+    renderTable(activeTab, cachedTables);
+    setStatusText(statusMessage(sel.uid, sel.book_id, snapshots));
+    if (withLoading) setRefreshButtonState("ok");
   } catch (err) {
-    $("status").textContent = `Error: ${err.message}`;
+    setStatusText(`Error: ${err.message}`, { error: true });
+    if (withLoading) setRefreshButtonState("idle");
+  } finally {
+    if (withLoading) setLoadingUI(false);
+    refreshInFlight = false;
   }
 }
 
 function setupTabs() {
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => {
+      const tab = btn.dataset.tab;
+      if (tab === activeTab) return;
       document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      activeTab = btn.dataset.tab;
-      refresh();
+      activeTab = tab;
+      if (cachedTables) {
+        renderTable(activeTab, cachedTables);
+        const sel = selection();
+        setStatusText(statusMessage(sel.uid, sel.book_id, cachedTables.snapshots));
+      }
     });
   });
 }
 
 function setupPoll() {
-  $("btn-refresh").addEventListener("click", refresh);
+  $("btn-refresh").addEventListener("click", () => refresh({ withLoading: true }));
   $("sel-uid").addEventListener("change", onUidChange);
   $("sel-validator").addEventListener("change", onValidatorChange);
   $("sel-sim").addEventListener("change", onSelectionChange);
@@ -419,7 +446,8 @@ function setupPoll() {
     const sel = ev.state || parseRoute(location.pathname) || defaultSelection();
     applySelection(sel, { updateUrl: false, replaceUrl: false });
     lastChartKey = null;
-    refresh();
+    cachedTables = null;
+    refresh({ withLoading: true });
   });
   pollTimer = setInterval(refresh, POLL_MS);
 }
@@ -428,7 +456,5 @@ document.addEventListener("DOMContentLoaded", () => {
   initChart();
   setupTabs();
   setupPoll();
-  loadMiners().catch((e) => {
-    $("status").textContent = `Failed to load: ${e.message}`;
-  });
+  loadMiners().catch((e) => setStatusText(`Failed to load: ${e.message}`, { error: true }));
 });
