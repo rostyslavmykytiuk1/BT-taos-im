@@ -311,6 +311,7 @@ To run a miner, use the provided `run_miner.sh`:
 | `-h` | Hotkey name | `miner` |
 | `-u` | Netuid | `79` |
 | `-a` | Axon port | `8091` |
+| `-P` | pm2 process name | `miner` |
 | `-g` | Agent directory | `~/.taos/agents` |
 | `-n` | Agent class name | `SimpleRegressorAgent` |
 | `-m` | Agent params (`param=val ...`) | *(SimpleRegressorAgent defaults)* |
@@ -334,6 +335,32 @@ The script will:
 ./run_miner.sh -G -w taos -h miner -u 79 -a 8091
 ```
 On first run with `-G`: prompts for your R2/Hippius bucket credentials, commits the read key on-chain, and saves all configuration to `.env`. It prints a complete reusable command at the end - useful as a template when running multiple UIDs (adjust `-w`/`-h`/`-a`). Subsequent runs restore saved config with no flags needed. To override training params without changing saved config: `./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"`. The default agent is `HybridTrainingAgent` - a template, not a finished strategy; tune before deploying seriously. Full setup guide: [`doc/gentrx/miner_setup.md`](doc/gentrx/miner_setup.md).
+
+### Local miner dashboard <span id="run-miner-dashboard"><span>
+
+A lightweight operator dashboard (TradingView-style chart, summary cards, round-trip and trade tables) reads telemetry written by the agent process. See [`DASHBOARD_DEVELOPMENT_PLAN.md`](DASHBOARD_DEVELOPMENT_PLAN.md) for architecture.
+
+**Configure via `.env`** (copy from `.env.example`); both `run_miner.sh` and `./dashboard/start.sh` load it.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TAOS_TELEMETRY_ENABLED` | **`1`** (on) | Write SQLite snapshots from the agent; set `0` to disable |
+| `TAOS_TELEMETRY_ROOT` | `~/.taos/telemetry` | Telemetry database directory |
+| `TAOS_DATA_ROOT` | `./agents/data` | Existing `orders.csv` / `trades.csv` path |
+| `TAOS_DASHBOARD_HOST` | **`127.0.0.1`** | Dashboard bind address; use `0.0.0.0` for remote access |
+| `TAOS_DASHBOARD_PORT` | `8787` | Dashboard HTTP port |
+
+`MomentumScalperAgent` records per-book mid, signals, positions, and round-trips. Set `TAOS_TELEMETRY_ENABLED=0` to disable I/O.
+
+**Start the dashboard** (separate terminal):
+
+```bash
+chmod +x dashboard/start.sh dashboard/seed_demo.py
+./dashboard/seed_demo.py          # optional smoke test (UID 999 demo data)
+./dashboard/start.sh                # http://127.0.0.1:8787/
+```
+
+Restart the miner after pulling so pm2 inherits the telemetry env vars. Select your UID, validator folder, and simulation id in the UI.
 
 To run manually without pm2:
 ```bash

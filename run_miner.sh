@@ -15,11 +15,13 @@ export BT_NO_PARSE_CLI_ARGS=false
 # Subsequent update runs: run without any flags — saved GenTRX mode, agent,
 # and params are restored automatically, setup prompts are skipped.
 # Pass -n/-m/-t explicitly to override saved agent/params on a specific run.
+# Pass -P to set the pm2 process name (required when running multiple miners).
 #
 # Examples:
 #   First setup:    ./run_miner.sh -G -w mywallet -h myhotkey
 #   Update/restart: ./run_miner.sh
 #   Override steps: ./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"
+#   Fleet miner:    ./run_miner.sh -P miner-sn79-1 -w sn79 -h sn79-1 -a 8091 -n MomentumScalperAgent ...
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -33,6 +35,7 @@ AGENT_PATH=~/.taos/agents
 AGENT_NAME=SimpleRegressorAgent
 AGENT_PARAMS="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
 LOG_LEVEL=info
+PM2_NAME=miner    # pm2 process name (-P); use a unique name per hotkey/port
 GENTRX=0          # 1 = enable GenTRX training mode
 GENTRX_PARAMS=""  # override GenTRX-specific params (gtx_* keys)
 
@@ -43,10 +46,17 @@ _EXPLICIT_GENTRX_PARAMS=0
 
 # set -a auto-exports every var the sourced file sets, so pm2 (and any other
 # child process) inherits them. Plain `. .env` would only populate this
-# script's shell vars.
+# script's shell vars. Source before defaults so .env overrides apply.
 [ -f "$REPO_ROOT/.env" ] && { set -a; . "$REPO_ROOT/.env"; set +a; }
 
-while getopts e:p:w:h:u:a:g:n:m:t:l:G flag; do
+# Miner telemetry + dashboard (see .env.example; also used by ./dashboard/start.sh)
+TAOS_TELEMETRY_ENABLED="${TAOS_TELEMETRY_ENABLED:-1}"
+TAOS_TELEMETRY_ROOT="${TAOS_TELEMETRY_ROOT:-$HOME/.taos/telemetry}"
+TAOS_DATA_ROOT="${TAOS_DATA_ROOT:-$REPO_ROOT/agents/data}"
+TAOS_DASHBOARD_HOST="${TAOS_DASHBOARD_HOST:-127.0.0.1}"
+TAOS_DASHBOARD_PORT="${TAOS_DASHBOARD_PORT:-8787}"
+
+while getopts e:p:w:h:u:a:g:n:m:t:l:GP: flag; do
     case "${flag}" in
         e) ENDPOINT=${OPTARG};;
         p) WALLET_PATH=${OPTARG};;
@@ -59,6 +69,7 @@ while getopts e:p:w:h:u:a:g:n:m:t:l:G flag; do
         m) AGENT_PARAMS=${OPTARG};     _EXPLICIT_PARAMS=1;;
         t) GENTRX_PARAMS=${OPTARG};    _EXPLICIT_GENTRX_PARAMS=1;;
         l) LOG_LEVEL=${OPTARG};;
+        P) PM2_NAME=${OPTARG};;
         G) GENTRX=1;;
     esac
 done
@@ -99,12 +110,16 @@ fi
 echo "ENDPOINT:        $ENDPOINT"
 echo "WALLET:          $WALLET_PATH $WALLET_NAME / $HOTKEY_NAME"
 echo "NETUID:          $NETUID"
+echo "PM2_NAME:        $PM2_NAME"
 echo "AXON_PORT:       $AXON_PORT"
 echo "AGENT_PATH:      $AGENT_PATH"
 echo "AGENT_NAME:      $AGENT_NAME"
 echo "AGENT_PARAMS:    $AGENT_PARAMS"
 echo "GENTRX:          $GENTRX"
 echo "GENTRX_PARAMS:   ${GENTRX_PARAMS:-(defaults)}"
+echo "TELEMETRY:       enabled=$TAOS_TELEMETRY_ENABLED root=$TAOS_TELEMETRY_ROOT"
+
+export TAOS_TELEMETRY_ENABLED TAOS_TELEMETRY_ROOT TAOS_DATA_ROOT
 
 cd "$REPO_ROOT"
 git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }
@@ -338,7 +353,7 @@ except Exception:
     _ok "GenTRX miner setup complete."
     _info "Agent:         $AGENT_NAME"
     _info "GENTRX_PARAMS: $GENTRX_PARAMS"
-    _info "Monitor:  pm2 logs miner | grep '\\[GTX\\]'"
+    _info "Monitor:  pm2 logs $PM2_NAME | grep '\\[GTX\\]'"
 }
 
 _print_miner_cmd() {
@@ -357,6 +372,7 @@ _print_miner_cmd() {
     printf '        -h %s \\\n'   "$HOTKEY_NAME"
     printf '        -u %s \\\n'   "$NETUID"
     printf '        -a %s \\\n'   "$AXON_PORT"
+    printf '        -P %s \\\n'   "$PM2_NAME"
     printf '        -n %s \\\n'   "$AGENT_NAME"
     printf '        -m %s \\\n'   "$_qparams"
     printf '        -t %s\n'      "$_qgtx"
@@ -387,9 +403,9 @@ read -ra _agent_params <<< "$AGENT_PARAMS"
 read -ra _gentrx_params <<< "$GENTRX_PARAMS"
 
 if [ "$GENTRX" = "1" ]; then
-    pm2 delete miner 2>/dev/null || true
+    pm2 delete "$PM2_NAME" 2>/dev/null || true
     pm2 start miner.py \
-        --name=miner \
+        --name="$PM2_NAME" \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
         -- \
@@ -420,17 +436,17 @@ print(m.group(1) if m else '')
         TRAIN_LOG="$REPO_ROOT/taos/im/neurons/$_gtx_out/gradients/train.log"
     fi
 
-    tmux kill-session -t miner 2>/dev/null || true
-    tmux new-session -d -s miner -n 'miner' 'htop -F miner.py'
-    tmux set-option -t miner mouse on
-    tmux split-window -v -p 50 -t miner:miner.0 "pm2 logs miner"
-    tmux split-window -h -p 50 -t miner:miner.1 "echo 'Waiting for training log...'; tail -F '$TRAIN_LOG' 2>/dev/null"
-    tmux select-pane -t miner:miner.0
-    tmux attach-session -t miner
+    tmux kill-session -t "$PM2_NAME" 2>/dev/null || true
+    tmux new-session -d -s "$PM2_NAME" -n "$PM2_NAME" "htop -F $PM2_NAME"
+    tmux set-option -t "$PM2_NAME" mouse on
+    tmux split-window -v -p 50 -t "$PM2_NAME:$PM2_NAME.0" "pm2 logs $PM2_NAME"
+    tmux split-window -h -p 50 -t "$PM2_NAME:$PM2_NAME.1" "echo 'Waiting for training log...'; tail -F '$TRAIN_LOG' 2>/dev/null"
+    tmux select-pane -t "$PM2_NAME:$PM2_NAME.0"
+    tmux attach-session -t "$PM2_NAME"
 else
-    pm2 delete miner 2>/dev/null || true
+    pm2 delete "$PM2_NAME" 2>/dev/null || true
     pm2 start miner.py \
-        --name=miner \
+        --name="$PM2_NAME" \
         --interpreter python \
         --cwd "$REPO_ROOT/taos/im/neurons" \
         -- \
@@ -446,5 +462,5 @@ else
         --agent.params "${_agent_params[@]}"
     pm2 save || true
     pm2 startup || true
-    pm2 logs miner
+    pm2 logs "$PM2_NAME"
 fi
