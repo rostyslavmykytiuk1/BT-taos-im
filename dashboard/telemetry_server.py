@@ -198,7 +198,8 @@ def get_snapshots(
         conn.close()
 
     out: list[dict[str, Any]] = []
-    for r in reversed(rows):
+    # Newest first (matches Signals table: read down = further into the past).
+    for r in rows:
         d = dict(r)
         ts_ns = int(d.pop("ts_ns", 0) or 0)
         time_sec = sim_seconds_from_ts_ns(ts_ns) if ts_ns else 0

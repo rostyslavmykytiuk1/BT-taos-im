@@ -309,13 +309,24 @@ function formatCell(row, col) {
 function renderTable(tab, data) {
   const cols = TABLE_COLUMNS[tab] || [];
   const rows = data[tab] || [];
-  const headers = { time_label: "time" };
+  const headers = {
+    time_label: "time",
+    // MeanReversionAgent maps dev_bps into signal_flow (see agent _snap).
+    signal_trend_bps: "trend_bps",
+    signal_flow: "dev_bps",
+    signal_imb: "imb",
+    closed_at: "sim_time",
+  };
   const table = $("data-table");
   table.querySelector("thead").innerHTML =
     `<tr>${cols.map((c) => `<th>${headers[c] || c}</th>`).join("")}</tr>`;
   table.querySelector("tbody").innerHTML = rows
     .map((r) => `<tr>${cols.map((c) => `<td>${formatCell(r, c)}</td>`).join("")}</tr>`)
     .join("");
+  if (tab === "snapshots") {
+    const wrap = document.querySelector(".table-wrap");
+    if (wrap) wrap.scrollTop = 0;
+  }
 }
 
 function updateCards(summary) {
@@ -377,8 +388,11 @@ async function refresh() {
     lastChartKey = key;
     updateChart(midPayload, orders, fitView);
     renderTable(activeTab, { round_trips: roundTrips, trades: orders, snapshots });
+    const latestSig = snapshots.length ? snapshots[0].closed_at : "";
     $("status").textContent =
-      `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book_id}`;
+      activeTab === "snapshots" && latestSig
+        ? `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book_id} · latest signal ${latestSig} (newest row on top)`
+        : `Updated ${new Date().toLocaleTimeString()} · uid=${uid} book=${book_id}`;
   } catch (err) {
     $("status").textContent = `Error: ${err.message}`;
   }

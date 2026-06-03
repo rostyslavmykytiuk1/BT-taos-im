@@ -1,10 +1,30 @@
 # Subnet 79 (MVTRX / τaos) — Miner Strategy Report
 
 > Working document to design a competitive trading agent for netuid 79.
-> Combines repo/code analysis with live on-chain + dashboard observations.
-> All "current values" reflect simulation `20260528_1007` as seen on the
-> UID-0 validator dashboard. **Scoring config can change weekly — re-verify
-> the Scoring Config table before every serious deployment.**
+> Combines repo/code analysis with live on-chain + dashboard observations
+> **plus an empirical price-path study of the target validator's books** (§3B).
+> All "current values" reflect simulation `20260528_1007`.
+> **Scoring config can change weekly — re-verify the Scoring Config table
+> before every serious deployment.**
+
+> ### Scope decision (locked)
+> **We optimize for ONE validator only:**
+> `5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF`.
+> It carries effectively all the stake/weight, so aligning to its simulation
+> and scoring config is the entire game. Our miner still answers other
+> validators, but **all tuning targets this one**. (This is the hotkey shown as
+> "UID 0" on the Grafana Validators page — the owner/aggregator validator.)
+
+> ### TL;DR — the findings that change everything
+> An empirical study of all **128 books** on this validator's tape
+> (sim `20260528_1007`, 178k trades) shows:
+> 1. Returns are **mean-reverting at every horizon** (1 s–120 s); momentum is
+>    essentially absent → **do not run a momentum scalper**.
+> 2. **123/128 books** show **sharp dumps (~20 bps/s) and slow grinds up
+>    (~0.3 bps/s)**; after a ≥50 bps cliff, median **+63 bps recovery in ~5 min**.
+>    The next agent must treat this **asymmetrically** (§3B.5, §5.3).
+> Recommended pivot: **mean-reversion range-fader** with explicit **crash–recovery**
+> rules — start from `MeanReversionAgent.py`, not `MomentumScalperAgent.py`.
 
 ---
 
@@ -203,6 +223,143 @@ The leaderboard is **a few operators running fleets of UIDs**, co-located:
 
 ---
 
+## 3B. Empirical price-path analysis — this validator's 128 books
+
+Source data: `agents/data/189/5EWwdZB7…/20260528_1007/trades.csv` (the actual
+market tape this validator produced), **178,485 trades across all 128 books**.
+Method: per book, reconstruct last-trade price series, resample to fixed bars,
+measure direction, range, volatility, trend-vs-chop, and **return
+autocorrelation** (the momentum-vs-mean-reversion test).
+
+### 3B.1 Per-book summary (distribution across 128 books)
+
+| Metric | Min | Median | Max | Meaning |
+|--------|-----|--------|-----|---------|
+| Trades / book | 620 | 1,371 | 2,586 | Plenty of fills to round-trip everywhere |
+| Total return (day) | **−13.4%** | +0.9% | **+7.7%** | Net daily drift, both signs |
+| Range (hi−lo)/p0 | 0.8% | 3.6% | 18.1% | How much room a fader has |
+| 1 s log-ret vol | 0.03% | 0.09% | 0.52% | Per-second move size |
+| Trendiness¹ | 0.04 | 0.58 | 1.00 | 1 = clean trend, 0 = round-trips to start |
+| Max drawdown | 0.1% | 2.3% | 18.0% | Worst peak→trough |
+| Max run-up | 0.8% | 3.0% | 12.1% | Best trough→peak |
+| Trades / hour | 417 | 920 | 1,710 | Liquidity is high on every book |
+
+¹ trendiness = |p_end − p_start| / (hi − lo): close to 1 means the move was
+one-directional; near 0 means price wandered and came back.
+
+### 3B.2 Pattern buckets (shape × volatility regime)
+
+Classified by net direction, trendiness, and volatility tercile:
+
+| Shape | Vol regime | # books | Example books |
+|-------|-----------|---------|---------------|
+| mixed (drift + chop) | lo-vol | 32 | 5, 6, 9, 12, 21, 28, 29, 33 |
+| trend up | lo-vol | 27 | 2, 4, 13, 14, 20, 25, 26, 31 |
+| choppy range | lo-vol | 24 | 3, 7, 16, 43, 46, 48, 50, 55 |
+| choppy range | hi-vol | 15 | 1, 8, 11, 15, 17, 18, 24, 44 |
+| trend down | hi-vol | 14 | 0, 19, 22, 23, 27, 36, 38, 65 |
+| mixed | hi-vol | 12 | 10, 40, 47, 63, 76, 87, 88, 99 |
+| trend down | lo-vol | 2 | 54, 73 |
+| trend up | hi-vol | 2 | 30, 32 |
+
+**Shape totals:** mixed **44**, choppy-range **39**, trend-up **29**,
+trend-down **16**.
+
+Read this as: **~65% of books are range/chop or mixed** (no clean trend), and
+trends split both directions. There is **no single dominant trend** to ride —
+which already argues against a pure momentum approach.
+
+### 3B.3 The decisive test — return autocorrelation by timeframe
+
+Lag-1 autocorrelation of bar returns, across all 128 books:
+
+| Bar size | Median ACF | Mean-reverting books (ACF<−0.03) | Momentum books (ACF>+0.03) |
+|----------|-----------|----------------------------------|----------------------------|
+| 1 s | −0.018 | 53 | 0 |
+| 5 s | −0.016 | 43 | 2 |
+| 15 s | −0.022 | 57 | 5 |
+| 30 s | −0.022 | 57 | 7 |
+| 60 s | −0.055 | 81 | 11 |
+| 120 s | **−0.095** | **92** | 11 |
+
+Plus: the **average return in the step right after a +1σ jump is negative**
+(≈ −0.02σ, median across books) → **spikes tend to reverse**, exactly the
+"sudden dump then recover" behavior seen on the book-0 chart.
+
+**Interpretation:**
+- **Momentum is statistically absent** (0–11 books out of 128 at any horizon).
+- **Mean-reversion is pervasive and grows with horizon** (53 → 92 books).
+- This is consistent with the market's construction (§ background agents):
+  **fundamentalist stylized traders + the ALGO trader pull price back toward
+  FP**, and **HFT market-makers** dampen momentum. Price oscillates around a
+  slowly-moving FP anchor rather than trending tick-to-tick.
+
+### 3B.4 Why this contradicts our current agent
+
+`MomentumScalperAgent` enters **only when trend + LOB imbalance + flow all
+agree in the same direction**, i.e. it **buys strength / sells weakness**. On a
+tape where the next move after a push is, on average, a **pullback**, that
+entry rule systematically enters **right before reversion** — paying taker fees
+to do it. That is the worst quadrant for Kappa-3 (LPM3 cubes the resulting
+losing round-trips).
+
+### 3B.5 The “sudden dump, slow rise” pattern (explicit check)
+
+This is the shape you called out on book 0 (stair-step up, vertical cliff, then
+gradual recovery). We **did not** bucket it as its own label in the first pass,
+but a dedicated asymmetry test on the same tape confirms it is **the dominant
+microstructure on this validator**, not an occasional outlier.
+
+Per book (1 s resampled last-trade prices, sim `20260528_1007`):
+
+| Measure | Result |
+|---------|--------|
+| Median **drop speed** (largest drop per second of wall time) | **~20 bps/s** |
+| Median **rise speed** (largest rise per second of wall time) | **~0.3 bps/s** |
+| Median rise-speed / drop-speed ratio | **~0.015** (rises are ~60× slower) |
+| Books matching “sharp dump + slower grind up” heuristic | **123 / 128** |
+| Books with ≥50 bps drop inside 60 s at least once | **109 / 128** |
+| **After** such a drop: median return over next ~300 s | **+63 bps** (97/109 books positive) |
+
+**What this means mechanically:**
+- **Dumps** = aggressive taker sell sweeps through the LOB (last-print cliff).
+  They are **fast** and often **overshoot** fair value.
+- **Recovery** = background ALGO/stylized flow + HFT makers **pull price back
+  toward FP** over many small steps → **slow grind**, not a V-reversal in one tick.
+- It is **not** symmetric: you cannot mirror long/short rules; the edge is
+  **asymmetric fade timing**.
+
+**Examples from the tape (book 0–style):**
+
+| Book | Max drop (60 s window) | Best rise window | Drop speed | Rise speed |
+|------|------------------------|------------------|------------|------------|
+| 0 | ~702 bps in 5 s | ~340 bps in 300 s | ~140 bps/s | ~1.1 bps/s |
+| 19 | ~1462 bps in 5 s | ~169 bps in 600 s | ~292 bps/s | ~0.3 bps/s |
+| 22 | ~743 bps in 5 s | ~76 bps in 300 s | ~149 bps/s | ~0.3 bps/s |
+
+So the Grafana book-0 chart and the FP chart diverge **because FP never takes
+the cliff** — it is the slow anchor; the **trade-price** series takes the sweep
+and then mean-reverts on a longer clock.
+
+### 3B.6 What the patterns imply for strategy routing
+
+- **Choppy-range + mixed (≈83 books):** core money-makers for a **fade**
+  strategy — sell upper band / buy lower band, target reversion to a rolling
+  mean/microprice, tight stop on band break.
+- **Trend books (≈45, both directions):** a fader must avoid being run over.
+  Use a **trend filter** (e.g. slope of a longer EMA / position vs FP-proxy):
+  in a confirmed trend, only fade **against** the minor counter-swings, or
+  widen the entry band and shrink size, or skip.
+- **Volatility regime** sets **band width and size**: hi-vol books → wider
+  entry offsets, smaller size, same risk budget; lo-vol → tighter bands,
+  more round-trips.
+
+> One adaptive strategy can cover all books if its **band width and trend
+> filter are computed per book from live stats** — we do **not** need separate
+> code per pattern, just per-book parameters derived at runtime.
+
+---
+
 ## 4. The register → profit → deregister cycle (your observation)
 
 Operators run **many UIDs**. Behavior pattern: spike to the top, extract
@@ -232,71 +389,174 @@ current rules:
 
 ---
 
-## 5. Target strategy profile (how to beat them)
+## 5. Target strategy — **mean-reversion range-fader** (recommended)
 
-Optimize for **what the scoring actually pays today**: consistent, low-downside
-**realized round-trip PnL across all 128 books** — not volume.
+Two facts decide the design:
+1. **Scoring pays** consistent, low-downside **realized round-trip PnL across
+   all 128 books** (Kappa-3, LPM3 cubes losses; volume is not rewarded today).
+2. **The tape mean-reverts** at every horizon (§3B). Fade extremes, don't chase.
 
-### Design principles
+So the edge is: **systematically sell local highs and buy local lows around a
+slowly-moving fair value, capture the reversion, close fast, repeat — on every
+book, with tight risk.** This is the opposite of the current momentum agent.
 
-1. **Maximize realized PnL per round-trip, minimize losing round-trips.**
-   LPM3 cubes losses — a strategy with a high *win-rate / small controlled
-   losses* beats a higher-average strategy with fat left-tail losses, even at
-   equal mean. Tight stop discipline; never let a round-trip blow out.
-2. **Always close positions to realize PnL.** Unrealized inventory ≠ score.
-   Enter with a predefined exit; prefer trades you can round-trip within the
-   3h window. Aim for **≥ 3 realized closes per book** within the window so
-   every book scores.
-3. **Be uniform across all 128 books.** Run the same logic on every book;
-   keep per-book Kappa tight to avoid the IQR outlier penalty. Don't let a few
-   books rot (they become 0.0 beyond the inactive tolerance).
-4. **Don't chase volume.** Stay well under 500k/book. Extra volume = extra
-   fees + downside exposure for zero score (while impact=0). Reassess instantly
-   if `activity_impact` becomes > 0 in a future config.
-5. **Latency matters.** Faster responses = less fill delay/slippage. Co-locate
-   near major validators; keep `respond()` fast (consider `lazy_load=1`,
-   parallel book processing, avoid heavy per-tick work).
-6. **Exploit fee regime per book.** Under DIS, in books where takers get
-   rebates, taking is *cheaper than free*; where makers get rebates, posting is
-   subsidized. Read `accounts[book].fees.maker_fee_rate/taker_fee_rate` each
-   tick and route order type to the side currently being paid.
-7. **Mild, controlled directional tilt** can help in trending books, but it
-   must be expressed through **closed round-trips**, not buy-and-hold.
-
-### Signal candidates (start, then differentiate)
-
-- Short-horizon **microstructure** signals: LOB imbalance (microprice),
-  trade-sign autocorrelation, queue dynamics — cheap, fast, per-tick.
-- A small **online predictor** (cf. `SimpleRegressorAgent`) on OHLC + trade/
-  order imbalance to predict next-interval return; trade only when |signal| is
-  high and you have a defined exit.
-- **Regime gating** (cf. `HybridTrainingAgent`): flat→quote, strong signal→
-  enter, holding→manage+stop. But the stock template self-interferes if copied
-  — replace the signal and tune thresholds per UID.
-
-### Concrete scaffolding to build
+### 5.1 Core loop (one adaptive strategy, per-book parameters)
 
 ```
-for each book:
-  1. update fast features (imbalance, microprice, short return, fee state)
-  2. if holding a position:
-       - exit at target or stop (realize PnL); never widen risk
-  3. elif strong, high-confidence signal AND no position:
-       - enter sized small, with a pre-set close plan
-  4. else:
-       - optionally post inside-spread on the fee-favored side, GTT short expiry
-  5. keep ≥3 round-trips/book/3h; keep per-book PnL variance low
-  6. stay < ~50% of volume cap as a safety margin
+for each book (read everything from state.config / live stats):
+  fair      = microprice                 # (bid*askVol + ask*bidVol)/(askVol+bidVol)
+  ref       = EMA(fair, mean_window)     # slow anchor ≈ local fair value
+  sigma     = rolling stdev of fair (or ATR-like band) on this book
+  band      = k_entry * sigma            # per-book, scales with volatility
+  trend     = slope of a longer EMA      # trend filter (see 5.3)
+
+  if holding a position:
+      exit when fair reverts to ref  (take-profit)         # realize PnL
+      OR price breaks band by k_stop*sigma (stop)          # cap LPM3 tail
+      OR max_hold elapsed                                   # recycle capital
+  elif flat and |fair - ref| >= band and trend filter allows:
+      fade it:  price above ref -> SELL toward ref
+                price below ref -> BUY  toward ref
+      prefer a MAKER limit at/just inside the band edge (earn rebate, better fill px)
+      fall back to a small taker only if fee regime favors taking (5.4)
+  keep >=3 realized round-trips / book / 3h; size for low per-book PnL variance
+  stay < ~50% of the 500k/book volume cap
 ```
 
-### Risk / anti-patterns to avoid
+### 5.2 Why maker-first here (big change vs current agent)
 
+- Taker round-trip cost ≈ 2 × 2.3 bps = **~4.6 bps**; median 1 s move is ~9 bps,
+  so a taker fader's edge is thin. **Posting limits at the band edge** both
+  (a) earns a **better entry price** and (b) can collect a **maker rebate** when
+  the book is taker-heavy (DIS). This widens the per-round-trip margin that
+  Kappa-3 rewards.
+- Mean-reversion entries are **naturally patient** — you *want* to be the
+  resting liquidity that gets hit when price overshoots, then reverts.
+- Risk: maker limits may not fill. Mitigate with **short GTT expiries**,
+  re-quoting each tick, and a taker fallback only when the signal is strong and
+  the fee regime is favorable.
+
+### 5.3 Crash–recovery asymmetry (must be explicit)
+
+The §3B.5 pattern is **exactly** what a mean-reversion fader should exploit,
+but only with **asymmetric rules** — not symmetric TP/SL/hold on long and short.
+
+| Phase | What the tape does | What the agent should do |
+|-------|-------------------|-------------------------|
+| **Pre-cliff rip** | Slow grind up, then stretched above mean | **Fade shorts** (sell above ref) when stretch + flow not still aggressively buying (`imb` gate, as in `MeanReversionAgent`) |
+| **Active cliff** | Vertical dump in seconds | **Do not catch the knife** — no new longs while 1 s return < −X bps or while sell-flow still dominant; optional **stand down** until volatility of last N s drops |
+| **Post-cliff floor** | Overshoot below mean; median +63 bps in ~5 min | **Fade longs** (buy below ref) with **wider TP / longer `max_hold`** than normal — recovery is slow, so exits at ref too early leave money on the table |
+| **Slow grind up** | Price creeps back; short squeeze risk for early shorts | If still short from pre-cliff fade: **tighter stop / time stop** — do not assume a fast snap-back down; the rise leg is slow but persistent |
+
+Concrete parameters to tune in implementation (not hardcoded):
+- `crash_bps` — e.g. 30–50 bps in ≤30–60 s → enter “post-crash” mode for that book
+- `recovery_hold_mult` — e.g. 1.5–2.5× normal `max_hold_s` for longs entered post-crash
+- `recovery_tp_bps` — slightly wider than standard `tp_bps` (grind gives time)
+- `knife_catch_block_s` — block new longs for N seconds after crash unless imbalance flips
+- `short_stop_tight_bps` — tighter stop on shorts during recovery grind (asymmetric vs long)
+
+`MeanReversionAgent` already has the right **skeleton** (fade stretch + imbalance
+gate + maker entry + realize on TP/SL/time). The **gap** vs production-ready
+crash-awareness is: no **crash detector**, no **post-crash hold/TP asymmetry**, and
+no **knife-catch block**. Those are the first additions when we implement §5.
+
+### 5.4 Trend filter (so trend books don't run you over)
+
+≈45 books trend (both directions). A fader must not keep buying a falling book.
+Gate entries with a **longer-horizon slope** (e.g. EMA over minutes, or sign of
+cumulative drift vs an FP-proxy built from the slow EMA):
+- **Range/mixed book (slope ≈ 0):** fade both sides freely.
+- **Confirmed up-trend:** only fade **dips** (buy below ref); skip/Shrink shorts.
+- **Confirmed down-trend:** only fade **rips** (sell above ref); skip/Shrink longs.
+- **Strong trend + hi-vol:** widen band, cut size, or stand down on that book.
+
+This makes a single code path adapt across all 8 pattern buckets in §3B.
+
+### 5.5 Exploit per-book fee regime (DIS)
+
+Read `accounts[book].fees` each tick:
+- **Takers being rebated** → a taker fade is *paid to enter*; use taker for
+  speed/fill certainty.
+- **Makers being rebated** (book taker-heavy) → strongly prefer posting limits.
+Route order type to whichever side is currently subsidized.
+
+### 5.6 Risk discipline (Kappa-3 is unforgiving)
+
+- **LPM3 cubes losses** → one blow-out round-trip can sink a book's Kappa. Hard
+  per-trade stop at `k_stop*sigma`; never average down past a fixed inventory.
+- **Always realize.** Unrealized inventory scores nothing and dies on
+  reset/cap. Enter only with a pre-set exit; ensure ≥3 closes/book/3h.
+- **Uniformity across books** to avoid the IQR outlier penalty — same logic
+  everywhere, per-book params from live stats; don't let books rot to 0.
+- **Latency.** Keep `respond()` fast (parallel books, light per-tick math); the
+  sim delays fills by your response time, and faders care about fill price.
+
+### 5.7 Implementation status (DONE) + offline backtest
+
+`agents/MeanReversionAgent.py` now implements all of §5/§5.3:
+microprice band fade, per-book dispersion band, trend filter, crash detector,
+post-crash long asymmetry (wider TP / longer hold), knife-catch block,
+**short-block after crash**, maker-first entries with fee-aware taker fallback,
+volume-cap tracking, full telemetry + round-trip recording, and per-UID jitter.
+
+**Offline backtest** on this validator's tape (mid-fill replay, all 128 books,
+sim `20260528_1007`) — signal quality only, not the full matching engine:
+
+| Config | Round-trips | Win-rate | Mean / RT | Per-book Kappa-3 proxy¹ |
+|--------|-------------|----------|-----------|--------------------------|
+| Fade only (no crash guards) | 2,628 | 61.5% | +10.2 bps | +0.578 |
+| **+ block shorts on recently-crashed books** | 1,906 | **70.7%** | **+14.5 bps** | **+0.884** |
+
+¹ proxy = mean / cbrt(LPM3), median across books; not the validator's exact
+normalization, but the same downside-cubing shape — directionally meaningful.
+
+**Key learnings baked into the agent:**
+- **Shorting a freshly-dumped book is the dominant tail.** The slow grind up
+  (§3B.5) runs shorts over. Blocking shorts for `short_block_after_crash_s`
+  (default 30 min) both *raised* win-rate and *cut* churn (fewer, better RTs) —
+  exactly what Kappa-3 rewards.
+- Fewer round-trips with higher quality **beats** more volume (consistent with
+  the leaderboard: top miners ~7-8k RT, not the 15-18k churners).
+- Residual catastrophic losses are **gap-throughs within one publish interval**
+  on a cliff — unavoidable by stop level alone; mitigated by *not being
+  positioned into cliffs* (knife-block for longs, short-block for shorts).
+
+### 5.8 Score-awareness vs the leaderboard (target operating point)
+
+From §3 (this validator, sim `20260528_1007`): top miners run
+**24H Vol ≈ 35-45k**, **24H RT ≈ 7-8k**, Activity = 1.0 (impact 0), Penalty = 0,
+Trading Score ≈ 0.41 (Kappa3 Score ≈ 0.52, raw median Kappa3 ≈ 0.08-0.095).
+
+Our configured operating point (defaults in `.env`):
+- `volume_safety=0.5` → cap ourselves at **250k/book** (we use far less; ~20 RT/
+  book/day × ~1.8k notional ≈ well under cap). **Do not chase the 15-18k RT
+  churn** — it loses now.
+- Aim for **consistent positive realized PnL on every book** (all 128 scored in
+  backtest) to keep the **cross-book IQR penalty at 0** and the median Kappa
+  high.
+- Re-check weekly: if `activity_impact` goes > 0, volume becomes a lever and we
+  raise `volume_safety` / round-trip frequency deliberately.
+
+### 5.9 Concrete next experiment
+
+We already have `MeanReversionAgent.py` in the repo as a starting point. Plan:
+1. **Repurpose toward this design** (microprice band fade + trend filter +
+   maker-first + per-book sigma) rather than extending the momentum agent.
+2. **Backtest via `agents/proxy/run`** against `simulation_0.xml`; measure
+   per-book realized-PnL distribution and simulated Kappa-3, **not** just total
+   PnL.
+3. Compare head-to-head vs `MomentumScalperAgent` on the same offline tape; the
+   §3B autocorrelation result predicts the fader wins on realized round-trips.
+
+### Anti-patterns to avoid
+
+- ❌ **Momentum entries** (buy strength / sell weakness) — fights the tape (§3B).
 - ❌ Volume farming (UIDs 32/144 prove it loses now).
-- ❌ Passive limits that never fill (no realized PnL → no Kappa).
-- ❌ Accumulating directional inventory you can't close (dies on reset/cap, and
-  shows as unrealized, not scored).
+- ❌ Passive limits that never fill (no realized PnL → no Kappa) — use short GTT
+  + re-quote + taker fallback.
+- ❌ Accumulating directional inventory you can't close.
 - ❌ One great book + several bad books (IQR penalty + inactive-book zeros).
-- ❌ Slow `respond()` → timeouts (no instructions submitted) or large slippage.
+- ❌ Slow `respond()` → timeouts or large slippage.
 
 ---
 
@@ -329,10 +589,14 @@ for each book:
 
 ## 8. Immediate next steps
 
-1. **Build a baseline agent** on the scaffolding in §5 (microstructure signal +
-   strict round-trip/exit discipline + all-book uniformity).
+1. **Pivot from momentum to mean-reversion.** Build the §5 range-fader
+   (microprice band + per-book sigma + trend filter + maker-first + strict
+   round-trip/exit discipline + all-book uniformity). Start from
+   `MeanReversionAgent.py`, not `MomentumScalperAgent.py`.
 2. **Backtest locally** via `agents/proxy/run` against the live
-   `simulation_0.xml` background model before any chain deployment.
+   `simulation_0.xml` background model before any chain deployment; report
+   per-book realized-PnL distribution + simulated Kappa-3, and a head-to-head
+   vs the momentum agent on the same tape.
 3. **Deploy on testnet (netuid 366)** to validate latency, success rate, and
    that every book scores (≥3 round-trips/book/3h, Penalty ~0).
 4. **Tune for Kappa-3**: track per-book realized-PnL distribution; cut left-tail
@@ -510,5 +774,7 @@ def respond(self, state):
 
 *Generated from analysis of the sn-79 repo (`taos/im/validator/reward.py`,
 `kappa.py`, `config/__init__.py`, `simulation_0.xml`, `agents/`), the Finney
-netuid-79 metagraph, and the UID-0 validator Grafana dashboard
-(sim 20260528_1007).*
+netuid-79 metagraph, the validator `5EWwdZB7…` Grafana dashboard, and an
+**empirical study of that validator's full trade tape** (§3B:
+`agents/data/189/5EWwdZB7…/20260528_1007/trades.csv`, 178,485 trades, 128
+books — direction, range, volatility, and return-autocorrelation per book).*
