@@ -218,6 +218,7 @@ def get_round_trips(
     simulation_id: str,
     book_id: int,
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
+    chart_limit: Annotated[int, Query(ge=10, le=10000)] = 5000,
 ) -> list[dict[str, Any]]:
     conn = _connect(telemetry_db(uid, validator_id, simulation_id))
     try:
@@ -231,13 +232,7 @@ def get_round_trips(
     finally:
         conn.close()
 
-    t_min, t_max = visible_sim_range(uid, validator_id, simulation_id, book_id, 1, _connect)
     formatted = [format_round_trip(dict(r)) for r in rows]
-    if t_max > t_min:
-        formatted = [
-            row for row in formatted
-            if t_min <= int(row.get("time_sec") or 0) <= t_max
-        ]
     formatted.reverse()
     for i, row in enumerate(formatted, start=1):
         row["seq"] = i
@@ -251,8 +246,17 @@ def get_trades(
     simulation_id: str,
     book_id: int,
     limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+    chart_limit: Annotated[int, Query(ge=10, le=10000)] = 5000,
 ) -> dict[str, Any]:
-    return load_trades_for_api(uid, validator_id, simulation_id, book_id, limit, _connect)
+    return load_trades_for_api(
+        uid,
+        validator_id,
+        simulation_id,
+        book_id,
+        limit,
+        _connect,
+        chart_limit=chart_limit,
+    )
 
 
 @app.get("/")

@@ -20,7 +20,7 @@ const TABLE_COLUMNS = {
     "realized_pnl", "hold", "reason",
   ],
   trades: [
-    "seq", "action", "time_label", "side", "price", "quantity",
+    "seq", "action", "reason", "time_label", "side", "price", "quantity",
     "pos_before", "pos_after", "fills", "orderId",
   ],
   snapshots: [
@@ -34,6 +34,7 @@ const TABLE_HEADERS = {
   signal_trend_bps: "trend_bps",
   signal_flow: "dev_bps",
   signal_imb: "imb",
+  reason: "reason",
 };
 
 const LINE_OPTS = {
@@ -53,6 +54,8 @@ let lastChartKey = null;
 let cachedTables = null;
 let applyingRoute = false;
 let refreshInFlight = false;
+let refreshSeq = 0;
+let pendingRefresh = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -68,6 +71,13 @@ function setLoadingUI(active) {
     $(id)?.setAttribute("aria-hidden", active ? "false" : "true");
   }
   if (active) setStatusText("Loading data from API…");
+}
+
+/** Let the browser paint overlays before a long await. */
+function paintLoadingFrame() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
 }
 
 function setRefreshButtonState(state) {
@@ -277,13 +287,27 @@ function chartKey(sel) {
   return `${sel.uid}|${sel.validator_id}|${sel.simulation_id}|${sel.book_id}`;
 }
 
+function ordersInChartRange(midPayload, orders) {
+  const pts = midPayload?.mid ?? [];
+  if (!pts.length) return [];
+  let tMin = midPayload?.range?.[0];
+  let tMax = midPayload?.range?.[1];
+  if (tMin == null || tMax == null) {
+    tMin = pts[0].time;
+    tMax = pts[pts.length - 1].time;
+  }
+  return (orders || []).filter(
+    (o) => o.time != null && o.time >= tMin && o.time <= tMax && MARKER_STYLE[o.action],
+  );
+}
+
 function updateChart(midPayload, orders, fitView) {
+  const inRange = ordersInChartRange(midPayload, orders);
   midSeries.setData(
     (midPayload?.mid ?? []).map((p) => ({ time: toChartTime(p.time), value: p.value })),
   );
   midSeries.setMarkers(
-    (orders || [])
-      .filter((o) => o.time != null && MARKER_STYLE[o.action])
+    inRange
       .map((o) => {
         const s = MARKER_STYLE[o.action];
         return { time: toChartTime(o.time), position: s.position, shape: s.shape, color: s.color, size: s.size };
@@ -310,9 +334,14 @@ function renderTable(tab, data) {
   const table = $("data-table");
   table.querySelector("thead").innerHTML =
     `<tr>${cols.map((c) => `<th>${TABLE_HEADERS[c] || c}</th>`).join("")}</tr>`;
+  let emptyMsg = "No data";
+  if (!rows.length && tab === "round_trips") {
+    emptyMsg =
+      "No completed round trips for this book. Only full flat-to-flat cycles appear here; partial closes are in Market orders.";
+  }
   table.querySelector("tbody").innerHTML = rows.length
     ? rows.map((r) => `<tr>${cols.map((c) => `<td>${formatCell(r, c)}</td>`).join("")}</tr>`).join("")
-    : `<tr><td colspan="${cols.length}" class="empty-cell">No data</td></tr>`;
+    : `<tr><td colspan="${cols.length}" class="empty-cell">${emptyMsg}</td></tr>`;
   if (tab === "snapshots") document.querySelector(".table-wrap")?.scrollTo(0, 0);
 }
 
@@ -378,17 +407,30 @@ async function loadMiners() {
   await refresh({ withLoading: true });
 }
 
+function beginLoadingUI() {
+  setLoadingUI(true);
+  showTableLoading();
+  setRefreshButtonState("loading");
+}
+
 async function refresh(opts = {}) {
   const withLoading = Boolean(opts.withLoading);
   const sel = selection();
   if (!sel.uid || !sel.validator_id || !sel.simulation_id) return;
-  if (refreshInFlight) return;
 
+  if (refreshInFlight) {
+    if (!withLoading) return;
+    refreshSeq += 1;
+    pendingRefresh = { withLoading: true };
+    beginLoadingUI();
+    return;
+  }
+
+  const seq = ++refreshSeq;
   refreshInFlight = true;
   if (withLoading) {
-    setLoadingUI(true);
-    showTableLoading();
-    setRefreshButtonState("loading");
+    beginLoadingUI();
+    await paintLoadingFrame();
   }
 
   const base = bookApiPath(sel);
@@ -396,26 +438,37 @@ async function refresh(opts = {}) {
     const [summary, midPayload, roundTrips, { orders }, snapshots] = await Promise.all([
       api(`${base}/summary`),
       api(`${base}/mid?resolution=1&limit=5000`),
-      api(`${base}/round_trips?limit=100`),
-      api(`${base}/trades?limit=500`),
+      api(`${base}/round_trips?limit=100&chart_limit=5000`),
+      api(`${base}/trades?limit=500&chart_limit=5000`),
       api(`${base}/snapshots?limit=80`),
     ]);
+
+    if (seq !== refreshSeq) return;
 
     updateCards(summary);
     const fitView = chartKey(sel) !== lastChartKey;
     lastChartKey = chartKey(sel);
-    updateChart(midPayload, orders, fitView);
+    const chartOrders = ordersInChartRange(midPayload, orders);
+    updateChart(midPayload, chartOrders, fitView);
 
-    cachedTables = { round_trips: roundTrips, trades: orders, snapshots };
+    cachedTables = { round_trips: roundTrips, trades: chartOrders, snapshots };
     renderTable(activeTab, cachedTables);
     setStatusText(statusMessage(sel.uid, sel.book_id, snapshots));
     if (withLoading) setRefreshButtonState("ok");
   } catch (err) {
-    setStatusText(`Error: ${err.message}`, { error: true });
-    if (withLoading) setRefreshButtonState("idle");
+    if (seq === refreshSeq) {
+      setStatusText(`Error: ${err.message}`, { error: true });
+      if (withLoading) setRefreshButtonState("idle");
+    }
   } finally {
-    if (withLoading) setLoadingUI(false);
     refreshInFlight = false;
+    const current = seq === refreshSeq;
+    if (withLoading && current) setLoadingUI(false);
+    if (pendingRefresh) {
+      const next = pendingRefresh;
+      pendingRefresh = null;
+      void refresh(next);
+    }
   }
 }
 
@@ -437,7 +490,10 @@ function setupTabs() {
 }
 
 function setupPoll() {
-  $("btn-refresh").addEventListener("click", () => refresh({ withLoading: true }));
+  $("btn-refresh").addEventListener("click", () => {
+    if (!applyingRoute) syncUrl(selection(), false);
+    refresh({ withLoading: true });
+  });
   $("sel-uid").addEventListener("change", onUidChange);
   $("sel-validator").addEventListener("change", onValidatorChange);
   $("sel-sim").addEventListener("change", onSelectionChange);

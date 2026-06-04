@@ -15,6 +15,86 @@ from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 _EPS = 1e-9
 
+# Snapshot actions that do not describe a taker fill intent.
+_SNAPSHOT_SKIP_ACTIONS = frozenset({
+    "manage", "flat", "hold", "warmup", "pause", "falling", "cap",
+    "rebound_hold", "ping_hold", "rebound_wait",
+})
+
+_CLOSE_ACTIONS = frozenset({"close_long", "close_short"})
+
+# Snapshot actions that may justify an open fill (current + legacy agent builds).
+_OPEN_SNAPSHOT_ACTIONS = frozenset({
+    "open_long", "open_short", "rebound_open", "rebound_add", "ping_open",
+    "fade_long", "fade_short",
+})
+
+# Snapshot actions that may justify a close fill when no round_trip row exists.
+_CLOSE_SNAPSHOT_ACTIONS = frozenset({
+    "close_tp", "close_sl", "close_time", "time",
+    "rebound_stop", "rebound_time", "activity_ping",
+    "fade_long_recover", "recover", "sl", "tp",
+})
+
+# Normalize legacy telemetry labels for display.
+_REASON_LABELS: dict[str, str] = {
+    "time": "close_time",
+    "sl": "close_sl",
+    "tp": "close_tp",
+    "fade_long": "open_long",
+    "fade_short": "open_short",
+    # Legacy stretch/recover modes — not the same as current rebound_open.
+    "fade_long_recover": "fade_long_recover",
+    "recover": "recover",
+}
+
+
+def normalize_reason(reason: str) -> str:
+    if not reason:
+        return ""
+    if reason.startswith("rebound_exit_"):
+        return reason
+    return _REASON_LABELS.get(reason, reason)
+
+
+# Reasons that must not be glued onto a fill with this action (from trades.csv).
+_REASON_INCOMPATIBLE: dict[str, frozenset[str]] = {
+    "open_long": frozenset({
+        "open_short", "fade_short", "activity_ping", "close_tp", "close_sl", "close_time",
+    }),
+    "open_short": frozenset({
+        "ping_open", "open_long", "fade_long", "rebound_open", "close_tp", "close_sl", "close_time",
+        "activity_ping",
+    }),
+    "close_long": frozenset({
+        "ping_open", "open_long", "open_short", "fade_long", "fade_short", "rebound_open",
+    }),
+    "close_short": frozenset({
+        "open_long", "open_short", "fade_long", "fade_short", "rebound_open",
+    }),
+}
+
+
+def reason_matches_action(reason: str, action: str) -> bool:
+    """True when a telemetry reason can describe this fill action."""
+    if not reason or not action:
+        return not reason
+    reason = normalize_reason(reason)
+    bad = _REASON_INCOMPATIBLE.get(action)
+    if bad and reason in bad:
+        return False
+    if action == "open_short" and reason.startswith("open_") and reason != "open_short":
+        return False
+    if action == "open_long" and reason == "ping_open":
+        return True
+    if action == "close_short" and reason == "ping_open":
+        return True  # ping starts with a buy that covers part of a short
+    if action.startswith("close_") and reason.startswith("open_"):
+        return False
+    if action.startswith("open_") and reason.startswith("close_"):
+        return False
+    return True
+
 
 def fnum(val: Any) -> float:
     try:
@@ -160,19 +240,25 @@ def _collect_mid_buckets(
     return buckets
 
 
-def chart_origin(
+def chart_time_window(
     uid: int,
     validator_slug: str,
     sim_id: str,
     book: int,
     resolution: int,
+    limit: int,
     connect_db,
-) -> int:
-    """Earliest simulation second on the chart (absolute, not bucket-relative)."""
+) -> tuple[int, int, list[tuple[int, float]]]:
+    """Last `limit` buckets (forward-filled) — shared window for mid line and markers."""
     buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
     if not buckets:
-        return 0
-    return min(buckets) * resolution
+        return 0, 0, []
+    ordered = sorted(_forward_fill(buckets).items())[-limit:]
+    if not ordered:
+        return 0, 0, []
+    t_min = ordered[0][0] * resolution
+    t_max = ordered[-1][0] * resolution
+    return t_min, t_max, ordered
 
 
 def build_mid_series(
@@ -185,14 +271,15 @@ def build_mid_series(
     connect_db,
 ) -> dict[str, Any]:
     """Mid line: market prints backfill, telemetry mid overwrites; times are sim seconds."""
-    buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
-    if not buckets:
-        return {"mid": [], "origin": 0}
-    origin = chart_origin(uid, validator_slug, sim_id, book, resolution, connect_db)
-    ordered = sorted(_forward_fill(buckets).items())[-limit:]
+    t_min, t_max, ordered = chart_time_window(
+        uid, validator_slug, sim_id, book, resolution, limit, connect_db
+    )
+    if not ordered:
+        return {"mid": [], "origin": 0, "range": [0, 0]}
     return {
         "mid": [{"time": b * resolution, "value": p} for b, p in ordered],
-        "origin": origin,
+        "origin": t_min,
+        "range": [t_min, t_max],
     }
 
 
@@ -210,6 +297,7 @@ class TakerOrder:
     fills: int
     pos_before: float
     pos_after: float
+    reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +313,7 @@ class TakerOrder:
             "fills": self.fills,
             "pos_before": round(self.pos_before, 4),
             "pos_after": round(self.pos_after, 4),
+            "reason": self.reason,
         }
 
 
@@ -417,6 +506,125 @@ def aggregate_taker_orders(rows: list[dict[str, Any]], uid: int) -> list[dict[st
     return [o.to_dict() for o in orders]
 
 
+def _load_reason_events(
+    connect_db,
+    uid: int,
+    validator_slug: str,
+    sim_id: str,
+    book: int,
+) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """(snapshot time, action) and (round-trip close time, reason) from telemetry DB."""
+    path = telemetry_db(uid, validator_slug, sim_id)
+    if not path.is_file():
+        return [], []
+    conn = connect_db(path)
+    try:
+        snap_rows = conn.execute(
+            """
+            SELECT ts_ns, action FROM snapshots
+            WHERE book_id = ? AND action IS NOT NULL AND action != ''
+            ORDER BY ts_ns
+            """,
+            (book,),
+        ).fetchall()
+        rt_rows = conn.execute(
+            """
+            SELECT ts_close_ns, reason FROM round_trips
+            WHERE book_id = ? AND reason IS NOT NULL AND reason != ''
+            ORDER BY ts_close_ns
+            """,
+            (book,),
+        ).fetchall()
+    finally:
+        conn.close()
+    snaps = [(sim_seconds_from_ts_ns(int(r[0])), str(r[1])) for r in snap_rows]
+    rts = [(sim_seconds_from_ts_ns(int(r[0])), str(r[1])) for r in rt_rows]
+    return snaps, rts
+
+
+def _snapshot_action_ok(action: str, *, for_open: bool) -> bool:
+    if not action or action in _SNAPSHOT_SKIP_ACTIONS:
+        return False
+    allowed = _OPEN_SNAPSHOT_ACTIONS if for_open else _CLOSE_SNAPSHOT_ACTIONS
+    if action in allowed:
+        return True
+    if for_open:
+        return action.startswith("open_") or action in ("ping_open", "rebound_open", "rebound_add")
+    return (
+        action.startswith("close_")
+        or action.startswith("rebound_exit_")
+        or action in ("rebound_stop", "rebound_time", "activity_ping", "time")
+    )
+
+
+def _pick_snapshot_reason(
+    snaps: list[tuple[int, str]],
+    t: int,
+    *,
+    for_open: bool,
+    max_delta: int,
+) -> str:
+    allowed = [e for e in snaps if _snapshot_action_ok(e[1], for_open=for_open)]
+    if not allowed:
+        return ""
+    before = [e for e in allowed if e[0] <= t]
+    if before:
+        ts, action = before[-1]
+        if t - ts <= max_delta:
+            return action
+    nearest = min(allowed, key=lambda e: abs(e[0] - t))
+    if abs(nearest[0] - t) <= max_delta:
+        return nearest[1]
+    return ""
+
+
+def attach_trade_reasons(
+    orders: list[dict[str, Any]],
+    snap_events: list[tuple[int, str]],
+    rt_events: list[tuple[int, str]],
+    *,
+    max_delta: int = 60,
+) -> None:
+    """Fill ``reason`` on taker orders from telemetry round-trips and snapshots."""
+    snaps = [(t, a) for t, a in snap_events if a]
+    rts = [(t, r) for t, r in rt_events if r]
+    rt_used = [False] * len(rts)
+
+    for order in orders:
+        t = order.get("time")
+        if t is None:
+            order["reason"] = ""
+            continue
+
+        is_close = order.get("action") in _CLOSE_ACTIONS
+        reason = ""
+
+        if is_close:
+            best_i = None
+            best_d = max_delta + 1
+            for i, (rt_t, rt_r) in enumerate(rts):
+                if rt_used[i]:
+                    continue
+                d = abs(rt_t - int(t))
+                if d < best_d:
+                    best_d, best_i = d, i
+            if best_i is not None:
+                rt_used[best_i] = True
+                reason = rts[best_i][1]
+            if not reason:
+                reason = _pick_snapshot_reason(snaps, int(t), for_open=False, max_delta=max_delta)
+        else:
+            reason = _pick_snapshot_reason(snaps, int(t), for_open=True, max_delta=max_delta)
+
+        reason = normalize_reason(reason)
+        action = str(order.get("action") or "")
+        if not reason_matches_action(reason, action):
+            reason = action
+        if not reason:
+            reason = action
+        order["reason"] = reason
+
+
 def load_trades_for_api(
     uid: int,
     validator_slug: str,
@@ -424,10 +632,20 @@ def load_trades_for_api(
     book: int,
     limit: int,
     connect_db,
+    *,
+    t_min: int | None = None,
+    t_max: int | None = None,
+    chart_limit: int = 5000,
+    resolution: int = 1,
 ) -> dict[str, Any]:
     path = find_trades_csv(uid, validator_slug, sim_id)
     if path is None:
-        return {"orders": []}
+        return {"orders": [], "origin": 0, "range": [0, 0]}
+
+    if t_min is None or t_max is None:
+        t_min, t_max, _ = chart_time_window(
+            uid, validator_slug, sim_id, book, resolution, chart_limit, connect_db
+        )
 
     rows: list[dict[str, Any]] = []
     with open(path, newline="", encoding="utf-8") as f:
@@ -438,12 +656,16 @@ def load_trades_for_api(
     rows.sort(key=trade_sort_key)
 
     orders = [o for o in aggregate_taker_orders(rows, uid) if o.get("time") is not None]
-    origin = chart_origin(uid, validator_slug, sim_id, max(book, 0), 1, connect_db)
+    if t_max > t_min:
+        orders = [o for o in orders if t_min <= int(o["time"]) <= t_max]
+
+    snap_events, rt_events = _load_reason_events(connect_db, uid, validator_slug, sim_id, book)
+    attach_trade_reasons(orders, snap_events, rt_events)
 
     window = orders[-limit:]
     for i, order in enumerate(window, start=1):
         order["seq"] = i
-    return {"orders": list(reversed(window)), "origin": origin}
+    return {"orders": list(reversed(window)), "origin": t_min, "range": [t_min, t_max]}
 
 
 def format_hold_s(seconds: float | None) -> str:
@@ -467,12 +689,12 @@ def visible_sim_range(
     book: int,
     resolution: int,
     connect_db,
+    limit: int = 5000,
 ) -> tuple[int, int]:
-    buckets = _collect_mid_buckets(uid, validator_slug, sim_id, book, resolution, connect_db)
-    if not buckets:
-        return 0, 0
-    keys = sorted(_forward_fill(buckets))
-    return keys[0] * resolution, keys[-1] * resolution
+    t_min, t_max, _ = chart_time_window(
+        uid, validator_slug, sim_id, book, resolution, limit, connect_db
+    )
+    return t_min, t_max
 
 
 def format_round_trip(row: dict[str, Any]) -> dict[str, Any]:
@@ -484,6 +706,8 @@ def format_round_trip(row: dict[str, Any]) -> dict[str, Any]:
     out["closed_at"] = sim_time_label(time_sec) if time_sec else ""
     hold = out.pop("hold_s", None)
     out["hold"] = format_hold_s(hold) if hold is not None else ""
+    if out.get("reason") is not None:
+        out["reason"] = normalize_reason(str(out["reason"]))
     for key in ("qty", "entry_avg", "exit_avg", "realized_pnl"):
         if out.get(key) is not None:
             out[key] = round(float(out[key]), 4)

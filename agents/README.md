@@ -479,7 +479,7 @@ All example agents support GenTRX distributed training. Training is **off by def
 
 | Agent | Trading logic | Notes |
 |---|---|---|
-| [`MeanReversionAgent`](MeanReversionAgent.py) | Contrarian fade (Kappa-3 tuned) | Maker entries, market exits; see `docs/MINER_STRATEGY_REPORT.md` |
+| [`MeanReversionAgent`](MeanReversionAgent.py) | Open long/short on stretch (Kappa-3 tuned) | Maker open, market close; see `docs/MINER_STRATEGY_REPORT.md` |
 | [`MomentumScalperAgent`](MomentumScalperAgent.py) | Directional taker scalper | Trend + flow + imbalance |
 | [`AdaptiveMakerAgent`](AdaptiveMakerAgent.py) | Two-sided spread maker | Inventory-aware quoting |
 | [`MaxMinReversionAgent`](MaxMinReversionAgent.py) | Rolling max/min bands | Mean-reversion variant |
