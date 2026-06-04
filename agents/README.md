@@ -479,6 +479,11 @@ All example agents support GenTRX distributed training. Training is **off by def
 
 | Agent | Trading logic | Notes |
 |---|---|---|
+| [`QuantTradingAgent`](QuantTradingAgent.py) | **Your custom strategy** | Blank boilerplate — start new work here |
+| [`MeanReversionAgent`](MeanReversionAgent.py) | Contrarian fade (Kappa-3 tuned) | Maker entries, market exits; see `docs/MINER_STRATEGY_REPORT.md` |
+| [`MomentumScalperAgent`](MomentumScalperAgent.py) | Directional taker scalper | Trend + flow + imbalance |
+| [`AdaptiveMakerAgent`](AdaptiveMakerAgent.py) | Two-sided spread maker | Inventory-aware quoting |
+| [`MaxMinReversionAgent`](MaxMinReversionAgent.py) | Rolling max/min bands | Mean-reversion variant |
 | [`RandomMakerAgent`](RandomMakerAgent.py) | Random limit orders | Add `gtx_training_enabled=true` to enable |
 | [`RandomTakerAgent`](RandomTakerAgent.py) | Random market orders | Add `gtx_training_enabled=true` to enable |
 | [`ImbalanceAgent`](ImbalanceAgent.py) | LOB imbalance signal | Add `gtx_training_enabled=true` to enable |

@@ -21,7 +21,7 @@ export BT_NO_PARSE_CLI_ARGS=false
 #   First setup:    ./run_miner.sh -G -w mywallet -h myhotkey
 #   Update/restart: ./run_miner.sh
 #   Override steps: ./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"
-#   Fleet miner:    ./run_miner.sh -P miner-sn79-1 -w sn79 -h sn79-1 -a 8091 -n MomentumScalperAgent ...
+#   Fleet miner:    ./run_miner.sh -P miner-sn79-1 -w sn79 -h sn79-1 -a 8091 -n QuantTradingAgent ...
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -32,7 +32,7 @@ HOTKEY_NAME=miner
 NETUID=79
 AXON_PORT=8091
 AGENT_PATH=~/.taos/agents
-AGENT_NAME=SimpleRegressorAgent
+AGENT_NAME=QuantTradingAgent
 AGENT_PARAMS="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
 LOG_LEVEL=info
 PM2_NAME=miner    # pm2 process name (-P); use a unique name per hotkey/port
@@ -99,7 +99,7 @@ fi
 # Apply GenTRX training agent defaults only on first setup (no saved config, no
 # explicit agent flag, and agent is still the non-training default).
 if [ "$GENTRX" = "1" ] && [ "$_EXPLICIT_AGENT" = "0" ] && \
-   [ -z "${GENTRX_SAVED_AGENT_NAME:-}" ] && [ "$AGENT_NAME" = "SimpleRegressorAgent" ]; then
+   [ -z "${GENTRX_SAVED_AGENT_NAME:-}" ] && [ "$AGENT_NAME" = "QuantTradingAgent" ]; then
     AGENT_NAME=HybridTrainingAgent
     AGENT_PARAMS="imbalance_depth=5 history_retention_mins=1 \
 entry_threshold=0.35 cancel_threshold=0.20 \
