@@ -350,7 +350,7 @@ A lightweight operator dashboard (TradingView-style chart, summary cards, round-
 | `TAOS_DASHBOARD_HOST` | **`127.0.0.1`** | Dashboard bind address; use `0.0.0.0` for remote access |
 | `TAOS_DASHBOARD_PORT` | `8787` | Dashboard HTTP port |
 
-`QuantTradingAgent` (and other instrumented agents) can record per-book mid, signals, positions, and round-trips. Set `TAOS_TELEMETRY_ENABLED=0` to disable I/O.
+`MeanReversionAgent` (and other instrumented agents) can record per-book mid, signals, positions, and round-trips. Set `TAOS_TELEMETRY_ENABLED=0` to disable I/O.
 
 **Start the dashboard** (separate terminal):
 

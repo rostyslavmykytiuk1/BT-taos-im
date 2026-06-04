@@ -24,9 +24,11 @@ From `taos/im/validator/reward.py` + `taos/im/utils/kappa.py`, with the current 
 4. **Coverage** — you must be active+profitable on the large majority of all 128 books;
    excess inactive books score 0 and drag your median down.
 
-**Things that do NOT help right now:** raw volume (activity_impact=0 → activity
-factor is 1.0 for everyone), churning round-trips (pure fee + downside cost),
-holding a big unrealized winner (never scored until closed).
+**Things that do NOT help right now:** raw volume beyond getting each book’s
+`activity_factor` to **1.0** (`activity_impact=0` → no boost above 1.0×), churning
+round-trips (spread + Kappa tail risk), holding a big unrealized winner (not scored
+until closed). **Books left at `activity_factor=0` score zero on that book** — see
+report §2 Activity factor.
 
 ### The design target
 

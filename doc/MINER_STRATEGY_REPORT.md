@@ -115,17 +115,38 @@ K3 = (mean_return - tau) / cbrt(LPM3(tau))      tau = 0
 - Per-book K3 is normalized to [0,1] from the range **[-2.5, 2.5]**
   (`normalization_min/max`), then aggregated by **median across books**.
 
-### Activity factor — CURRENTLY NEUTRALIZED
+### Activity factor — impact off, multiplier still gates each book
 
 ```
 activity_factor = min(1 + (roundtrip_volume / volume_cap) * activity_impact, 2.0)
+weighted_kappa  = activity_factor × pnl_factor × normalized_kappa   (per book)
 ```
 
-- `activity_impact = 0.0` right now → **activity_factor = 1.0 for everyone.**
-- `activity_decay_rate = 0.0` → no decay penalty for pausing.
-- **Implication: trading more volume gives ZERO score boost today.** Volume is
-  only a *constraint* (the cap), not a lever. This is the biggest lever-change
-  vs the README narrative, which assumes activity weighting is on.
+**`activity_impact = 0.0` today does *not* mean activity is ignored.** It means
+there is **no volume boost** (active books cap at **1.0×**, not up to 2.0×).
+It does **not** remove the activity multiplier from scoring.
+
+How factors are set (`taos/im/validator/reward.py`):
+
+| Book state | `activity_impact = 0` | `activity_impact > 0` |
+|------------|------------------------|------------------------|
+| Round-trip in the last **10 min** sampling interval | `activity_factor → 1.0` | `1.0` … `2.0` by volume |
+| Never traded / factor still **0.0** | **`weighted_kappa = 0`** on that book | same zero until first RT |
+| Idle after a prior `1.0`, `decay_rate = 0` | Stays **1.0** (decay skipped) | Decay pulls factor below 1 |
+
+**Critical:** A book whose `activity_factor` is **0** contributes **no score**
+on that book (`0 × kappa = 0`), even with good Kappa-3. You must get at least
+one realized round-trip per book so the factor moves off zero. Top miners show
+**Activity = 1.0** on traded books for this reason.
+
+**What `activity_impact = 0` changes:** no extra reward for high volume; no
+decay acceleration when `decay_rate = 0`. Volume is still capped at
+`capital_turnover_cap × miner_wealth` per book per 24h assessment window.
+
+**Cadence (when impact is turned on later):**
+`trade_volume_sampling_interval` = **600 s (10 sim-minutes)** — trade each book
+at least once per interval to stay in the “active” branch. Assessment window =
+**24 sim-hours**.
 
 ### PnL factor / PnL score
 
