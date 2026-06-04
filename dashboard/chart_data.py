@@ -15,6 +15,10 @@ from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 _EPS = 1e-9
 
+# Match MeanReversionAgent rolling fair-value window (trade-print average).
+CHART_AVERAGE_WINDOW_S = 300.0
+CHART_AVERAGE_MIN_SAMPLES = 8
+
 # Snapshot actions that do not describe a taker fill intent.
 _SNAPSHOT_SKIP_ACTIONS = frozenset({
     "manage", "flat", "hold", "warmup", "pause", "falling", "cap",
@@ -55,6 +59,45 @@ def normalize_reason(reason: str) -> str:
     if reason.startswith("rebound_exit_"):
         return reason
     return _REASON_LABELS.get(reason, reason)
+
+
+# Plain-language labels for the dashboard "reason" / "why" column.
+REASON_DISPLAY: dict[str, str] = {
+    "open_long": "much cheap vs average",
+    "open_short": "much above average",
+    "close_tp": "take profit",
+    "close_sl": "stop loss",
+    "close_time": "held too long",
+    "ping_open": "activity ping (start)",
+    "activity_ping": "activity ping (done)",
+    "ping_hold": "activity ping (waiting)",
+    "ping_followup_wait": "activity ping (waiting leg 2)",
+    "rebound_open": "after sharp drop (legacy)",
+    "rebound_stop": "rebound stop (legacy)",
+    "rebound_time": "rebound max hold (legacy)",
+    "rebound_add": "rebound add size (legacy)",
+    "fade_long_recover": "legacy recover mode",
+    "recover": "legacy recover mode",
+    "fill": "fill",
+    "pause": "paused after stop",
+    "cap": "volume cap",
+    "falling": "price still falling",
+    "flat": "no trade",
+    "warmup": "warming up",
+    "manage": "holding",
+}
+
+
+def display_reason(code: str) -> str:
+    """Map agent reason code to a short human-readable label."""
+    code = normalize_reason((code or "").strip())
+    if not code:
+        return ""
+    if code in REASON_DISPLAY:
+        return REASON_DISPLAY[code]
+    if code.startswith("rebound_exit_"):
+        return "rebound scale-out (legacy)"
+    return code.replace("_", " ")
 
 
 # Reasons that must not be glued onto a fill with this action (from trades.csv).
@@ -240,6 +283,30 @@ def _collect_mid_buckets(
     return buckets
 
 
+def _rolling_average_of_mid(
+    ordered: list[tuple[int, float]],
+    resolution: int,
+    *,
+    window_s: float = CHART_AVERAGE_WINDOW_S,
+    min_samples: int = CHART_AVERAGE_MIN_SAMPLES,
+) -> list[dict[str, Any]]:
+    """Rolling mean of the chart mid line (bid+ask)/2 over the last ``window_s``."""
+    if not ordered:
+        return []
+    window_pts = max(1, int(window_s) // max(1, resolution))
+    out: list[dict[str, Any]] = []
+    last_avg: float | None = None
+    for i, (bucket, price) in enumerate(ordered):
+        start = max(0, i - window_pts + 1)
+        window = [p for _, p in ordered[start : i + 1]]
+        if len(window) >= min_samples:
+            last_avg = sum(window) / len(window)
+            out.append({"time": int(bucket) * resolution, "value": round(last_avg, 6)})
+        elif last_avg is not None:
+            out.append({"time": int(bucket) * resolution, "value": round(last_avg, 6)})
+    return out
+
+
 def chart_time_window(
     uid: int,
     validator_slug: str,
@@ -270,14 +337,18 @@ def build_mid_series(
     limit: int,
     connect_db,
 ) -> dict[str, Any]:
-    """Mid line: market prints backfill, telemetry mid overwrites; times are sim seconds."""
+    """Mid line plus 5 min rolling average of that mid (same window length as the agent)."""
     t_min, t_max, ordered = chart_time_window(
         uid, validator_slug, sim_id, book, resolution, limit, connect_db
     )
     if not ordered:
-        return {"mid": [], "origin": 0, "range": [0, 0]}
+        return {"mid": [], "average": [], "origin": 0, "range": [0, 0]}
+
+    average = _rolling_average_of_mid(ordered, resolution)
+
     return {
         "mid": [{"time": b * resolution, "value": p} for b, p in ordered],
+        "average": average,
         "origin": t_min,
         "range": [t_min, t_max],
     }
@@ -622,7 +693,8 @@ def attach_trade_reasons(
             reason = action
         if not reason:
             reason = action
-        order["reason"] = reason
+        order["reason_code"] = reason
+        order["reason"] = display_reason(reason)
 
 
 def load_trades_for_api(
@@ -707,7 +779,9 @@ def format_round_trip(row: dict[str, Any]) -> dict[str, Any]:
     hold = out.pop("hold_s", None)
     out["hold"] = format_hold_s(hold) if hold is not None else ""
     if out.get("reason") is not None:
-        out["reason"] = normalize_reason(str(out["reason"]))
+        code = normalize_reason(str(out["reason"]))
+        out["reason_code"] = code
+        out["reason"] = display_reason(code)
     for key in ("qty", "entry_avg", "exit_avg", "realized_pnl"):
         if out.get(key) is not None:
             out[key] = round(float(out[key]), 4)

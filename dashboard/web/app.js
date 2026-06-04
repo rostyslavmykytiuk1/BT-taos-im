@@ -34,7 +34,7 @@ const TABLE_HEADERS = {
   signal_trend_bps: "trend_bps",
   signal_flow: "dev_bps",
   signal_imb: "imb",
-  reason: "reason",
+  reason: "why",
 };
 
 const LINE_OPTS = {
@@ -47,6 +47,7 @@ const LINE_OPTS = {
 
 let chart;
 let midSeries;
+let avgSeries;
 let miners = [];
 let activeTab = "round_trips";
 let pollTimer;
@@ -278,6 +279,15 @@ function initChart() {
     localization: { timeFormatter: formatChartAxisTime },
   });
   midSeries = chart.addLineSeries({ ...LINE_OPTS, color: "#f59e0b", priceLineVisible: true });
+  avgSeries = chart.addLineSeries({
+    lineWidth: 2,
+    lineType: LightweightCharts.LineType?.Simple ?? 0,
+    lineStyle: LightweightCharts.LineStyle?.Dashed ?? 2,
+    color: "#38bdf8",
+    crosshairMarkerVisible: false,
+    lastValueVisible: true,
+    priceLineVisible: false,
+  });
   const onResize = () => chart.applyOptions({ width: el.clientWidth });
   window.addEventListener("resize", onResize);
   onResize();
@@ -306,6 +316,8 @@ function updateChart(midPayload, orders, fitView) {
   midSeries.setData(
     (midPayload?.mid ?? []).map((p) => ({ time: toChartTime(p.time), value: p.value })),
   );
+  const avgPts = midPayload?.average ?? [];
+  avgSeries.setData(avgPts.map((p) => ({ time: toChartTime(p.time), value: p.value })));
   midSeries.setMarkers(
     inRange
       .map((o) => {
