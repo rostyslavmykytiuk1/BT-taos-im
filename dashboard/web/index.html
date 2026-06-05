@@ -50,13 +50,21 @@
       </div>
     </div>
     <div id="chart"></div>
-    <div class="chart-legend" aria-hidden="true">
+    <div class="chart-legend" id="price-legend" aria-hidden="true">
       <span class="leg leg-mid">— mid (bid+ask)/2</span>
       <span class="leg leg-avg">- - 5m average of mid</span>
+      <span class="leg leg-kalman hidden" id="leg-kalman-level">- - Kalman level</span>
       <span class="leg leg-long-entry">▲ long open</span>
       <span class="leg leg-short-entry">▼ short open</span>
       <span class="leg leg-long-exit">● long close</span>
       <span class="leg leg-short-exit">● short close</span>
+    </div>
+    <div class="slope-panel hidden" id="slope-panel">
+      <div id="chart-slope"></div>
+      <div class="chart-legend" id="slope-legend" aria-hidden="true">
+        <span class="leg leg-slope">— Kalman slope (bps)</span>
+        <span class="leg leg-slope-zero">- - zero</span>
+      </div>
     </div>
   </section>
 

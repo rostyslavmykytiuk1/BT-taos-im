@@ -48,7 +48,12 @@ const LINE_OPTS = {
 let chart;
 let midSeries;
 let avgSeries;
+let kalmanLevelSeries;
+let slopeChart;
+let slopeSeries;
+let slopeZeroSeries;
 let miners = [];
+let activeAgentClass = null;
 let activeTab = "round_trips";
 let pollTimer;
 let lastChartKey = null;
@@ -266,9 +271,8 @@ function formatChartAxisTime(chartTime) {
   return formatSimTimeSec(fromChartTime(chartTime));
 }
 
-function initChart() {
-  const el = $("chart");
-  chart = LightweightCharts.createChart(el, {
+function chartOptions(el) {
+  return {
     layout: { background: { color: "#161a22" }, textColor: "#8b95a8" },
     grid: { vertLines: { color: "#2a3140" }, horzLines: { color: "#2a3140" } },
     timeScale: {
@@ -277,7 +281,13 @@ function initChart() {
       tickMarkFormatter: formatChartAxisTime,
     },
     localization: { timeFormatter: formatChartAxisTime },
-  });
+    width: el.clientWidth,
+  };
+}
+
+function initChart() {
+  const el = $("chart");
+  chart = LightweightCharts.createChart(el, chartOptions(el));
   midSeries = chart.addLineSeries({ ...LINE_OPTS, color: "#f59e0b", priceLineVisible: true });
   avgSeries = chart.addLineSeries({
     lineWidth: 2,
@@ -288,7 +298,57 @@ function initChart() {
     lastValueVisible: true,
     priceLineVisible: false,
   });
-  const onResize = () => chart.applyOptions({ width: el.clientWidth });
+  kalmanLevelSeries = chart.addLineSeries({
+    lineWidth: 2,
+    lineType: LightweightCharts.LineType?.Simple ?? 0,
+    lineStyle: LightweightCharts.LineStyle?.Dashed ?? 2,
+    color: "#a78bfa",
+    crosshairMarkerVisible: false,
+    lastValueVisible: true,
+    priceLineVisible: false,
+    visible: false,
+  });
+
+  const slopeEl = $("chart-slope");
+  slopeChart = LightweightCharts.createChart(slopeEl, {
+    ...chartOptions(slopeEl),
+    rightPriceScale: { borderVisible: false },
+    timeScale: { visible: false },
+  });
+  slopeSeries = slopeChart.addLineSeries({
+    ...LINE_OPTS,
+    lineType: LightweightCharts.LineType?.Simple ?? 0,
+    color: "#c084fc",
+    priceLineVisible: false,
+  });
+  slopeZeroSeries = slopeChart.addLineSeries({
+    lineWidth: 1,
+    lineType: LightweightCharts.LineType?.Simple ?? 0,
+    lineStyle: LightweightCharts.LineStyle?.Dashed ?? 2,
+    color: "#4b5563",
+    crosshairMarkerVisible: false,
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+
+  let syncing = false;
+  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (syncing || !range) return;
+    syncing = true;
+    slopeChart.timeScale().setVisibleLogicalRange(range);
+    syncing = false;
+  });
+  slopeChart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (syncing || !range) return;
+    syncing = true;
+    chart.timeScale().setVisibleLogicalRange(range);
+    syncing = false;
+  });
+
+  const onResize = () => {
+    chart.applyOptions({ width: el.clientWidth });
+    slopeChart.applyOptions({ width: slopeEl.clientWidth });
+  };
   window.addEventListener("resize", onResize);
   onResize();
 }
@@ -311,6 +371,22 @@ function ordersInChartRange(midPayload, orders) {
   );
 }
 
+function agentClassFor(sel) {
+  const row = miners.find(
+    (m) =>
+      m.uid === sel.uid &&
+      m.validator_id === sel.validator_id &&
+      m.simulation_id === sel.simulation_id,
+  );
+  return row?.agent_class ?? null;
+}
+
+function setKalmanPanelsVisible(showLevel, showSlope) {
+  $("leg-kalman-level")?.classList.toggle("hidden", !showLevel);
+  kalmanLevelSeries?.applyOptions({ visible: showLevel });
+  $("slope-panel")?.classList.toggle("hidden", !showSlope);
+}
+
 function updateChart(midPayload, orders, fitView) {
   const inRange = ordersInChartRange(midPayload, orders);
   midSeries.setData(
@@ -318,6 +394,35 @@ function updateChart(midPayload, orders, fitView) {
   );
   const avgPts = midPayload?.average ?? [];
   avgSeries.setData(avgPts.map((p) => ({ time: toChartTime(p.time), value: p.value })));
+
+  const levelPts = midPayload?.kalman_level ?? [];
+  const slopePts = midPayload?.slope_bps ?? [];
+  const isKalman = activeAgentClass === "KalmanMomentumAgent";
+  const showLevel = levelPts.length > 0 && (isKalman || levelPts.length >= 3);
+  const showSlope = slopePts.length > 0 && (isKalman || slopePts.length >= 3);
+
+  setKalmanPanelsVisible(showLevel, showSlope);
+  if (showLevel) {
+    kalmanLevelSeries.setData(levelPts.map((p) => ({ time: toChartTime(p.time), value: p.value })));
+  } else {
+    kalmanLevelSeries.setData([]);
+  }
+  if (showSlope) {
+    const slopeData = slopePts.map((p) => ({ time: toChartTime(p.time), value: p.value }));
+    slopeSeries.setData(slopeData);
+    if (slopeData.length >= 2) {
+      slopeZeroSeries.setData([
+        { time: slopeData[0].time, value: 0 },
+        { time: slopeData[slopeData.length - 1].time, value: 0 },
+      ]);
+    } else {
+      slopeZeroSeries.setData([]);
+    }
+  } else {
+    slopeSeries.setData([]);
+    slopeZeroSeries.setData([]);
+  }
+
   midSeries.setMarkers(
     inRange
       .map((o) => {
@@ -326,7 +431,12 @@ function updateChart(midPayload, orders, fitView) {
       })
       .sort((a, b) => a.time - b.time),
   );
-  if (fitView) requestAnimationFrame(() => chart.timeScale().fitContent());
+  if (fitView) {
+    requestAnimationFrame(() => {
+      chart.timeScale().fitContent();
+      if (showSlope) slopeChart.timeScale().fitContent();
+    });
+  }
 }
 
 function formatCell(row, col) {
@@ -457,6 +567,7 @@ async function refresh(opts = {}) {
 
     if (seq !== refreshSeq) return;
 
+    activeAgentClass = agentClassFor(sel);
     updateCards(summary);
     const fitView = chartKey(sel) !== lastChartKey;
     lastChartKey = chartKey(sel);
