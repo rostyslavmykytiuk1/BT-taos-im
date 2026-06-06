@@ -102,6 +102,9 @@ class FinanceSimulationAgent(SimulationAgent):
         Returns:
             None
         """
+        if config is None:
+            from types import SimpleNamespace
+            config = SimpleNamespace()
         self.history = []
         # State snapshots kept for handlers that read self.history (e.g. last
         # bid/ask). 0 keeps none — set it on agents that never read history to

@@ -45,15 +45,11 @@ def test_miner_telemetry_batch_insert():
             traded_volume=12_000.0,
             volume_cap=300_000.0,
             volume_remaining=288_000.0,
-            signals={"trend_bps": 4.0, "flow": 1.0, "imb": 0.0, "level": 49.8},
             action="hold",
         )
         tel.end_step(_State(), instructions=2)
 
         row = tel._conn.execute(
-            """
-            SELECT traded_volume, volume_cap, volume_remaining, signal_level
-            FROM snapshots WHERE book_id=1
-            """
+            "SELECT traded_volume, volume_cap, volume_remaining FROM snapshots WHERE book_id=1"
         ).fetchone()
-        assert row == (12_000.0, 300_000.0, 288_000.0, 49.8)
+        assert row == (12_000.0, 300_000.0, 288_000.0)

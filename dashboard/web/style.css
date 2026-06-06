@@ -160,32 +160,6 @@ button.btn-refresh.is-ok:hover:not(:disabled) {
   width: 100%;
 }
 
-#chart-slope {
-  height: 160px;
-  width: 100%;
-  border-top: 1px solid var(--border);
-}
-
-.slope-panel.hidden {
-  display: none;
-}
-
-.chart-legend .leg-kalman {
-  color: #a78bfa;
-}
-
-.chart-legend .leg-slope {
-  color: #c084fc;
-}
-
-.chart-legend .leg-slope-zero {
-  color: #4b5563;
-}
-
-.hidden {
-  display: none !important;
-}
-
 .chart-legend {
   display: flex;
   flex-wrap: wrap;

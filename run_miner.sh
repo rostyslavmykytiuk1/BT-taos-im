@@ -12,16 +12,17 @@ export BT_NO_PARSE_CLI_ARGS=false
 # First run: prompts interactively for bucket credentials and commits them
 # on-chain; saves all config (agent name/params, GenTRX params) to .env.
 #
-# Subsequent update runs: run without any flags — saved GenTRX mode, agent,
-# and params are restored automatically, setup prompts are skipped.
-# Pass -n/-m/-t explicitly to override saved agent/params on a specific run.
+# Subsequent update runs: run without any flags — saved GenTRX mode and params
+# are restored automatically, setup prompts are skipped.
+# Agent name and --agent.params ALWAYS come from .env (never from CLI).
+# Fleet: optional .env.<PM2_NAME> overlays base .env (e.g. .env.miner-1).
 # Pass -P to set the pm2 process name (required when running multiple miners).
 #
 # Examples:
 #   First setup:    ./run_miner.sh -G -w mywallet -h myhotkey
 #   Update/restart: ./run_miner.sh
 #   Override steps: ./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"
-#   Fleet miner:    ./run_miner.sh -P miner-sn79-1 -w sn79 -h sn79-1 -a 8091 -n MeanReversionAgent ...
+#   Fleet miner:    ./run_miner.sh -P miner-1 -w sn79 -h sn79-1 -a 8091
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -33,15 +34,13 @@ NETUID=79
 AXON_PORT=8091
 AGENT_PATH=~/.taos/agents
 AGENT_NAME=MeanReversionAgent
-AGENT_PARAMS="quote_notional=1800 min_order_size=0.25"
+AGENT_PARAMS=lazy_load=0
 LOG_LEVEL=info
 PM2_NAME=miner    # pm2 process name (-P); use a unique name per hotkey/port
 GENTRX=0          # 1 = enable GenTRX training mode
 GENTRX_PARAMS=""  # override GenTRX-specific params (gtx_* keys)
 
-# Track whether agent/params were explicitly provided on the command line
-_EXPLICIT_AGENT=0
-_EXPLICIT_PARAMS=0
+# Track whether GenTRX params were explicitly provided on the command line
 _EXPLICIT_GENTRX_PARAMS=0
 
 # set -a auto-exports every var the sourced file sets, so pm2 (and any other
@@ -56,7 +55,7 @@ TAOS_DATA_ROOT="${TAOS_DATA_ROOT:-$REPO_ROOT/agents/data}"
 TAOS_DASHBOARD_HOST="${TAOS_DASHBOARD_HOST:-127.0.0.1}"
 TAOS_DASHBOARD_PORT="${TAOS_DASHBOARD_PORT:-8787}"
 
-while getopts e:p:w:h:u:a:g:n:m:t:l:GP: flag; do
+while getopts e:p:w:h:u:a:g:t:l:GP: flag; do
     case "${flag}" in
         e) ENDPOINT=${OPTARG};;
         p) WALLET_PATH=${OPTARG};;
@@ -65,8 +64,6 @@ while getopts e:p:w:h:u:a:g:n:m:t:l:GP: flag; do
         u) NETUID=${OPTARG};;
         a) AXON_PORT=${OPTARG};;
         g) AGENT_PATH=${OPTARG};;
-        n) AGENT_NAME=${OPTARG};       _EXPLICIT_AGENT=1;;
-        m) AGENT_PARAMS=${OPTARG};     _EXPLICIT_PARAMS=1;;
         t) GENTRX_PARAMS=${OPTARG};    _EXPLICIT_GENTRX_PARAMS=1;;
         l) LOG_LEVEL=${OPTARG};;
         P) PM2_NAME=${OPTARG};;
@@ -74,20 +71,26 @@ while getopts e:p:w:h:u:a:g:n:m:t:l:GP: flag; do
     esac
 done
 
+# Per-miner overlay: .env.miner-1 etc. overrides wallet/agent/port for fleet runs.
+if [ -n "${PM2_NAME:-}" ] && [ -f "$REPO_ROOT/.env.$PM2_NAME" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$REPO_ROOT/.env.$PM2_NAME"
+    set +a
+fi
+
+# miner.py requires lazy_load; empty --agent.params crashes every state update.
+AGENT_PARAMS="${AGENT_PARAMS:-lazy_load=0}"
+
 # If -G not passed but GenTRX was previously enabled, restore saved mode
 if [ "$GENTRX" = "0" ] && [ "${GENTRX_ENABLED:-0}" = "1" ]; then
     GENTRX=1
 fi
 
-# On GenTRX update runs: restore saved agent/params unless overridden on CLI.
-# If -n is explicitly set to a different agent, don't restore the old params
-# (they belong to the previous agent and are likely incompatible).
+# On GenTRX update runs: restore saved agent/params from .env unless unset.
 if [ "$GENTRX" = "1" ]; then
-    [ "$_EXPLICIT_AGENT" = "0" ] && [ -n "${GENTRX_SAVED_AGENT_NAME:-}" ] && \
-        AGENT_NAME="$GENTRX_SAVED_AGENT_NAME"
-    # Only restore params if agent wasn't explicitly changed to something different
-    if [ "$_EXPLICIT_PARAMS" = "0" ] && [ "$_EXPLICIT_AGENT" = "0" ] && \
-       [ -n "${GENTRX_SAVED_AGENT_PARAMS:-}" ]; then
+    [ -n "${GENTRX_SAVED_AGENT_NAME:-}" ] && AGENT_NAME="$GENTRX_SAVED_AGENT_NAME"
+    if [ -n "${GENTRX_SAVED_AGENT_PARAMS:-}" ]; then
         AGENT_PARAMS="$GENTRX_SAVED_AGENT_PARAMS"
     fi
     [ "$_EXPLICIT_GENTRX_PARAMS" = "0" ] && [ -n "${GENTRX_SAVED_GENTRX_PARAMS:-}" ] && \
@@ -96,12 +99,12 @@ if [ "$GENTRX" = "1" ]; then
         [ -n "${GENTRX_SAVED_AGENT_PATH:-}" ] && AGENT_PATH="$GENTRX_SAVED_AGENT_PATH"
 fi
 
-# Apply GenTRX training agent defaults only on first setup (no saved config, no
-# explicit agent flag, and agent is still the non-training default).
-if [ "$GENTRX" = "1" ] && [ "$_EXPLICIT_AGENT" = "0" ] && \
-   [ -z "${GENTRX_SAVED_AGENT_NAME:-}" ] && [ "$AGENT_NAME" = "MeanReversionAgent" ]; then
+# Apply GenTRX training agent defaults only on first setup (no saved config and
+# agent is still the non-training default in .env).
+if [ "$GENTRX" = "1" ] && [ -z "${GENTRX_SAVED_AGENT_NAME:-}" ] && \
+   [ "$AGENT_NAME" = "MeanReversionAgent" ]; then
     AGENT_NAME=HybridTrainingAgent
-    AGENT_PARAMS="imbalance_depth=5 history_retention_mins=1 \
+    AGENT_PARAMS="lazy_load=0 imbalance_depth=5 history_retention_mins=1 \
 entry_threshold=0.35 cancel_threshold=0.20 \
 stop_loss_bps=40 base_quote_size=0.3 enter_size_mult=3.0 \
 max_flat_inventory=2.0 expiry_period=500000000 max_fee_rate=0.005"
@@ -373,9 +376,8 @@ _print_miner_cmd() {
     printf '        -u %s \\\n'   "$NETUID"
     printf '        -a %s \\\n'   "$AXON_PORT"
     printf '        -P %s \\\n'   "$PM2_NAME"
-    printf '        -n %s \\\n'   "$AGENT_NAME"
-    printf '        -m %s \\\n'   "$_qparams"
     printf '        -t %s\n'      "$_qgtx"
+    printf '  # AGENT_NAME=%s AGENT_PARAMS=%s in .env\n' "$AGENT_NAME" "$AGENT_PARAMS"
     echo
     printf '  Note: bucket credentials are in .env.\n'
     printf '  Copy .env to each new deployment (or re-run without -G to use the same .env).\n'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline mid-fill backtest: MeanReversionAgent vs MomentumScalperAgent on validator tape.
+"""Offline mid-fill backtest: KappaScoreAgent vs MeanReversionAgent on validator tape.
 
 Uses the same trades.csv path as the dashboard. Not a full matching engine — assumes
 fills at the 1s resampled mid — but compares signal quality and Kappa-3 proxy fairly.
@@ -86,22 +86,26 @@ def kappa3_proxy(rets: list[float]) -> float | None:
 
 
 def run_mean_reversion(bars: list[Bar]) -> list[float]:
-    """MeanReversionAgent defaults + short_block_after_crash_s=1800."""
+    """MeanReversionAgent constants (incl. grind dump, grind-long, soft short-block)."""
     if len(bars) < 300:
         return []
 
-    MEAN_W, K = 120, 1.4
+    MEAN_W, K = 300, 1.5
     MINBAND, MAXBAND = 8.0, 120.0
-    TP, SL, HOLD = 12.0, 16.0, 150.0
+    TP, SL, HOLD = 12.0, 16.0, 180.0
     CRASH_BPS, CRASH_W, REC_W = 35.0, 20, 300
+    GRIND_BPS, GRIND_W = 38.0, 300
     REC_TP, REC_HOLD = 1.8, 2.0
-    KNIFE_BPS, KNIFE_S = 8.0, 8
+    KNIFE_STEP, KNIFE_DROP, KNIFE_S = 8.0, 20.0, 8
+    ROCKET_STEP, ROCKET_RISE, ROCKET_S = 8.0, 20.0, 8
+    GRIND_RISE, GRIND_DEV, STRONG_SHORT = 8.0, 18.0, 1.25
     TREND_W, TREND_GATE = 600.0, 25.0
     SHORT_BLOCK_S = 1800
     COOL_S = 30
 
     prices: deque = deque()
     mids: deque = deque()
+    grind: deque = deque()
     ema = 0.0
     pos = 0
     avg = 0.0
@@ -109,6 +113,7 @@ def run_mean_reversion(bars: list[Bar]) -> list[float]:
     postc = False
     crash_until = 0
     knife_until = 0
+    rocket_until = 0
     short_block_until = 0
     cool = 0
     rts: list[float] = []
@@ -121,6 +126,9 @@ def run_mean_reversion(bars: list[Bar]) -> list[float]:
         mids.append((t, m))
         while mids and mids[0][0] < t - CRASH_W:
             mids.popleft()
+        grind.append((t, m))
+        while grind and grind[0][0] < t - GRIND_W:
+            grind.popleft()
         ema = m if ema <= 0 else ema + (1 - math.exp(-1 / TREND_W)) * (m - ema)
         if len(prices) < 8:
             continue
@@ -132,21 +140,32 @@ def run_mean_reversion(bars: list[Bar]) -> list[float]:
         band = max(MINBAND, min(MAXBAND, K * disp))
 
         hi = max(p for _, p in mids)
+        lo = min(p for _, p in mids)
+        ghi = max(p for _, p in grind)
+        glo = min(p for _, p in grind)
         drop = max(0.0, (hi - m) / hi * 1e4) if hi > 0 else 0.0
+        gdrop = max(0.0, (ghi - m) / ghi * 1e4) if ghi > 0 else 0.0
+        rise = max(0.0, (m - lo) / lo * 1e4) if lo > 0 else 0.0
+        grise = max(0.0, (m - glo) / glo * 1e4) if glo > 0 else 0.0
         step = (m - mids[-2][1]) / mids[-2][1] * 1e4 if len(mids) >= 2 else 0.0
-        if drop >= CRASH_BPS:
+        if drop >= CRASH_BPS or gdrop >= GRIND_BPS:
             crash_until = t + REC_W
             short_block_until = t + SHORT_BLOCK_S
-        if step <= -KNIFE_BPS:
+        if step <= -KNIFE_STEP and drop >= KNIFE_DROP:
             knife_until = t + KNIFE_S
+        if step >= ROCKET_STEP and rise >= ROCKET_RISE:
+            rocket_until = t + ROCKET_S
 
         in_rec = t < crash_until
         knife = t < knife_until
+        rocket = t < rocket_until
         short_blocked = t < short_block_until
         trend = (ref - ema) / ema * 1e4 if ema > 0 else 0.0
         up = trend > TREND_GATE
         dn = trend < -TREND_GATE
         dev = (m - ref) / ref * 1e4 if ref > 0 else 0.0
+        strong_short = dev >= band * STRONG_SHORT
+        grind_short_blocked = m > ema and grise >= GRIND_RISE and not strong_short
 
         if pos != 0:
             pnl = ((m - avg) if pos > 0 else (avg - m)) / avg * 1e4
@@ -170,11 +189,144 @@ def run_mean_reversion(bars: list[Bar]) -> list[float]:
             avg = m
             ent = t
             postc = in_rec
-        elif dev >= band and not in_rec and not short_blocked and not up:
+        elif in_rec and m > ema and grise >= GRIND_RISE and dev <= GRIND_DEV and not knife:
+            pos = 1
+            avg = m
+            ent = t
+            postc = True
+        elif (dev >= band and not in_rec and not short_blocked and not rocket
+              and not grind_short_blocked and not up):
             pos = -1
             avg = m
             ent = t
             postc = False
+
+    return rts
+
+
+def run_kappa_score(bars: list[Bar]) -> list[float]:
+    """KappaScoreAgent constants: fee-aware TP, no SL (disaster only), long-biased, ping."""
+    if len(bars) < 300:
+        return []
+
+    MEAN_W, K = 300, 2.0
+    MINBAND, MAXBAND = 10.0, 120.0
+    MIN_TP, TP_BUF, BE_BUF = 8.0, 4.0, 1.0
+    RT_FEE = 2.0 * 2.3  # assumed maker-in + maker-out (bps)
+    TP = max(MIN_TP, RT_FEE + TP_BUF)
+    BE = RT_FEE + BE_BUF
+    HOLD = 240.0
+    DISASTER = 150.0
+    CRASH_BPS, CRASH_W, REC_W = 35.0, 20, 300
+    GRIND_BPS, GRIND_W = 38.0, 300
+    REC_TP, REC_HOLD = 1.6, 2.0
+    KNIFE_STEP, KNIFE_DROP, KNIFE_S = 8.0, 20.0, 8
+    TREND_W, TREND_GATE = 600.0, 25.0
+    COOL_S = 30
+    PING_S, PING_DEV = 540, 6.0
+
+    prices: deque = deque()
+    mids: deque = deque()
+    grind: deque = deque()
+    ema = 0.0
+    pos = 0
+    avg = 0.0
+    ent = 0
+    postc = False
+    crash_until = 0
+    knife_until = 0
+    cool = 0
+    last_rt = 0
+    rts: list[float] = []
+
+    min_edge = max(MINBAND, TP + TP_BUF)
+
+    for bar in bars:
+        t, m = bar.t, bar.mid
+        prices.append((t, m))
+        while prices and prices[0][0] < t - MEAN_W:
+            prices.popleft()
+        mids.append((t, m))
+        while mids and mids[0][0] < t - CRASH_W:
+            mids.popleft()
+        grind.append((t, m))
+        while grind and grind[0][0] < t - GRIND_W:
+            grind.popleft()
+        ema = m if ema <= 0 else ema + (1 - math.exp(-1 / TREND_W)) * (m - ema)
+        if len(prices) < 8:
+            continue
+
+        ps = [p for _, p in prices]
+        ref = sum(ps) / len(ps)
+        var = sum((p - ref) ** 2 for p in ps) / len(ps)
+        disp = (math.sqrt(var) / ref) * 1e4 if ref > 0 else 0.0
+        band = max(MINBAND, min(MAXBAND, K * disp))
+
+        hi = max(p for _, p in mids)
+        ghi = max(p for _, p in grind)
+        drop = max(0.0, (hi - m) / hi * 1e4) if hi > 0 else 0.0
+        gdrop = max(0.0, (ghi - m) / ghi * 1e4) if ghi > 0 else 0.0
+        step = (m - mids[-2][1]) / mids[-2][1] * 1e4 if len(mids) >= 2 else 0.0
+        if drop >= CRASH_BPS or gdrop >= GRIND_BPS:
+            crash_until = t + REC_W
+        if step <= -KNIFE_STEP and drop >= KNIFE_DROP:
+            knife_until = t + KNIFE_S
+
+        in_rec = t < crash_until
+        knife = t < knife_until
+        trend = (ref - ema) / ema * 1e4 if ema > 0 else 0.0
+        dn = trend < -TREND_GATE
+        dev = (m - ref) / ref * 1e4 if ref > 0 else 0.0
+        edge = max(band, min_edge)
+
+        if pos != 0:
+            pnl = ((m - avg) if pos > 0 else (avg - m)) / avg * 1e4
+            tp_ = TP * (REC_TP if (pos > 0 and postc) else 1.0)
+            hold_ = HOLD * (REC_HOLD if (pos > 0 and postc) else 1.0)
+            timed_out = (t - ent) >= hold_
+
+            if pnl <= -DISASTER:
+                rts.append(pnl / 1e4)
+                last_rt = t
+                cool = t + COOL_S
+                pos = 0
+                avg = 0.0
+                ent = 0
+                postc = False
+            elif timed_out and pnl >= BE:
+                rts.append(pnl / 1e4)
+                last_rt = t
+                pos = 0
+                avg = 0.0
+                ent = 0
+                postc = False
+            elif pnl >= tp_:
+                rts.append(pnl / 1e4)
+                last_rt = t
+                pos = 0
+                avg = 0.0
+                ent = 0
+                postc = False
+            continue
+
+        if t < cool:
+            continue
+
+        need_ping = (last_rt == 0) or ((t - last_rt) >= PING_S)
+        fade_long = False
+        is_ping = False
+
+        if dev <= -edge and not knife and (in_rec or not dn):
+            fade_long = True
+        elif need_ping and not knife and not dn and not in_rec and dev <= PING_DEV:
+            fade_long = True
+            is_ping = True
+
+        if fade_long:
+            pos = 1
+            avg = m
+            ent = t
+            postc = in_rec and not is_ping
 
     return rts
 
@@ -296,6 +448,7 @@ def main() -> None:
     print(f"Books with bars: {len(books)}\n")
 
     strategies = [
+        ("KappaScoreAgent", run_kappa_score, 800.0),
         ("MeanReversionAgent", run_mean_reversion, 1800.0),
         ("MomentumScalperAgent", run_momentum, 2200.0),
     ]

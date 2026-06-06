@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS snapshots (
     signal_trend_bps REAL,
     signal_flow REAL,
     signal_imb REAL,
-    signal_level REAL,
     action TEXT,
     traded_volume REAL,
     volume_cap REAL,
@@ -67,9 +66,6 @@ _MIGRATIONS: dict[int, list[str]] = {
         "ALTER TABLE snapshots ADD COLUMN traded_volume REAL",
         "ALTER TABLE snapshots ADD COLUMN volume_cap REAL",
         "ALTER TABLE snapshots ADD COLUMN volume_remaining REAL",
-    ],
-    3: [
-        "ALTER TABLE snapshots ADD COLUMN signal_level REAL",
     ],
 }
 

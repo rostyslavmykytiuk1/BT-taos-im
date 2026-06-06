@@ -235,7 +235,6 @@ class MinerTelemetry:
             sig.get("trend_bps"),
             sig.get("flow"),
             sig.get("imb"),
-            sig.get("level"),
             action,
             traded_volume,
             volume_cap,
@@ -306,9 +305,9 @@ class MinerTelemetry:
                     INSERT OR REPLACE INTO snapshots (
                         ts_ns, book_id, mid, bid, ask, spread_bps,
                         pos_qty, pos_avg, unrealized_pnl, base_bal, quote_bal,
-                        signal_trend_bps, signal_flow, signal_imb, signal_level, action,
+                        signal_trend_bps, signal_flow, signal_imb, action,
                         traded_volume, volume_cap, volume_remaining
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     self._buf.snapshots,
                 )

@@ -479,6 +479,7 @@ All example agents support GenTRX distributed training. Training is **off by def
 
 | Agent | Trading logic | Notes |
 |---|---|---|
+| [`KappaScoreAgent`](KappaScoreAgent.py) | Score-max fader: tiny fee-clearing maker wins on every book, no-loss exits, 10-min activity ping | Maker open + maker close; never realizes a loss except a wide disaster stop; long-biased; see `doc/MINER_STRATEGY_REPORT.md` |
 | [`MeanReversionAgent`](MeanReversionAgent.py) | Open long/short on stretch (Kappa-3 tuned) | Maker open, market close; see `docs/MINER_STRATEGY_REPORT.md` |
 | [`MomentumScalperAgent`](MomentumScalperAgent.py) | Directional taker scalper | Trend + flow + imbalance |
 | [`AdaptiveMakerAgent`](AdaptiveMakerAgent.py) | Two-sided spread maker | Inventory-aware quoting |

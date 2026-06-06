@@ -15,7 +15,7 @@ from taos.im.utils import duration_from_timestamp, timestamp_from_duration
 
 _EPS = 1e-9
 
-# Match MeanReversionAgent rolling fair-value window (trade-print average).
+# Match MeanReversionAgent mean_window_s (default 300s).
 CHART_AVERAGE_WINDOW_S = 300.0
 CHART_AVERAGE_MIN_SAMPLES = 8
 
@@ -31,6 +31,7 @@ _CLOSE_ACTIONS = frozenset({"close_long", "close_short"})
 _OPEN_SNAPSHOT_ACTIONS = frozenset({
     "open_long", "open_short", "rebound_open", "rebound_add", "ping_open",
     "fade_long", "fade_short",
+    "fade_long_grind",
 })
 
 # Snapshot actions that may justify a close fill when no round_trip row exists.
@@ -46,6 +47,7 @@ _REASON_LABELS: dict[str, str] = {
     "sl": "close_sl",
     "tp": "close_tp",
     "fade_long": "open_long",
+    "fade_long_grind": "grind-up long",
     "fade_short": "open_short",
     # Legacy stretch/recover modes — not the same as current rebound_open.
     "fade_long_recover": "fade_long_recover",
@@ -69,6 +71,11 @@ REASON_DISPLAY: dict[str, str] = {
     "close_sl": "stop loss",
     "close_time": "held too long",
     "ping_open": "activity ping (start)",
+    "ping_long": "activity ping (buy leg)",
+    "ping_active": "activity ping (sell leg)",
+    "ping_wait": "activity ping (open in flight)",
+    "ping_skip_bal": "activity ping (no balance)",
+    "short_flatten": "flatten accidental short",
     "activity_ping": "activity ping (done)",
     "ping_hold": "activity ping (waiting)",
     "ping_followup_wait": "activity ping (waiting leg 2)",
@@ -78,10 +85,14 @@ REASON_DISPLAY: dict[str, str] = {
     "rebound_add": "rebound add size (legacy)",
     "fade_long_recover": "legacy recover mode",
     "recover": "legacy recover mode",
+    "grind_up": "slow grind up after dump",
+    "grind_short_block": "grind up — short blocked",
     "fill": "fill",
     "pause": "paused after stop",
     "cap": "volume cap",
     "falling": "price still falling",
+    "knife": "sharp dump, still falling",
+    "rocket": "sharp pump, still rising",
     "flat": "no trade",
     "warmup": "warming up",
     "manage": "holding",
@@ -328,41 +339,6 @@ def chart_time_window(
     return t_min, t_max, ordered
 
 
-def _signal_series_in_window(
-    conn,
-    book: int,
-    resolution: int,
-    ordered: list[tuple[int, float]],
-    column: str,
-) -> list[dict[str, Any]]:
-    """Forward-fill a snapshot signal column onto the chart bucket grid."""
-    if not ordered:
-        return []
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT ts_ns, {column} FROM snapshots
-            WHERE book_id = ? AND {column} IS NOT NULL
-            ORDER BY ts_ns ASC
-            """,
-            (book,),
-        ).fetchall()
-    except Exception:
-        return []
-    by_bucket: dict[int, float] = {}
-    for row in rows:
-        bucket = sim_seconds_from_ts_ns(int(row["ts_ns"])) // resolution
-        by_bucket[bucket] = float(row[column])
-    out: list[dict[str, Any]] = []
-    last: float | None = None
-    for bucket, _ in ordered:
-        if bucket in by_bucket:
-            last = by_bucket[bucket]
-        if last is not None:
-            out.append({"time": int(bucket) * resolution, "value": round(last, 6)})
-    return out
-
-
 def build_mid_series(
     uid: int,
     validator_slug: str,
@@ -372,37 +348,18 @@ def build_mid_series(
     limit: int,
     connect_db,
 ) -> dict[str, Any]:
-    """Mid line, 5m rolling average, and optional Kalman level / slope from telemetry."""
+    """Mid line plus 5 min rolling average of that mid (same window length as the agent)."""
     t_min, t_max, ordered = chart_time_window(
         uid, validator_slug, sim_id, book, resolution, limit, connect_db
     )
     if not ordered:
-        return {
-            "mid": [],
-            "average": [],
-            "kalman_level": [],
-            "slope_bps": [],
-            "origin": 0,
-            "range": [0, 0],
-        }
+        return {"mid": [], "average": [], "origin": 0, "range": [0, 0]}
 
     average = _rolling_average_of_mid(ordered, resolution)
-    kalman_level: list[dict[str, Any]] = []
-    slope_bps: list[dict[str, Any]] = []
-    db_path = telemetry_db(uid, validator_slug, sim_id)
-    if db_path.is_file():
-        conn = connect_db(db_path)
-        try:
-            kalman_level = _signal_series_in_window(conn, book, resolution, ordered, "signal_level")
-            slope_bps = _signal_series_in_window(conn, book, resolution, ordered, "signal_trend_bps")
-        finally:
-            conn.close()
 
     return {
         "mid": [{"time": b * resolution, "value": p} for b, p in ordered],
         "average": average,
-        "kalman_level": kalman_level,
-        "slope_bps": slope_bps,
         "origin": t_min,
         "range": [t_min, t_max],
     }

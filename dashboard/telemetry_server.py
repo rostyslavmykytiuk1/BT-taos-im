@@ -174,15 +174,6 @@ def get_mid(
     )
 
 
-def _snapshot_select(conn: sqlite3.Connection) -> str:
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-    fields = ["ts_ns", "mid", "signal_trend_bps", "signal_flow", "signal_imb"]
-    if "signal_level" in cols:
-        fields.append("signal_level")
-    fields.extend(["action", "pos_qty", "spread_bps"])
-    return ", ".join(fields)
-
-
 def _snapshot_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in rows:
@@ -205,10 +196,10 @@ def get_snapshots(
 ) -> list[dict[str, Any]]:
     conn = _connect(telemetry_db(uid, validator_id, simulation_id))
     try:
-        select_cols = _snapshot_select(conn)
         rows = conn.execute(
-            f"""
-            SELECT {select_cols}
+            """
+            SELECT ts_ns, mid, signal_trend_bps, signal_flow, signal_imb,
+                   action, pos_qty, spread_bps
             FROM snapshots
             WHERE book_id = ?
             ORDER BY ts_ns DESC LIMIT ?
