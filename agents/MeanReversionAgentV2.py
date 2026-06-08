@@ -1,51 +1,20 @@
 """
-MeanReversionAgent (v1)
-=======================
+MeanReversionAgentV2
+====================
 
-Contrarian range-fader for Subnet 79 (MVTRX / taos), tuned for **Kappa-3**.
-Frozen baseline — use ``MeanReversionAgentV2`` for ping fix + top-miner tuning.
+Taker min-lot scalper aligned with top miners (#22, #234, #248) on sim
+``20260606_1135``:
 
-Why this design
----------------
-An empirical study of the target validator's tape (see ``MINER_STRATEGY_REPORT.md``
-§3B) shows, across all 128 books:
+  * **100% taker** — no maker orders; skip book when ``taker_fee_rate > 0``.
+  * **Fixed 0.25 BASE** clip per trade (same as top-miner tape).
+  * **Fast round-trips** — hold ≤15s, exit at fee-aware TP/SL on **bid** (realistic).
+  * **128-book parallel** — each book: flat → taker buy → taker sell → flat.
+  * **When to open**: mean-reversion dip OR activity RT due (~520s window).
+  * **Signal** still filters *discretionary* entries; activity RT keeps books alive.
 
-  * Returns are **mean-reverting at every horizon** (1s-120s); momentum is
-    essentially absent. Fading extremes beats chasing trends.
-  * **123/128 books** show a **sharp dump (~20 bps/s) then a slow grind up
-    (~0.3 bps/s)**. After a >=50 bps cliff the median forward return over the
-    next ~5 min is **+63 bps** (97/109 books recover). The edge is therefore
-    *asymmetric*: do not mirror long/short rules.
+Run: ``AGENT_NAME=MeanReversionAgentV2`` in ``.env.miner-2``, then pm2 restart.
 
-Scoring reality (verified): Kappa-3 rewards **consistent, low-downside realized
-round-trip PnL across all books**; LPM3 cubes losses, so one blow-out hurts far
-more than a win helps. Volume is **not** rewarded today (activity_impact = 0),
-so we stay well under the cap and never churn — top miners use only ~35-45k of
-the 500k/book cap and win on PnL-per-round-trip, not volume.
-
-Strategy
---------
-Per book, each step:
-
-  fair  = microprice
-  ref   = rolling mean of recent trade prices (local fair value)
-  band  = k_entry * price_dispersion          (per-book, scales with volatility)
-  trend = (ref - long_EMA) / long_EMA         (slow direction filter)
-  crash = fast drop over crash_window          (sharp-dump detector)
-
-  if holding -> exit on TP / SL / time  (wider TP / longer hold post-crash)
-  elif flat and not over the volume cap:
-      * activity PING when no round-trip in ~8 min (min lot; separate from fades)
-      * during an active cliff -> DO NOT catch the knife (block new longs)
-      * post-crash floor / grind-up -> fade LONG with recovery asymmetry
-      * normal dip below ref -> fade LONG (maker-first entry)
-
-Every position is closed with a market order to **realize** PnL.
-
-Run (local proxy test):
-  python MeanReversionAgent.py --port 8902 --agent_id 0
-
-Tune strategy here (pm2 restart picks up changes; no .env / --agent.params needed):
+v1 baseline remains in ``MeanReversionAgent.py``.
 """
 
 import math
@@ -60,69 +29,61 @@ from taos.im.agents import FinanceSimulationAgent
 from taos.im.telemetry import MinerTelemetry
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.protocol.events import TradeEvent, SimulationStartEvent
-from taos.im.protocol.models import OrderDirection, OrderCurrency, STP, TimeInForce
+from taos.im.protocol.models import OrderDirection, OrderCurrency, STP
 
 # ---------------------------------------------------------------------------
-# Strategy constants — edit here, then: pm2 restart miner-1 miner-2 miner-3
+# Strategy constants — top-miner taker scalper (#22 / #234 / #248 tape)
 # ---------------------------------------------------------------------------
 
-# --- position size ---
-QUOTE_NOTIONAL = 1800.0         # QUOTE size per new entry (e.g. ~1800 USDT notional)
-MIN_ORDER_SIZE = 0.25           # smallest BASE order the sim accepts on a book
+MIN_ORDER_SIZE = 0.25             # fixed clip — top miners use min lot only
 
-# --- entry signal: "ref" + band ---
-MEAN_WINDOW_S = 300.0           # seconds of trade prints for rolling mean (ref); matches dashboard blue 5m line
-MIN_SAMPLES = 8                 # min prints in window before ref/band are valid
-K_ENTRY = 1.5                   # entry band = K_ENTRY × volatility
-MIN_BAND_BPS = 8.0              # never enter on less than this stretch vs ref (bps)
-MAX_BAND_BPS = 120.0            # never require more than this stretch to enter (bps cap)
-IMBALANCE_DEPTH = 5             # LOB levels used for bid/ask depth imbalance
-IMB_GATE = 0.30                 # skip long if heavy sell pressure (imb < -gate)
+# --- entry signal (when to open a discretionary scalp vs activity-only RT) ---
+MEAN_WINDOW_S = 300.0
+MIN_SAMPLES = 8
+K_ENTRY = 2.0
+MIN_BAND_BPS = 10.0
+MAX_BAND_BPS = 120.0
+IMBALANCE_DEPTH = 5
+IMB_GATE = 0.35
 
-# --- exit rules (from entry price, not ref) ---
-TP_BPS = 12.0                   # take profit when open PnL reaches +12 bps
-SL_BPS = 16.0                   # stop loss when open PnL reaches -16 bps
-MAX_HOLD_S = 180.0              # close anyway after this many seconds (tape-tuned; was 210)
-COOLDOWN_S = 30.0               # after a stop on a book, pause new entries there for N seconds
+# --- exit (fee-aware floors; actual TP/SL computed live per book) ---
+TP_BUFFER_BPS = 2.0               # profit above breakeven after taker RT + spread
+MIN_TP_BPS = 6.0                  # floor when fees are zero/rebate
+MIN_SL_BPS = 8.0
+ASSUMED_TAKER_BPS = 2.3           # fallback if account.fees missing
+DEFAULT_SPREAD_BPS = 6.0          # fallback full spread if book empty
+MAX_HOLD_S = 15.0                 # top miners: RT completes in seconds
+COOLDOWN_S = 30.0                 # pause book after stop-out
 
-# --- trend filter (slow direction; blocks fading into strong trends) ---
-TREND_WINDOW_S = 600.0          # EMA lookback for slow trend (seconds); should be > MEAN_WINDOW_S
-TREND_GATE_BPS = 25.0           # if ref vs EMA exceeds ±25 bps, treat book as trending
+# --- trend / crash filters (same tape asymmetry as v1) ---
+TREND_WINDOW_S = 600.0
+TREND_GATE_BPS = 20.0
+CRASH_BPS = 35.0
+CRASH_WINDOW_S = 20.0
+RECOVERY_WINDOW_S = 300.0
+RECOVERY_TP_MULT = 1.2
+GRIND_DUMP_WINDOW_S = 300.0
+GRIND_DUMP_BPS = 38.0
+GRIND_RISE_MIN_BPS = 8.0
+GRIND_LONG_MAX_DEV_BPS = 18.0
+MID_DEQUE_MAXLEN = 360
+KNIFE_MIN_DROP_BPS = 20.0
+KNIFE_STEP_BPS = 8.0
+KNIFE_BLOCK_S = 8.0
 
-# --- crash / recovery (sharp dump then slow grind up — tape asymmetry) ---
-CRASH_BPS = 35.0                # drop from recent high over CRASH_WINDOW_S that flags a "cliff"
-CRASH_WINDOW_S = 20.0           # lookback (seconds) for measuring that cliff drop
-RECOVERY_WINDOW_S = 300.0       # after a cliff, treat book as "recovery" for this long (favor careful longs)
-RECOVERY_TP_MULT = 1.8          # post-crash longs: multiply TP by this (recovery is slow, let winners run)
-RECOVERY_HOLD_MULT = 2.0        # post-crash longs: multiply MAX_HOLD_S by this
-GRIND_DUMP_WINDOW_S = 300.0      # slow-cliff lookback (matches mean window); catches multi-minute dumps
-GRIND_DUMP_BPS = 38.0           # drop from GRIND_DUMP_WINDOW high → post-dump recovery (tape-tuned)
-GRIND_RISE_MIN_BPS = 8.0        # off the grind floor by at least this much before grind-long
-GRIND_LONG_MAX_DEV_BPS = 18.0   # in grind-up, long while fair only this much above ref (not chasing spikes)
+# --- activity round-trip cadence (under 600s validator window) ---
+RT_INTERVAL_S = 520.0
+ORDER_COOLDOWN_S = 1.0            # min gap between orders on same book
 
-MID_DEQUE_MAXLEN = 360          # mid history for slow dump / grind windows (~1 pt/s × 300s)
+# --- taker-only (top miners: zero maker fee on chart) ---
+MAX_TAKER_FEE = 0.0               # trade only when taker fee ≤ 0 (free/rebate)
 
-# --- knife (block longs into an active dump) ---
-KNIFE_MIN_DROP_BPS = 20.0       # knife only after price has already dumped this much from the 20s high
-KNIFE_STEP_BPS = 8.0            # …and this step still falls ≥8 bps (falling knife → block longs)
-KNIFE_BLOCK_S = 8.0             # how long to block new longs after a knife trigger
+# --- volume cap ---
+CAPITAL_TURNOVER_CAP = 10.0
+VOLUME_SAFETY = 0.35
+VOLUME_ASSESSMENT_NS = 86_400_000_000_000
 
-# --- activity ping (separate from fade entries; keeps Activity=1 on each book) ---
-# Fires only when no completed round-trip in PING_INTERVAL_S. Uses one min lot at a
-# time so it never drains a normal fade position in a burst.
-PING_INTERVAL_S = 480.0         # ~8 min (well under the 600 s activity sampling window)
-PING_SUBMIT_COOLDOWN_S = 5.0    # min gap between ping orders on the same book
-
-# --- order routing ---
-ENTRY_EXPIRY_S = 8.0            # maker limit entries expire after N seconds (GTT)
-MAX_TAKER_FEE = 0.0             # only market/taker when fee ≤ this (0 = rebate or zero fee only)
-
-# --- volume cap (hard constraint; volume does not boost score today) ---
-CAPITAL_TURNOVER_CAP = 10.0     # max quote turnover = this × miner_wealth before stopping new entries
-VOLUME_SAFETY = 0.5             # use only this fraction of cap (stay well under limit)
-VOLUME_ASSESSMENT_NS = 86_400_000_000_000  # rolling 24h window for traded volume tally (nanoseconds)
-
-PRICES_DEQUE_MAXLEN = 3000      # max stored trade prints per book (covers MEAN_WINDOW_S on busy books)
+PRICES_DEQUE_MAXLEN = 3000
 
 
 @dataclass
@@ -144,18 +105,16 @@ class _BookState:
     crash_until: int = 0      # post-crash recovery window end (ns)
     knife_until: int = 0        # block new longs during active dump (ns)
     cooldown_until: int = 0   # pause after a stop-loss (ns)
-    last_rt_ns: int = 0           # sim time (ns) of last completed round-trip
-    last_ping_submit_ns: int = 0  # sim time (ns) of last ping order submit (anti-burst)
-    ping_awaiting_open: bool = False  # open ping leg in flight; block fade until fill/timeout
-    vol_log: list = field(default_factory=list)  # (ts, quote_volume) round-trip cost
+    last_rt_ns: int = 0
+    last_order_ns: int = 0
+    vol_log: list = field(default_factory=list)
 
 
-class MeanReversionAgent(FinanceSimulationAgent):
+class MeanReversionAgentV2(FinanceSimulationAgent):
     # ------------------------------------------------------------------ setup
     def initialize(self) -> None:
         bt.logging.set_info()
 
-        self.quote_notional = QUOTE_NOTIONAL
         self.min_order_size = MIN_ORDER_SIZE
         self.mean_window_s = MEAN_WINDOW_S
         self.min_samples = MIN_SAMPLES
@@ -164,8 +123,11 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.max_band_bps = MAX_BAND_BPS
         self.imbalance_depth = IMBALANCE_DEPTH
         self.imb_gate = IMB_GATE
-        self.tp_bps = TP_BPS
-        self.sl_bps = SL_BPS
+        self.tp_buffer_bps = TP_BUFFER_BPS
+        self.min_tp_bps = MIN_TP_BPS
+        self.min_sl_bps = MIN_SL_BPS
+        self.assumed_taker_bps = ASSUMED_TAKER_BPS
+        self.default_spread_bps = DEFAULT_SPREAD_BPS
         self.max_hold_s = MAX_HOLD_S
         self.cooldown_s = COOLDOWN_S
         self.trend_window_s = TREND_WINDOW_S
@@ -174,7 +136,6 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.crash_window_s = CRASH_WINDOW_S
         self.recovery_window_s = RECOVERY_WINDOW_S
         self.recovery_tp_mult = RECOVERY_TP_MULT
-        self.recovery_hold_mult = RECOVERY_HOLD_MULT
         self.knife_min_drop_bps = KNIFE_MIN_DROP_BPS
         self.knife_block_s = KNIFE_BLOCK_S
         self.knife_step_bps = KNIFE_STEP_BPS
@@ -182,11 +143,10 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.grind_dump_bps = GRIND_DUMP_BPS
         self.grind_rise_min_bps = GRIND_RISE_MIN_BPS
         self.grind_long_max_dev_bps = GRIND_LONG_MAX_DEV_BPS
-        self.ping_interval_s = PING_INTERVAL_S
-        self.ping_submit_cooldown_s = PING_SUBMIT_COOLDOWN_S
-        self.ping_interval_ns = int(self.ping_interval_s * 1e9)
-        self.ping_submit_cooldown_ns = int(self.ping_submit_cooldown_s * 1e9)
-        self.entry_expiry_s = ENTRY_EXPIRY_S
+        self.rt_interval_s = RT_INTERVAL_S
+        self.order_cooldown_s = ORDER_COOLDOWN_S
+        self.rt_interval_ns = int(self.rt_interval_s * 1e9)
+        self.order_cooldown_ns = int(self.order_cooldown_s * 1e9)
         self.max_taker_fee = MAX_TAKER_FEE
         self.turnover_cap = CAPITAL_TURNOVER_CAP
         self.volume_safety = VOLUME_SAFETY
@@ -210,16 +170,12 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self._exit_reason: dict[tuple[str, int], str] = {}
         self._step_ts_ns: int = 0
 
-        self.telemetry = MinerTelemetry.from_agent(self, agent_class="MeanReversionAgent")
+        self.telemetry = MinerTelemetry.from_agent(self, agent_class="MeanReversionAgentV2")
 
         bt.logging.info(
-            f"[MeanReversion uid={self.uid}] notional={self.quote_notional} "
-            f"tp={self.tp_bps}bps sl={self.sl_bps}bps hold={self.max_hold_s}s "
-            f"k_entry={self.k_entry:.2f} mean={self.mean_window_s}s "
-            f"crash={self.crash_bps:.1f}bps/{self.crash_window_s}s "
-            f"grind={self.grind_dump_bps:.1f}bps/{self.grind_dump_window_s}s "
-            f"recovery={self.recovery_window_s}s tp_mult={self.recovery_tp_mult} "
-            f"ping={self.ping_interval_s}s long_only"
+            f"[MeanReversionV2 uid={self.uid}] taker_scalper lot={self.min_order_size} "
+            f"hold={self.max_hold_s}s rt={self.rt_interval_s}s "
+            f"k_entry={self.k_entry:.2f} max_taker_fee={self.max_taker_fee}"
         )
 
     # --------------------------------------------------------------- lifecycle
@@ -228,7 +184,7 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.books_state.clear()
         self._sim_id.clear()
         self._exit_reason.clear()
-        bt.logging.info(f"[MeanReversion uid={self.uid}] simulation start: reset state")
+        bt.logging.info(f"[MeanReversionV2 uid={self.uid}] simulation start: reset state")
 
     def update(self, state: MarketSimulationStateUpdate) -> None:
         # Stamp the current simulation time so fills are tracked on sim-time
@@ -283,8 +239,6 @@ class MeanReversionAgent(FinanceSimulationAgent):
             pos.qty = prev + signed
             if prev == 0:
                 pos.entry_ts = ts
-            if direction == OrderDirection.BUY:
-                self._bstate(validator, book_id).ping_awaiting_open = False
         else:
             # Reduce / close / flip -> realize a round-trip on the closed amount.
             # Partial closes (activity-ping slice) count as RTs for scoring.
@@ -423,22 +377,67 @@ class MeanReversionAgent(FinanceSimulationAgent):
                                   price_dp, vol_dp, cap, state.timestamp)
             except Exception as ex:
                 bt.logging.warning(
-                    f"[MeanReversion uid={self.uid}] book {book_id} error: {ex}\n"
+                    f"[MeanReversionV2 uid={self.uid}] book {book_id} error: {ex}\n"
                     f"{traceback.format_exc()}"
                 )
         self.telemetry.end_step(state, instructions=len(response.instructions) - instr_before)
         return response
 
     def _reconcile_position(self, account, pos, vol_dp) -> None:
-        """Clamp tracked qty to free base so we never oversell on ping/exit."""
+        """Clamp tracked qty to free base; cap at one min lot (top-miner clip)."""
         if account.base_balance is None:
             return
         free = account.base_balance.free
         if pos.qty > 0:
             if free < self.min_order_size / 2:
                 pos.qty, pos.avg, pos.entry_ts, pos.post_crash = 0.0, 0.0, 0, False
-            elif free < pos.qty - self.min_order_size / 4:
-                pos.qty = round(free, vol_dp)
+            else:
+                pos.qty = round(min(pos.qty, free, self.min_order_size), vol_dp)
+
+    def _order_cooldown_ok(self, st: _BookState, now: int) -> bool:
+        return (st.last_order_ns == 0) or ((now - st.last_order_ns) >= self.order_cooldown_ns)
+
+    def _rt_due(self, st: _BookState, now: int) -> bool:
+        return (st.last_rt_ns == 0) or ((now - st.last_rt_ns) >= self.rt_interval_ns)
+
+    def _spread_bps(self, book, mid: float) -> float:
+        if not book.bids or not book.asks or mid <= 0:
+            return self.default_spread_bps
+        return (book.asks[0].price - book.bids[0].price) / mid * 1e4
+
+    def _taker_fee_bps(self, account) -> float:
+        fees = getattr(account, "fees", None)
+        rate = getattr(fees, "taker_fee_rate", None) if fees is not None else None
+        if rate is None:
+            return self.assumed_taker_bps
+        try:
+            return float(rate) * 1e4
+        except (TypeError, ValueError):
+            return self.assumed_taker_bps
+
+    def _roundtrip_fee_bps(self, account) -> float:
+        """Taker-in + taker-out fee cost in bps."""
+        return 2.0 * self._taker_fee_bps(account)
+
+    def _tp_sl_bps(self, account, book, mid: float, post_crash: bool) -> tuple[float, float]:
+        """Fee + spread aware TP/SL for a full taker round-trip."""
+        rt_fee = self._roundtrip_fee_bps(account)
+        spread = self._spread_bps(book, mid)
+        tp = max(self.min_tp_bps, rt_fee + spread + self.tp_buffer_bps)
+        sl = max(self.min_sl_bps, rt_fee + spread * 0.5)
+        if post_crash:
+            tp *= self.recovery_tp_mult
+        return tp, sl
+
+    def _taker_allowed(self, account) -> bool:
+        fees = getattr(account, "fees", None)
+        rate = getattr(fees, "taker_fee_rate", None) if fees is not None else None
+        if rate is None:
+            return False
+        try:
+            return float(rate) <= self.max_taker_fee
+        except (TypeError, ValueError):
+            return False
 
     def _handle_book(self, response, validator, book_id, book,
                      price_dp, vol_dp, cap, now) -> None:
@@ -448,6 +447,8 @@ class MeanReversionAgent(FinanceSimulationAgent):
             return
         account = self.accounts.get(book_id)
         if account is None:
+            return
+        if not self._taker_allowed(account):
             return
 
         st = self._bstate(validator, book_id)
@@ -459,16 +460,14 @@ class MeanReversionAgent(FinanceSimulationAgent):
         pos = self._book_positions(validator).setdefault(book_id, _Position())
         self._reconcile_position(account, pos, vol_dp)
 
-        # Flatten accidental shorts (should not happen on a long-only agent).
         if pos.qty < -self.min_order_size / 2:
             self._exit_reason[(validator, book_id)] = "short_flatten"
-            st.last_ping_submit_ns = now
-            self._flatten(response, account, book_id, pos, vol_dp)
+            st.last_order_ns = now
+            self._taker_sell(response, account, book_id, pos, vol_dp)
             self._snap(validator, book_id, mid, bid, ask, pos, account,
                        0.0, 0.0, imb, "short_flatten", cap, now)
             return
 
-        # --- crash / knife state (asymmetric §3B.5 handling) ---
         drop_bps = self._crash_drop_bps(st, mid)
         grind_drop_bps = self._grind_drop_bps(st, mid)
         grind_rise_bps = self._grind_rise_bps(st, mid)
@@ -479,41 +478,31 @@ class MeanReversionAgent(FinanceSimulationAgent):
             st.knife_until = now + int(self.knife_block_s * 1e9)
         in_recovery = now < st.crash_until
         knife_active = now < st.knife_until
-
-        # trend filter
         trend_bps = ((ref - st.ema_long) / st.ema_long * 1e4) if (ref and st.ema_long > 0) else 0.0
         downtrend = trend_bps < -self.trend_gate_bps
 
-        # ---- 1) manage an open long (market exit guarantees realization) ----
+        # ---- manage open min-lot long: taker sell on bid PnL ----
         if pos.qty >= self.min_order_size / 2 and pos.avg > 0:
-            # Activity ping close: one min lot only — never flatten a fade position.
-            if self._ping_close_due(st, pos.qty, now):
-                if self._submit_ping_close(response, validator, book_id, account, pos, st,
-                                           mid, bid, ask, trend_bps, imb, vol_dp, cap, now):
-                    return
-
-            # Exit PnL on mid — matches the chart and avoids microprice/spread false stops.
-            pnl_bps = (mid - pos.avg) / pos.avg * 1e4
-            tp = self.tp_bps
-            sl = self.sl_bps
-            hold_ns = self.max_hold_s * 1e9
-            if pos.post_crash:
-                tp *= self.recovery_tp_mult
-                hold_ns *= self.recovery_hold_mult
-            timed_out = (now - pos.entry_ts) >= hold_ns if pos.entry_ts else False
+            exit_px = bid if bid and bid > 0 else mid
+            pnl_bps = (exit_px - pos.avg) / pos.avg * 1e4
+            tp, sl = self._tp_sl_bps(account, book, mid, pos.post_crash)
+            timed_out = (now - pos.entry_ts) >= int(self.max_hold_s * 1e9) if pos.entry_ts else False
             if pnl_bps >= tp:
                 self._exit_reason[(validator, book_id)] = "tp"
                 exit_action = "exit_tp"
-                self._flatten(response, account, book_id, pos, vol_dp)
+                st.last_order_ns = now
+                self._taker_sell(response, account, book_id, pos, vol_dp)
             elif pnl_bps <= -sl:
                 self._exit_reason[(validator, book_id)] = "sl"
                 st.cooldown_until = now + int(self.cooldown_s * 1e9)
                 exit_action = "exit_sl"
-                self._flatten(response, account, book_id, pos, vol_dp)
+                st.last_order_ns = now
+                self._taker_sell(response, account, book_id, pos, vol_dp)
             elif timed_out:
                 self._exit_reason[(validator, book_id)] = "time"
                 exit_action = "exit_time"
-                self._flatten(response, account, book_id, pos, vol_dp)
+                st.last_order_ns = now
+                self._taker_sell(response, account, book_id, pos, vol_dp)
             else:
                 exit_action = "manage"
             self._snap(validator, book_id, mid, bid, ask, pos, account,
@@ -521,182 +510,84 @@ class MeanReversionAgent(FinanceSimulationAgent):
                        exit_action, cap, now)
             return
 
-        # ---- 2) flat: activity ping open, then optional fade long ----
-        if self._ping_open_due(st, pos.qty, now):
-            self._submit_ping_open(response, validator, book_id, account, pos, st, book,
-                                   mid, bid, ask, trend_bps, imb, cap, now)
-            return
-
-        if ref is None or now < st.cooldown_until or st.ping_awaiting_open:
-            label = "warmup" if ref is None else ("cooldown" if now < st.cooldown_until else "ping_wait")
+        # ---- flat: taker buy on signal or activity RT ----
+        if ref is None or now < st.cooldown_until:
+            label = "warmup" if ref is None else "cooldown"
             self._snap(validator, book_id, mid, bid, ask, pos, account,
                        trend_bps, 0.0, imb, label, cap, now)
             return
-
+        if not self._order_cooldown_ok(st, now):
+            self._snap(validator, book_id, mid, bid, ask, pos, account,
+                       trend_bps, 0.0, imb, "order_cd", cap, now)
+            return
         if self._rolled_quote_volume(validator, book_id, now) >= cap:
             self._snap(validator, book_id, mid, bid, ask, pos, account,
                        trend_bps, 0.0, imb, "cap", cap, now)
             return
 
-        dev_bps = (fair - ref) / ref * 1e4    # >0 stretched above ref, <0 below
+        dev_bps = (fair - ref) / ref * 1e4
         fade_long = False
         grind_long = False
-
         if dev_bps <= -band_bps:
-            # Over-extended DOWN -> buy the dip, expecting reversion up.
-            # But not while the knife is still falling, and not in a downtrend
-            # unless this is a post-crash recovery floor (then we *want* the dip).
             if not knife_active and imb >= -self.imb_gate:
                 if in_recovery or not downtrend:
                     fade_long = True
         elif (in_recovery and mid > st.ema_long and grind_rise_bps >= self.grind_rise_min_bps
               and dev_bps <= self.grind_long_max_dev_bps):
-            # Post-dump slow grind up: price may sit above ref — ride the rise, don't fade it.
             if not knife_active and imb >= -self.imb_gate:
                 grind_long = True
                 fade_long = True
 
-        if not fade_long:
-            if knife_active:
-                label = "knife"
-            elif in_recovery and mid > st.ema_long and grind_rise_bps >= self.grind_rise_min_bps:
-                label = "grind_up"
-            elif in_recovery:
-                label = "recover"
-            else:
-                label = "flat"
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, dev_bps, imb, label, cap, now)
-            return
+        rt_due = self._rt_due(st, now)
+        if fade_long or rt_due:
+            action = (
+                "fade_long_grind" if grind_long
+                else "fade_long_recover" if in_recovery and fade_long
+                else "fade_long" if fade_long
+                else "activity_rt"
+            )
+            if self._taker_buy(response, account, book_id, book, pos, st, now):
+                self._snap(validator, book_id, mid, bid, ask, pos, account,
+                           trend_bps, dev_bps, imb, action, cap, now)
+                return
 
-        qty = round(self.quote_notional / mid, vol_dp)
-        if qty < self.min_order_size:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, dev_bps, imb, "too_small", cap, now)
-            return
-
-        take_ok = self._taker_allowed(account)
-        action = (
-            "fade_long_grind" if grind_long
-            else "fade_long_recover" if in_recovery
-            else "fade_long"
-        )
-        self._enter(response, account, book_id, qty,
-                    book, price_dp, take_ok, mark_post_crash=in_recovery, pos=pos)
-
+        if knife_active:
+            label = "knife"
+        elif in_recovery and mid > st.ema_long and grind_rise_bps >= self.grind_rise_min_bps:
+            label = "grind_up"
+        elif in_recovery:
+            label = "recover"
+        elif rt_due:
+            label = "rt_skip"
+        else:
+            label = "flat"
         self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, dev_bps, imb, action, cap, now)
+                   trend_bps, dev_bps, imb, label, cap, now)
 
-    # ----------------------------------------------------------- activity ping
-    def _rt_due(self, st: _BookState, now: int) -> bool:
-        """True when this book needs a round-trip for the activity window."""
-        return (st.last_rt_ns == 0) or ((now - st.last_rt_ns) >= self.ping_interval_ns)
-
-    def _submit_cooldown_ok(self, st: _BookState, now: int) -> bool:
-        return (st.last_ping_submit_ns == 0) or (
-            (now - st.last_ping_submit_ns) >= self.ping_submit_cooldown_ns)
-
-    def _ping_open_due(self, st: _BookState, inv_qty: float, now: int) -> bool:
-        """Flat book: open leg of a mandatory activity round-trip."""
-        if st.ping_awaiting_open:
-            if (now - st.last_ping_submit_ns) > int(60e9):
-                st.ping_awaiting_open = False
-            else:
-                return False
-        return (inv_qty < self.min_order_size / 2 and self._rt_due(st, now)
-                and self._submit_cooldown_ok(st, now))
-
-    def _ping_close_due(self, st: _BookState, inv_qty: float, now: int) -> bool:
-        """Holding book: close leg of a mandatory activity round-trip."""
-        return (inv_qty >= self.min_order_size / 2 and self._rt_due(st, now)
-                and self._submit_cooldown_ok(st, now))
-
-    def _submit_ping_open(self, response, validator, book_id, account, pos, st, book,
-                          mid, bid, ask, trend_bps, imb, cap, now) -> None:
-        """Market-buy exactly one min lot (open leg). Separate from fade entries."""
+    def _taker_buy(self, response, account, book_id, book, pos, st, now) -> bool:
+        """Market-buy exactly one min lot."""
         qty = self.min_order_size
-        ask_px = book.asks[0].price if book.asks else mid
-        if account.quote_balance.free < qty * ask_px:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "ping_skip_bal", cap, now)
-            return
-        st.last_ping_submit_ns = now
-        st.ping_awaiting_open = True
-        self._exit_reason[(validator, book_id)] = "ping_open"
+        ask_px = book.asks[0].price if book.asks else 0.0
+        if ask_px <= 0 or account.quote_balance.free < qty * ask_px:
+            return False
+        st.last_order_ns = now
+        pos.post_crash = now < st.crash_until
         response.market_order(book_id=book_id, direction=OrderDirection.BUY,
                               quantity=qty, currency=OrderCurrency.BASE,
                               stp=STP.CANCEL_OLDEST)
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, 0.0, imb, "ping_long", cap, now)
-
-    def _submit_ping_close(self, response, validator, book_id, account, pos, st,
-                           mid, bid, ask, trend_bps, imb, vol_dp, cap, now) -> bool:
-        """Market-sell exactly one min lot (close leg). Leaves fade positions intact."""
-        if pos.qty <= 0:
-            return False
-        slice_qty = round(min(self.min_order_size, pos.qty,
-                              account.base_balance.free if account.base_balance else pos.qty),
-                          vol_dp)
-        if slice_qty < self.min_order_size:
-            return False
-        st.last_ping_submit_ns = now
-        self._exit_reason[(validator, book_id)] = "ping_active"
-        self._market_close_slice(response, account, book_id, pos, slice_qty, vol_dp)
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, 0.0, imb, "ping_active", cap, now)
         return True
 
-    # ------------------------------------------------------------------ orders
-    def _taker_allowed(self, account) -> bool:
-        """Allow a taker entry only when the current taker fee is a rebate/cheap."""
-        fees = getattr(account, "fees", None)
-        rate = getattr(fees, "taker_fee_rate", None) if fees is not None else None
-        if rate is None:
-            return False
-        try:
-            return float(rate) <= self.max_taker_fee
-        except (TypeError, ValueError):
-            return False
-
-    def _enter(self, response, account, book_id, qty, book,
-               price_dp, take_ok, mark_post_crash, pos) -> None:
-        """Maker-first long entry; taker fallback only when the fee regime pays takers."""
-        expiry_ns = int(self.entry_expiry_s * 1e9)
-        price = round(book.bids[0].price, price_dp)
-        if account.quote_balance.free < qty * (book.asks[0].price or price):
-            return
-        pos.post_crash = bool(mark_post_crash)
-        if take_ok:
-            response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=qty,
-                                  currency=OrderCurrency.BASE, stp=STP.CANCEL_OLDEST)
-        else:
-            response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=qty,
-                                 price=price, postOnly=True, timeInForce=TimeInForce.GTT,
-                                 expiryPeriod=expiry_ns, stp=STP.CANCEL_OLDEST)
-
-    def _market_close_slice(self, response, account, book_id, pos, qty, vol_dp) -> None:
-        """Market-close up to `qty` BASE of a long (partial allowed for activity ping)."""
+    def _taker_sell(self, response, account, book_id, pos, vol_dp) -> None:
+        """Market-sell full min-lot long."""
         if pos.qty <= 0:
             return
         free = account.base_balance.free if account.base_balance else 0.0
-        q = round(min(qty, pos.qty, free), vol_dp)
-        if q < self.min_order_size:
+        qty = round(min(self.min_order_size, pos.qty, free), vol_dp)
+        if qty < self.min_order_size / 2:
             return
         response.market_order(book_id=book_id, direction=OrderDirection.SELL,
-                              quantity=q, currency=OrderCurrency.BASE,
+                              quantity=qty, currency=OrderCurrency.BASE,
                               stp=STP.CANCEL_OLDEST)
-
-    def _flatten(self, response, account, book_id, pos, vol_dp) -> None:
-        """Market-close the full tracked position (long or accidental short)."""
-        if pos.qty > 0:
-            self._market_close_slice(response, account, book_id, pos, pos.qty, vol_dp)
-        elif pos.qty < 0:
-            qty = round(-pos.qty, vol_dp)
-            if qty < self.min_order_size:
-                return
-            response.market_order(book_id=book_id, direction=OrderDirection.BUY,
-                                  quantity=qty, currency=OrderCurrency.BASE,
-                                  stp=STP.CANCEL_OLDEST)
 
     # --------------------------------------------------------------- telemetry
     def _snap(self, validator, book_id, mid, bid, ask, pos, account,
@@ -716,4 +607,4 @@ class MeanReversionAgent(FinanceSimulationAgent):
 
 
 if __name__ == "__main__":
-    launch(MeanReversionAgent)
+    launch(MeanReversionAgentV2)
