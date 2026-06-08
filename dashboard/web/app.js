@@ -10,9 +10,19 @@ const ROUTE_RE =
 const MARKER_STYLE = {
   open_long: { position: "aboveBar", shape: "arrowUp", color: "#22c55e", size: 1 },
   open_short: { position: "aboveBar", shape: "arrowDown", color: "#ef4444", size: 1 },
+  open_kappa: { position: "aboveBar", shape: "arrowUp", color: "#22c55e", size: 1 },
+  open_activity: { position: "aboveBar", shape: "arrowUp", color: "#eab308", size: 1 },
+  open_force: { position: "aboveBar", shape: "arrowUp", color: "#f97316", size: 1 },
   close_long: { position: "aboveBar", shape: "circle", color: "#22c55e", size: 1 },
   close_short: { position: "aboveBar", shape: "circle", color: "#ef4444", size: 1 },
 };
+
+/** Chart marker key: RebateScalper open snapshots (open_kappa/activity/force) override generic open_long. */
+function markerKey(row) {
+  const code = row.reason_code || row.action;
+  if (code && MARKER_STYLE[code]) return code;
+  return row.action;
+}
 
 const TABLE_COLUMNS = {
   round_trips: [
@@ -31,9 +41,9 @@ const TABLE_COLUMNS = {
 const TABLE_HEADERS = {
   time_label: "time",
   closed_at: "sim_time",
-  signal_trend_bps: "trend_bps",
-  signal_flow: "dev_bps",
-  signal_imb: "imb",
+  signal_trend_bps: "taker_bps",
+  signal_flow: "kappa3",
+  signal_imb: "est_pnl",
   reason: "why",
 };
 
@@ -307,7 +317,7 @@ function ordersInChartRange(midPayload, orders) {
     tMax = pts[pts.length - 1].time;
   }
   return (orders || []).filter(
-    (o) => o.time != null && o.time >= tMin && o.time <= tMax && MARKER_STYLE[o.action],
+    (o) => o.time != null && o.time >= tMin && o.time <= tMax && MARKER_STYLE[markerKey(o)],
   );
 }
 
@@ -321,7 +331,7 @@ function updateChart(midPayload, orders, fitView) {
   midSeries.setMarkers(
     inRange
       .map((o) => {
-        const s = MARKER_STYLE[o.action];
+        const s = MARKER_STYLE[markerKey(o)];
         return { time: toChartTime(o.time), position: s.position, shape: s.shape, color: s.color, size: s.size };
       })
       .sort((a, b) => a.time - b.time),
@@ -337,6 +347,13 @@ function formatCell(row, col) {
     if (sec != null) return formatSimTimeSec(sec);
   }
   if (col === "pos_before" || col === "pos_after") return Number(v).toFixed(3);
+  if (col === "signal_trend_bps") return fmt(v, 2);
+  if (col === "signal_flow") return fmt(v, 3);
+  if (col === "signal_imb") {
+    const act = row.action || "";
+    if (act === "open_force" || act === "open_activity") return `${fmt(v, 0)}s gap`;
+    return fmt(v, 4);
+  }
   return String(v);
 }
 

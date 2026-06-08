@@ -32,6 +32,7 @@ _OPEN_SNAPSHOT_ACTIONS = frozenset({
     "open_long", "open_short", "rebound_open", "rebound_add", "ping_open",
     "fade_long", "fade_short",
     "fade_long_grind",
+    "open_kappa", "open_activity", "open_force",
 })
 
 # Snapshot actions that may justify a close fill when no round_trip row exists.
@@ -67,6 +68,9 @@ def normalize_reason(reason: str) -> str:
 REASON_DISPLAY: dict[str, str] = {
     "open_long": "much cheap vs average",
     "open_short": "much above average",
+    "open_kappa": "kappa path (rebate + kappa ok)",
+    "open_activity": "activity path (520s+, fee ≤ 0)",
+    "open_force": "force path (570s+, any fee)",
     "close_tp": "take profit",
     "close_sl": "stop loss",
     "close_time": "held too long",
