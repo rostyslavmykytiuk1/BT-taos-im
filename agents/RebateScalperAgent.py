@@ -4,19 +4,14 @@ RebateScalperAgent — taker rebate round-trip engine for subnet 79.
 Tick flow
 ---------
 1. Close all open legs (TP / SL / max_hold).
-2. Scan 32 books per tick (activity-urgent books first, then rotating window).
-3. Open decision uses cached per-book Kappa-3 (3h realized PnL) on the normal path
-   when fee is good (rebate/zero), conservative RT estimate passes, and kappa
-   keeps or improves. Activity/force if no RT in ~10m (mandatory).
-   ACTIVITY_WARMUP_S disables activity/force for N seconds after agent start
-   (kappa path still runs). κ needs ≥3 RTs in 3h. RT caps: 4/40m, 18/3h.
-   Volume cap on kappa path only.
+2. Scan 32 books per tick (0 RT in 10m first, then rotating window).
+3. Per book in RT_WINDOW_S: force if 0 RTs, kappa if rebate and count < RT_MAX,
+   skip if at cap. Volume cap on kappa path only.
 
-Open reasons (telemetry action): open_kappa | open_activity | open_force
+Open reasons (telemetry action): open_kappa | open_force
 """
 
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,22 +34,19 @@ MAX_HOLD_S = 5.0
 MIN_GROSS_TP_BPS = 2.5
 MAX_GROSS_SL_BPS = 6.0
 
-# Activity (validator sampling window = 600s)
-ACTIVITY_URGENT_S = 520.0          # scan priority before 10m window lapses
-ACTIVITY_RT_INTERVAL_S = 560.0     # must RT if last close older than this
-ACTIVITY_WARMUP_S = 0.0            # seconds; 0 = off. edit here (e.g. 3600, 7200)
 MIN_REOPEN_GAP_S = 4.0
 
-# Kappa-3 + RT caps
+# RT window for opens (validator activity sampling = 10m)
+RT_WINDOW_S = 570.0                # ~10 min
+RT_MAX = 3                         # max RTs per book in window
+
+# Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
 KAPPA_MIN_OBS = 3
 KAPPA_MIN_LOOKBACK_S = 5400.0      # 90 min
+KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
 KAPPA_PROJ_TOLERANCE = 0.008
-RT_LOOKBACK_S = 10_800.0           # 3h
-RT_LOOKBACK_SHORT_S = 2400.0       # 40m
-RT_CAP_3H = 18                     # 3h / 10m sampling interval
-RT_CAP_SHORT = 4
 
 BOOKS_PER_STEP = 32
 
@@ -96,10 +88,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
         self.min_reopen_gap_ns = int(MIN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
-        self.activity_urgent_ns = int(ACTIVITY_URGENT_S * _NS)
-        self.activity_rt_interval_ns = int(ACTIVITY_RT_INTERVAL_S * _NS)
-        self.rt_lookback_ns = int(RT_LOOKBACK_S * _NS)
-        self.rt_lookback_short_ns = int(RT_LOOKBACK_SHORT_S * _NS)
+        self.rt_window_ns = int(RT_WINDOW_S * _NS)
+        self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
 
         self.positions: dict[str, dict[int, _Position]] = {}
@@ -109,15 +99,12 @@ class RebateScalperAgent(FinanceSimulationAgent):
         self._open_step: dict[str, int] = {}
         self._step_ts_ns: int = 0
         self._active_validator: str | None = None
-        self._agent_start_ts = time.time()
 
         self.telemetry = MinerTelemetry.from_agent(self, agent_class="RebateScalperAgent")
-        warmup_msg = f" activity_warmup={ACTIVITY_WARMUP_S:.0f}s" if ACTIVITY_WARMUP_S > 0 else ""
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] lot={MIN_ORDER_SIZE} "
             f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s books/step={BOOKS_PER_STEP} "
-            f"rt_cap={RT_CAP_SHORT}/{RT_LOOKBACK_SHORT_S / 60:.0f}m {RT_CAP_3H}/3h"
-            f"{warmup_msg}"
+            f"rt_window={RT_WINDOW_S / 60:.0f}m force=0 max={RT_MAX}"
         )
 
     def onStart(self, event: SimulationStartEvent) -> None:
@@ -191,10 +178,12 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 continue
             try:
                 do_open, reason, meta = self._open_decision(
-                    validator, book_id, book, account, volume_cap, now,
+                    validator, book_id, book, account, vol_dp, volume_cap, now,
                 )
                 if do_open and self._taker_buy(response, validator, book_id, account, book):
-                    self._record_open(validator, book_id, book, account, now, reason, volume_cap, meta)
+                    self._record_open(
+                        validator, book_id, book, account, now, reason, volume_cap, meta,
+                    )
             except Exception as ex:
                 bt.logging.warning(f"[RebateScalper uid={self.uid}] open {book_id}: {ex}")
 
@@ -310,7 +299,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
             pos.entry_fee = trade_fee * (abs(pos.qty) / qty) if qty > 0 else 0.0
 
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
-        cutoff = now - self.rt_lookback_ns
+        cutoff = now - self.kappa_rt_history_ns
         before = len(st.rt_events)
         st.rt_events = [(t, p) for t, p in st.rt_events if t >= cutoff]
         return len(st.rt_events) != before
@@ -329,7 +318,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ kappa-3
     def _global_rt_timestamps(self, validator: str, now: int) -> list[int]:
-        cutoff = now - self.rt_lookback_ns
+        cutoff = now - self.kappa_rt_history_ns
         ts_set: set[int] = set()
         for st in self.books_state.get(validator, {}).values():
             for ts, _ in st.rt_events:
@@ -352,7 +341,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if not timestamps:
             return []
 
-        cutoff = now - self.rt_lookback_ns
+        cutoff = now - self.kappa_rt_history_ns
         by_ts = {t: p for t, p in self._bstate(validator, book_id).rt_events if t >= cutoff}
         if extra is not None:
             by_ts[extra[0]] = extra[1]
@@ -421,7 +410,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         projected = self._kappa3_raw(
             self._book_pnl_series(validator, book_id, now, extra=(close_ts, estimated)),
         )
-        rt_n = self._rt_count(st, now, self.rt_lookback_ns)
+        rt_n = self._rt_count(st, now, self.kappa_rt_history_ns)
         if projected is None:
             return rt_n < KAPPA_MIN_OBS
 
@@ -433,47 +422,24 @@ class RebateScalperAgent(FinanceSimulationAgent):
         return projected >= current - KAPPA_PROJ_TOLERANCE
 
     # ------------------------------------------------------------------ open gates
-    @staticmethod
-    def _rt_gap_ns(st: _BookState, now: int) -> int:
-        return 0 if st.last_rt_ns == 0 else now - st.last_rt_ns
-
-    def _rt_stale(self, st: _BookState, now: int, interval_ns: int) -> bool:
-        if st.last_rt_ns == 0:
-            return True
-        return (now - st.last_rt_ns) >= interval_ns
-
-    def _activity_enabled(self) -> bool:
-        if ACTIVITY_WARMUP_S <= 0:
-            return True
-        return (time.time() - self._agent_start_ts) >= ACTIVITY_WARMUP_S
-
     def _reopen_ok(self, st: _BookState, now: int) -> bool:
         return st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
 
-    def _rt_count(self, st: _BookState, now: int, window_ns: int) -> int:
-        cutoff = now - window_ns
+    def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
+        cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
-    def _at_rt_cap(self, st: _BookState, now: int) -> bool:
-        return (
-            self._rt_count(st, now, self.rt_lookback_short_ns) >= RT_CAP_SHORT
-            or self._rt_count(st, now, self.rt_lookback_ns) >= RT_CAP_3H
-        )
-
-    def _activity_urgent_books(self, validator: str, now: int) -> list[int]:
-        if not self._activity_enabled():
-            return []
-        urgent: list[tuple[int, int]] = []
+    def _books_needing_force(self, validator: str, now: int) -> list[int]:
+        """Flat books with 0 RTs in the window — scanned first each tick."""
+        stale: list[tuple[int, int]] = []
         for book_id in sorted(self.accounts.keys()):
             st = self._bstate(validator, book_id)
             pos = self._book_positions(validator).get(book_id, _Position())
-            if pos.qty >= self._min_qty or st.pending_buy:
+            if pos.qty >= self._min_qty or st.pending_buy or self._rt_count(st, now) > 0:
                 continue
-            if not self._rt_stale(st, now, self.activity_urgent_ns):
-                continue
-            urgent.append((now if st.last_rt_ns == 0 else now - st.last_rt_ns, book_id))
-        urgent.sort(reverse=True)
-        return [book_id for _, book_id in urgent]
+            stale.append((now if st.last_rt_ns == 0 else now - st.last_rt_ns, book_id))
+        stale.sort(reverse=True)
+        return [book_id for _, book_id in stale]
 
     def _open_book_batch(self, validator: str, step: int, now: int) -> list[int]:
         book_ids = sorted(self.accounts.keys())
@@ -486,7 +452,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         merged: list[int] = []
         seen: set[int] = set()
-        for book_id in self._activity_urgent_books(validator, now) + rotated:
+        for book_id in self._books_needing_force(validator, now) + rotated:
             if book_id in seen:
                 continue
             seen.add(book_id)
@@ -501,6 +467,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         book_id: int,
         book,
         account,
+        vol_dp: int,
         volume_cap: float,
         now: int,
     ) -> tuple[bool, str, dict[str, Any]]:
@@ -517,30 +484,29 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if self._mid(book) is None or rate is None:
             return False, "", {}
 
-        gap_ns = self._rt_gap_ns(st, now)
-        at_cap = self._at_rt_cap(st, now)
+        rt_n = self._rt_count(st, now)
         estimated = self._estimate_rt_pnl(rate, book, self.min_order_size)
         meta: dict[str, Any] = {
             "taker_bps": rate * 1e4,
             "kappa3": st.kappa3,
-            "gap_s": gap_ns / _NS,
+            "rt_10m": rt_n,
             "estimated_pnl": estimated,
         }
 
-        if not at_cap and rate <= 0.0 and self._rolled_quote_volume(validator, book_id, now) < volume_cap:
-            if self._kappa_open_ok(st, validator, book_id, estimated, now):
-                return True, "kappa", meta
-
-        if at_cap:
+        if rt_n >= RT_MAX:
             return False, "", {}
+
+        if rt_n == 0:
+            return True, "force", meta
 
         if (
-            not self._activity_enabled()
-            or not self._rt_stale(st, now, self.activity_rt_interval_ns)
+            rate <= 0.0
+            and self._rolled_quote_volume(validator, book_id, now) < volume_cap
+            and self._kappa_open_ok(st, validator, book_id, estimated, now)
         ):
-            return False, "", {}
+            return True, "kappa", meta
 
-        return True, ("activity" if rate <= 0.0 else "force"), meta
+        return False, "", {}
 
     def _record_open(
         self,
@@ -573,6 +539,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 "taker_bps": meta.get("taker_bps"),
                 "kappa3": meta.get("kappa3"),
                 "est_pnl": meta.get("estimated_pnl"),
+                "rt_10m": meta.get("rt_10m"),
             },
             action=f"open_{reason}",
         )
