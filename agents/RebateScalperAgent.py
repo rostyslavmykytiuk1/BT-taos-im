@@ -484,12 +484,13 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if self._mid(book) is None or rate is None:
             return False, "", {}
 
+        # rt_n = completed RT closes in the last RT_WINDOW_S
         rt_n = self._rt_count(st, now)
         estimated = self._estimate_rt_pnl(rate, book, self.min_order_size)
         meta: dict[str, Any] = {
             "taker_bps": rate * 1e4,
             "kappa3": st.kappa3,
-            "rt_10m": rt_n,
+            "rt_window_n": rt_n,
             "estimated_pnl": estimated,
         }
 
@@ -539,7 +540,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 "taker_bps": meta.get("taker_bps"),
                 "kappa3": meta.get("kappa3"),
                 "est_pnl": meta.get("estimated_pnl"),
-                "rt_10m": meta.get("rt_10m"),
+                "rt_window_n": meta.get("rt_window_n"),
             },
             action=f"open_{reason}",
         )
