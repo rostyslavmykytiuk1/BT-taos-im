@@ -15,8 +15,6 @@ Tick flow
 Open reasons (telemetry action): open_kappa | open_activity | open_force
 """
 
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -79,9 +77,9 @@ class _Position:
 class _BookState:
     last_rt_ns: int = 0
     pending_buy: bool = False
-    rt_events: list[tuple[int, float]] = field(default_factory=list)
+    rt_events: list = field(default_factory=list)    # (close_ts_ns, net_pnl)
     kappa3: float | None = None
-    vol_log: list[tuple[int, float]] = field(default_factory=list)
+    vol_log: list = field(default_factory=list)      # (ts, quote vol)
 
 
 class RebateScalperAgent(FinanceSimulationAgent):
