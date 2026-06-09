@@ -7,8 +7,9 @@ Tick flow
 2. Scan 32 books per tick (0 RT in 10m first, then rotating window).
 3. Per book in RT_WINDOW_S: force if 0 RTs, kappa if rebate and count < RT_MAX,
    skip if at cap. Volume cap on kappa path only.
+4. Open side from order book: microprice vs mid → long (BUY) or short (SELL).
 
-Open reasons (telemetry action): open_kappa | open_force
+Open reasons (telemetry): open_{force,kappa}_{long,short}
 """
 
 import math
@@ -22,7 +23,7 @@ from taos.im.agents import FinanceSimulationAgent
 from taos.im.telemetry import MinerTelemetry
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
 from taos.im.protocol.events import OrderPlacementEvent, SimulationStartEvent, TradeEvent
-from taos.im.protocol.models import OrderCurrency, OrderDirection, STP
+from taos.im.protocol.models import LoanSettlementOption, OrderCurrency, OrderDirection, STP
 
 _NS = 1_000_000_000
 
@@ -35,6 +36,9 @@ MIN_GROSS_TP_BPS = 2.5
 MAX_GROSS_SL_BPS = 6.0
 
 MIN_REOPEN_GAP_S = 4.0
+
+# Open side: microprice vs mid (order book only)
+SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insufficient
 
 # RT window for opens (validator activity sampling = 10m)
 RT_WINDOW_S = 570.0                # ~10 min
@@ -67,7 +71,7 @@ class _Position:
 @dataclass
 class _BookState:
     last_rt_ns: int = 0
-    pending_buy: bool = False
+    pending_open: bool = False
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
@@ -123,10 +127,10 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if event.bookId is None:
             return
         if self._active_validator:
-            self._bstate(self._active_validator, event.bookId).pending_buy = False
+            self._bstate(self._active_validator, event.bookId).pending_open = False
             return
         for v in self.books_state:
-            self._bstate(v, event.bookId).pending_buy = False
+            self._bstate(v, event.bookId).pending_open = False
 
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
         if event.bookId is None:
@@ -180,7 +184,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 do_open, reason, meta = self._open_decision(
                     validator, book_id, book, account, vol_dp, volume_cap, now,
                 )
-                if do_open and self._taker_buy(response, validator, book_id, account, book):
+                if do_open and self._taker_open(
+                    response, validator, book_id, account, book, meta["direction"],
+                ):
                     self._record_open(
                         validator, book_id, book, account, now, reason, volume_cap, meta,
                     )
@@ -263,7 +269,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
             if prev == 0:
                 pos.entry_ts = ts
                 pos.entry_fee = trade_fee
-                self._bstate(validator, book_id).pending_buy = False
+                self._bstate(validator, book_id).pending_open = False
             else:
                 pos.entry_fee += trade_fee
             return
@@ -435,7 +441,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         for book_id in sorted(self.accounts.keys()):
             st = self._bstate(validator, book_id)
             pos = self._book_positions(validator).get(book_id, _Position())
-            if pos.qty >= self._min_qty or st.pending_buy or self._rt_count(st, now) > 0:
+            if abs(pos.qty) >= self._min_qty or st.pending_open or self._rt_count(st, now) > 0:
                 continue
             stale.append((now if st.last_rt_ns == 0 else now - st.last_rt_ns, book_id))
         stale.sort(reverse=True)
@@ -473,15 +479,16 @@ class RebateScalperAgent(FinanceSimulationAgent):
     ) -> tuple[bool, str, dict[str, Any]]:
         pos = self._book_positions(validator).get(book_id, _Position())
         self._reconcile_position(account, pos, vol_dp)
-        if pos.qty >= self._min_qty:
+        if abs(pos.qty) >= self._min_qty:
             return False, "", {}
 
         st = self._sync_book_rt_state(validator, book_id, now)
-        if st.pending_buy or not self._reopen_ok(st, now):
+        if st.pending_open or not self._reopen_ok(st, now):
             return False, "", {}
 
         rate = self._taker_fee_rate(account)
-        if self._mid(book) is None or rate is None:
+        direction, micro_bps, mid = self._book_bias(book)
+        if mid is None or rate is None:
             return False, "", {}
 
         # rt_n = completed RT closes in the last RT_WINDOW_S
@@ -492,6 +499,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
             "kappa3": st.kappa3,
             "rt_window_n": rt_n,
             "estimated_pnl": estimated,
+            "micro_bps": micro_bps,
+            "direction": direction,
         }
 
         if rt_n >= RT_MAX:
@@ -523,14 +532,15 @@ class RebateScalperAgent(FinanceSimulationAgent):
         mid = self._mid(book)
         bid = book.bids[0].price if book.bids else None
         ask = book.asks[0].price if book.asks else None
+        is_long = meta["direction"] == OrderDirection.BUY
         traded = self._rolled_quote_volume(validator, book_id, now)
         self.telemetry.snapshot(
             book_id=book_id,
             mid=mid,
             bid=bid,
             ask=ask,
-            pos_qty=self.min_order_size,
-            pos_avg=ask or mid,
+            pos_qty=self.min_order_size if is_long else -self.min_order_size,
+            pos_avg=ask if is_long else bid or mid,
             base_bal=account.base_balance.total if account.base_balance else None,
             quote_bal=account.quote_balance.total if account.quote_balance else None,
             traded_volume=traded,
@@ -541,8 +551,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 "kappa3": meta.get("kappa3"),
                 "est_pnl": meta.get("estimated_pnl"),
                 "rt_window_n": meta.get("rt_window_n"),
+                "micro_bps": meta.get("micro_bps"),
             },
-            action=f"open_{reason}",
+            action=f"open_{reason}_{'long' if is_long else 'short'}",
         )
 
     # ------------------------------------------------------------------ market
@@ -561,6 +572,40 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if not book.bids or not book.asks:
             return None
         return 0.5 * (book.bids[0].price + book.asks[0].price)
+
+    @staticmethod
+    def _microprice(book) -> float | None:
+        if not book.bids or not book.asks:
+            return None
+        bid, ask = book.bids[0], book.asks[0]
+        denom = bid.quantity + ask.quantity
+        if denom <= 0:
+            return 0.5 * (bid.price + ask.price)
+        return (ask.price * bid.quantity + bid.price * ask.quantity) / denom
+
+    @classmethod
+    def _book_bias(cls, book) -> tuple[OrderDirection, float, float | None]:
+        """microprice vs mid → direction and micro_bps; tie → long."""
+        mid = cls._mid(book)
+        micro = cls._microprice(book)
+        if mid is None or micro is None:
+            return OrderDirection.BUY, 0.0, mid
+        micro_bps = (micro - mid) / mid * 1e4
+        direction = OrderDirection.SELL if micro < mid else OrderDirection.BUY
+        return direction, micro_bps, mid
+
+    @staticmethod
+    def _exit_gross_bps(pos: _Position, bid: float | None, ask: float | None, mid: float) -> float:
+        if pos.qty > 0:
+            exit_px = bid if bid and bid > 0 else mid
+            return (exit_px - pos.avg) / pos.avg * 1e4
+        exit_px = ask if ask and ask > 0 else mid
+        return (pos.avg - exit_px) / pos.avg * 1e4
+
+    @staticmethod
+    def _loan_settlement(account) -> LoanSettlementOption:
+        quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
+        return LoanSettlementOption.FIFO if quote_loan > 0 else LoanSettlementOption.NONE
 
     def _taker_fee_rate(self, account) -> float | None:
         fees = getattr(account, "fees", None)
@@ -594,11 +639,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         pos = self._book_positions(validator).setdefault(book_id, _Position())
         self._reconcile_position(account, pos, vol_dp)
 
-        if pos.qty < -self._min_qty:
-            self._exit_reason[(validator, book_id)] = "short_flatten"
-            self._taker_sell(response, account, book_id, pos, vol_dp)
-            return
-        if pos.qty < self._min_qty or pos.avg <= 0:
+        if abs(pos.qty) < self._min_qty or pos.avg <= 0:
             return
 
         hold_ns = (now - pos.entry_ts) if pos.entry_ts else 0
@@ -606,8 +647,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
             return
 
         bid = book.bids[0].price if book.bids else None
-        exit_px = bid if bid and bid > 0 else mid
-        gross_bps = (exit_px - pos.avg) / pos.avg * 1e4
+        ask = book.asks[0].price if book.asks else None
+        gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
 
         if gross_bps >= MIN_GROSS_TP_BPS:
             self._exit_reason[(validator, book_id)] = "tp"
@@ -618,43 +659,94 @@ class RebateScalperAgent(FinanceSimulationAgent):
         else:
             return
 
-        self._taker_sell(response, account, book_id, pos, vol_dp)
+        self._close_position(response, account, book_id, pos, vol_dp)
 
-    def _taker_buy(self, response, validator: str, book_id: int, account, book) -> bool:
+    def _taker_open(
+        self,
+        response,
+        validator: str,
+        book_id: int,
+        account,
+        book,
+        direction: OrderDirection,
+    ) -> bool:
         qty = self.min_order_size
-        ask_px = book.asks[0].price if book.asks else 0.0
-        if ask_px <= 0 or account.quote_balance.free < qty * ask_px:
-            return False
-        response.market_order(
-            book_id=book_id,
-            direction=OrderDirection.BUY,
-            quantity=qty,
-            currency=OrderCurrency.BASE,
-            stp=STP.CANCEL_OLDEST,
-        )
-        self._bstate(validator, book_id).pending_buy = True
+        st = self._bstate(validator, book_id)
+
+        if direction == OrderDirection.BUY:
+            ask_px = book.asks[0].price if book.asks else 0.0
+            if ask_px <= 0 or account.quote_balance.free < qty * ask_px:
+                return False
+            self._submit_market(response, book_id, OrderDirection.BUY, qty)
+        else:
+            bid_px = book.bids[0].price if book.bids else 0.0
+            if bid_px <= 0:
+                return False
+            free_base = account.base_balance.free if account.base_balance else 0.0
+            if free_base >= qty:
+                self._submit_market(response, book_id, OrderDirection.SELL, qty)
+            else:
+                quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
+                self._submit_market(
+                    response,
+                    book_id,
+                    OrderDirection.SELL,
+                    qty,
+                    leverage=0.0 if quote_loan > 0 else SHORT_LEVERAGE,
+                    settlement=self._loan_settlement(account),
+                )
+
+        st.pending_open = True
         return True
 
-    def _taker_sell(self, response, account, book_id: int, pos: _Position, vol_dp: int) -> None:
-        if pos.qty <= 0:
-            return
-        free = account.base_balance.free if account.base_balance else 0.0
-        qty = round(min(self.min_order_size, pos.qty, free), vol_dp)
+    def _close_position(
+        self, response, account, book_id: int, pos: _Position, vol_dp: int,
+    ) -> None:
+        qty = round(min(self.min_order_size, abs(pos.qty)), vol_dp)
         if qty < self._min_qty:
             return
-        response.market_order(
-            book_id=book_id,
-            direction=OrderDirection.SELL,
-            quantity=qty,
-            currency=OrderCurrency.BASE,
-            stp=STP.CANCEL_OLDEST,
-        )
+
+        if pos.qty > 0:
+            free = account.base_balance.free if account.base_balance else 0.0
+            qty = round(min(qty, free), vol_dp)
+            if qty < self._min_qty:
+                return
+            self._submit_market(response, book_id, OrderDirection.SELL, qty)
+        else:
+            self._submit_market(
+                response,
+                book_id,
+                OrderDirection.BUY,
+                qty,
+                settlement=self._loan_settlement(account),
+            )
+
+    @staticmethod
+    def _submit_market(
+        response,
+        book_id: int,
+        direction: OrderDirection,
+        qty: float,
+        *,
+        leverage: float = 0.0,
+        settlement: LoanSettlementOption = LoanSettlementOption.NONE,
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "book_id": book_id,
+            "direction": direction,
+            "quantity": qty,
+            "currency": OrderCurrency.BASE,
+            "stp": STP.CANCEL_OLDEST,
+        }
+        if leverage > 0:
+            kwargs["leverage"] = leverage
+        if settlement != LoanSettlementOption.NONE:
+            kwargs["settlement_option"] = settlement
+        response.market_order(**kwargs)
 
     def _reconcile_position(self, account, pos: _Position, vol_dp: int) -> None:
-        if account.base_balance is None:
-            return
-        free = account.base_balance.free
-        if pos.qty > 0:
+        if pos.qty > 0 and account.base_balance is not None:
+            free = account.base_balance.free
             if free < self._min_qty:
                 self._clear_position(pos)
             else:
