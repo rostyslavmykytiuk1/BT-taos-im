@@ -66,7 +66,6 @@ import bittensor as bt
 
 from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
-from taos.im.telemetry import MinerTelemetry
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.protocol.events import TradeEvent, SimulationStartEvent
 from taos.im.protocol.models import OrderDirection, OrderCurrency, STP, TimeInForce
@@ -239,7 +238,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         self._exit_reason: dict[tuple[str, int], str] = {}
         self._step_ts_ns: int = 0
 
-        self.telemetry = MinerTelemetry.from_agent(self, agent_class="KappaScoreAgent")
 
         bt.logging.info(
             f"[KappaScore uid={self.uid}] notional={self.quote_notional} "
@@ -258,8 +256,7 @@ class KappaScoreAgent(FinanceSimulationAgent):
         bt.logging.info(f"[KappaScore uid={self.uid}] simulation start: reset state")
 
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        # Stamp sim time so fills are tracked on sim-time (aligns telemetry +
-        # round-trip times with trades.csv / the dashboard).
+        # Stamp sim time so fills are tracked on sim-time.
         self._step_ts_ns = int(state.timestamp)
         super().update(state)
 
@@ -319,20 +316,8 @@ class KappaScoreAgent(FinanceSimulationAgent):
             # whole position one tick at a time while the ping window is open.
             closed_qty = min(qty, abs(prev))
             if closed_qty >= self.min_order_size / 2 and entry_avg > 0:
-                if prev > 0:
-                    rpnl = (price - entry_avg) * closed_qty
-                    side = "long"
-                else:
-                    rpnl = (entry_avg - price) * closed_qty
-                    side = "short"
-                hold_s = (ts - entry_ts) / 1e9 if entry_ts else None
-                reason = self._exit_reason.pop((validator, book_id), "fill")
+                self._exit_reason.pop((validator, book_id), None)
                 self._bstate(validator, book_id).last_rt_ns = ts
-                self.telemetry.record_round_trip(
-                    book_id=book_id, ts_close_ns=ts, side=side, qty=closed_qty,
-                    entry_avg=entry_avg, exit_avg=price, realized_pnl=rpnl,
-                    hold_s=hold_s, reason=reason,
-                )
             pos.qty = prev + signed
             if abs(pos.qty) < 1e-12:
                 pos.qty, pos.avg, pos.entry_ts, pos.post_crash = 0.0, 0.0, 0, False
@@ -471,8 +456,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         vol_dp = cfg.volumeDecimals
         cap = self.turnover_cap * cfg.miner_wealth * self.volume_safety
 
-        self.telemetry.begin_step(state)
-        instr_before = len(response.instructions)
         for book_id, book in state.books.items():
             try:
                 self._handle_book(response, validator, book_id, book,
@@ -482,7 +465,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
                     f"[KappaScore uid={self.uid}] book {book_id} error: {ex}\n"
                     f"{traceback.format_exc()}"
                 )
-        self.telemetry.end_step(state, instructions=len(response.instructions) - instr_before)
         return response
 
     def _handle_book(self, response, validator, book_id, book,
@@ -510,8 +492,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
             self._exit_reason[(validator, book_id)] = "short_flatten"
             st.last_ping_submit_ns = now
             self._market_flatten(response, account, book_id, pos, vol_dp)
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       0.0, 0.0, imb, "short_flatten", cap, now)
             return
 
         # Always start from a clean slate: cancel our resting orders so we never
@@ -557,13 +537,9 @@ class KappaScoreAgent(FinanceSimulationAgent):
             return
 
         if ref is None or now < st.cooldown_until:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "warmup" if ref is None else "cooldown", cap, now)
             return
 
         if self._rolled_quote_volume(validator, book_id, now) >= cap:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "cap", cap, now)
             return
 
         dev_bps = (fair - ref) / ref * 1e4    # >0 stretched above ref, <0 below
@@ -594,8 +570,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
                 label = "short_blocked"
             else:
                 label = "flat"
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, dev_bps, imb, label, cap, now)
             return
 
         qty = round(self.quote_notional / mid, vol_dp)
@@ -612,8 +586,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
             self._enter(response, account, book_id, OrderDirection.SELL, qty, book,
                         price_dp, take_ok, mark_post_crash=False, pos=pos)
 
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, dev_bps, imb, action, cap, now)
 
     # ---------------------------------------------------------- manage position
     def _manage_position(self, response, validator, book_id, book, account, pos, st,
@@ -629,8 +601,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         if not book.bids or not book.asks:
             return
         if pos.avg <= 0:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "pos_sync", cap, now)
             return
         best_bid = book.bids[0].price
         best_ask = book.asks[0].price
@@ -648,8 +618,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
             self._exit_reason[(validator, book_id)] = "disaster"
             st.cooldown_until = now + int(self.cooldown_s * 1e9)
             self._market_flatten(response, account, book_id, pos, vol_dp)
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "disaster", cap, now)
             return
 
         # Harvest: held long enough AND already profitable past break-even ->
@@ -658,8 +626,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         if timed_out and pnl_bps >= breakeven_bps:
             self._exit_reason[(validator, book_id)] = "harvest"
             self._market_flatten(response, account, book_id, pos, vol_dp)
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "harvest", cap, now)
             return
 
         # MANDATORY activity round-trip (keeps the book scored WHILE holding).
@@ -688,8 +654,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
                                  timeInForce=TimeInForce.GTT, expiryPeriod=expiry_ns,
                                  stp=STP.CANCEL_OLDEST)
         self._exit_reason[(validator, book_id)] = "tp"
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, 0.0, imb, "close_long", cap, now)
 
     # ----------------------------------------------------------- activity ping
     def _rt_due(self, st: _BookState, now: int) -> bool:
@@ -719,8 +683,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         qty = self.min_order_size
         ask_px = book.asks[0].price if book.asks else mid
         if account.quote_balance.free < qty * ask_px:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "ping_skip_bal", cap, now)
             return
         st.last_ping_submit_ns = now
         st.ping_awaiting_open = True
@@ -728,8 +690,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         response.market_order(book_id=book_id, direction=OrderDirection.BUY,
                               quantity=qty, currency=OrderCurrency.BASE,
                               stp=STP.CANCEL_OLDEST)
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, 0.0, imb, "ping_long", cap, now)
 
     def _submit_ping_close(self, response, validator, book_id, account, pos, st,
                            mid, bid, ask, trend_bps, imb, breakeven_bps, pnl_bps,
@@ -743,8 +703,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
         self._exit_reason[(validator, book_id)] = reason
         # Close exactly one lot; never drain the whole position in a burst.
         self._market_close(response, account, book_id, pos, slice_qty, vol_dp)
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, 0.0, imb, reason, cap, now)
 
     def _inventory_long(self, account, pos, vol_dp) -> float:
         """Long inventory we opened (fill tracker), capped by free base."""
@@ -815,19 +773,6 @@ class KappaScoreAgent(FinanceSimulationAgent):
                                   quantity=q, currency=OrderCurrency.BASE,
                                   stp=STP.CANCEL_OLDEST)
 
-    # --------------------------------------------------------------- telemetry
-    def _snap(self, validator, book_id, mid, bid, ask, pos, account,
-              trend_bps, dev_bps, imb, action, cap, now) -> None:
-        traded = self._rolled_quote_volume(validator, book_id, now)
-        self.telemetry.snapshot(
-            book_id=book_id, mid=mid, bid=bid, ask=ask,
-            pos_qty=pos.qty, pos_avg=pos.avg,
-            base_bal=account.base_balance.total if account.base_balance else None,
-            quote_bal=account.quote_balance.total if account.quote_balance else None,
-            traded_volume=traded, volume_cap=cap, volume_remaining=max(0.0, cap - traded),
-            signals={"trend_bps": trend_bps, "flow": dev_bps, "imb": imb},
-            action=action,
-        )
 
 
 if __name__ == "__main__":

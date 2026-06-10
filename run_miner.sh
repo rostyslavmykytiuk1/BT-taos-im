@@ -48,13 +48,6 @@ _EXPLICIT_GENTRX_PARAMS=0
 # script's shell vars. Source before defaults so .env overrides apply.
 [ -f "$REPO_ROOT/.env" ] && { set -a; . "$REPO_ROOT/.env"; set +a; }
 
-# Miner telemetry + dashboard (see .env.example; also used by ./dashboard/start.sh)
-TAOS_TELEMETRY_ENABLED="${TAOS_TELEMETRY_ENABLED:-1}"
-TAOS_TELEMETRY_ROOT="${TAOS_TELEMETRY_ROOT:-$HOME/.taos/telemetry}"
-TAOS_DATA_ROOT="${TAOS_DATA_ROOT:-$REPO_ROOT/agents/data}"
-TAOS_DASHBOARD_HOST="${TAOS_DASHBOARD_HOST:-127.0.0.1}"
-TAOS_DASHBOARD_PORT="${TAOS_DASHBOARD_PORT:-8787}"
-
 while getopts e:p:w:h:u:a:g:t:l:GP: flag; do
     case "${flag}" in
         e) ENDPOINT=${OPTARG};;
@@ -120,9 +113,6 @@ echo "AGENT_NAME:      $AGENT_NAME"
 echo "AGENT_PARAMS:    $AGENT_PARAMS"
 echo "GENTRX:          $GENTRX"
 echo "GENTRX_PARAMS:   ${GENTRX_PARAMS:-(defaults)}"
-echo "TELEMETRY:       enabled=$TAOS_TELEMETRY_ENABLED root=$TAOS_TELEMETRY_ROOT"
-
-export TAOS_TELEMETRY_ENABLED TAOS_TELEMETRY_ROOT TAOS_DATA_ROOT
 
 cd "$REPO_ROOT"
 git pull || { echo "WARNING: git pull failed (no tracking branch?). Continue without updating? [y/N]"; read -r _yn; [ "$_yn" = "y" ] || exit 1; }

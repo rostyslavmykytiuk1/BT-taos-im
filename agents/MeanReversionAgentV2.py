@@ -26,7 +26,6 @@ import bittensor as bt
 
 from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
-from taos.im.telemetry import MinerTelemetry
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse
 from taos.im.protocol.events import TradeEvent, SimulationStartEvent
 from taos.im.protocol.models import OrderDirection, OrderCurrency, STP
@@ -170,7 +169,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
         self._exit_reason: dict[tuple[str, int], str] = {}
         self._step_ts_ns: int = 0
 
-        self.telemetry = MinerTelemetry.from_agent(self, agent_class="MeanReversionAgentV2")
 
         bt.logging.info(
             f"[MeanReversionV2 uid={self.uid}] taker_scalper lot={self.min_order_size} "
@@ -187,8 +185,7 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
         bt.logging.info(f"[MeanReversionV2 uid={self.uid}] simulation start: reset state")
 
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        # Stamp the current simulation time so fills are tracked on sim-time
-        # (aligns telemetry + round-trip times with trades.csv / the dashboard).
+        # Stamp the current simulation time so fills are tracked on sim-time.
         self._step_ts_ns = int(state.timestamp)
         super().update(state)
 
@@ -244,20 +241,8 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
             # Partial closes (activity-ping slice) count as RTs for scoring.
             closed_qty = min(qty, abs(prev))
             if closed_qty >= self.min_order_size / 2 and entry_avg > 0:
-                if prev > 0:
-                    rpnl = (price - entry_avg) * closed_qty
-                    side = "long"
-                else:
-                    rpnl = (entry_avg - price) * closed_qty
-                    side = "short"
-                hold_s = (ts - entry_ts) / 1e9 if entry_ts else None
-                reason = self._exit_reason.pop((validator, book_id), "fill")
+                self._exit_reason.pop((validator, book_id), None)
                 self._bstate(validator, book_id).last_rt_ns = ts
-                self.telemetry.record_round_trip(
-                    book_id=book_id, ts_close_ns=ts, side=side, qty=closed_qty,
-                    entry_avg=entry_avg, exit_avg=price, realized_pnl=rpnl,
-                    hold_s=hold_s, reason=reason,
-                )
             pos.qty = prev + signed
             if abs(pos.qty) < 1e-12:
                 pos.qty, pos.avg, pos.entry_ts, pos.post_crash = 0.0, 0.0, 0, False
@@ -369,8 +354,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
         vol_dp = cfg.volumeDecimals
         cap = self.turnover_cap * cfg.miner_wealth * self.volume_safety
 
-        self.telemetry.begin_step(state)
-        instr_before = len(response.instructions)
         for book_id, book in state.books.items():
             try:
                 self._handle_book(response, validator, book_id, book,
@@ -380,7 +363,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
                     f"[MeanReversionV2 uid={self.uid}] book {book_id} error: {ex}\n"
                     f"{traceback.format_exc()}"
                 )
-        self.telemetry.end_step(state, instructions=len(response.instructions) - instr_before)
         return response
 
     def _reconcile_position(self, account, pos, vol_dp) -> None:
@@ -464,8 +446,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
             self._exit_reason[(validator, book_id)] = "short_flatten"
             st.last_order_ns = now
             self._taker_sell(response, account, book_id, pos, vol_dp)
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       0.0, 0.0, imb, "short_flatten", cap, now)
             return
 
         drop_bps = self._crash_drop_bps(st, mid)
@@ -505,24 +485,15 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
                 self._taker_sell(response, account, book_id, pos, vol_dp)
             else:
                 exit_action = "manage"
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, (fair - ref) / ref * 1e4 if ref else 0.0, imb,
-                       exit_action, cap, now)
             return
 
         # ---- flat: taker buy on signal or activity RT ----
         if ref is None or now < st.cooldown_until:
             label = "warmup" if ref is None else "cooldown"
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, label, cap, now)
             return
         if not self._order_cooldown_ok(st, now):
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "order_cd", cap, now)
             return
         if self._rolled_quote_volume(validator, book_id, now) >= cap:
-            self._snap(validator, book_id, mid, bid, ask, pos, account,
-                       trend_bps, 0.0, imb, "cap", cap, now)
             return
 
         dev_bps = (fair - ref) / ref * 1e4
@@ -547,8 +518,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
                 else "activity_rt"
             )
             if self._taker_buy(response, account, book_id, book, pos, st, now):
-                self._snap(validator, book_id, mid, bid, ask, pos, account,
-                           trend_bps, dev_bps, imb, action, cap, now)
                 return
 
         if knife_active:
@@ -561,8 +530,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
             label = "rt_skip"
         else:
             label = "flat"
-        self._snap(validator, book_id, mid, bid, ask, pos, account,
-                   trend_bps, dev_bps, imb, label, cap, now)
 
     def _taker_buy(self, response, account, book_id, book, pos, st, now) -> bool:
         """Market-buy exactly one min lot."""
@@ -589,21 +556,6 @@ class MeanReversionAgentV2(FinanceSimulationAgent):
                               quantity=qty, currency=OrderCurrency.BASE,
                               stp=STP.CANCEL_OLDEST)
 
-    # --------------------------------------------------------------- telemetry
-    def _snap(self, validator, book_id, mid, bid, ask, pos, account,
-              trend_bps, dev_bps, imb, action, cap, now) -> None:
-        traded = self._rolled_quote_volume(validator, book_id, now)
-        self.telemetry.snapshot(
-            book_id=book_id, mid=mid, bid=bid, ask=ask,
-            pos_qty=pos.qty, pos_avg=pos.avg,
-            base_bal=account.base_balance.total if account.base_balance else None,
-            quote_bal=account.quote_balance.total if account.quote_balance else None,
-            traded_volume=traded, volume_cap=cap, volume_remaining=max(0.0, cap - traded),
-            # dashboard columns: trend_bps / flow / imb. We map flow->deviation
-            # (the primary fade signal) so the Signals tab stays meaningful.
-            signals={"trend_bps": trend_bps, "flow": dev_bps, "imb": imb},
-            action=action,
-        )
 
 
 if __name__ == "__main__":

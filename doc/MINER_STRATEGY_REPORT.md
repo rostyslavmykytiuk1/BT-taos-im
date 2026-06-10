@@ -518,7 +518,7 @@ Route order type to whichever side is currently subsidized.
 microprice band fade, per-book dispersion band, trend filter, crash detector,
 post-crash long asymmetry (wider TP / longer hold), knife-catch block,
 **short-block after crash**, maker-first entries with fee-aware taker fallback,
-volume-cap tracking, full telemetry + round-trip recording, and per-UID jitter.
+volume-cap tracking, and per-UID jitter.
 
 **Offline backtest** on this validator's tape (mid-fill replay, all 128 books,
 sim `20260528_1007`) — signal quality only, not the full matching engine:
