@@ -3,7 +3,7 @@ RebateScalperAgent — taker rebate round-trip engine for subnet 79.
 
 Tick flow
 ---------
-1. Close open legs at TP (MIN_GROSS_TP_BPS) or max_hold.
+1. Close open legs at TP (MIN_GROSS_TP_BPS), max_hold, or STOP_LOSS_BPS (tail guard).
 2. Scan BOOKS_PER_STEP books per tick (round-robin over all books).
 3. Per book in RT_WINDOW_S: activity open at rt_n==0, kappa if rebate and rt_n < RT_MAX,
    skip at cap. Volume cap on kappa path only.
@@ -26,12 +26,16 @@ _NS = 1_000_000_000
 
 MIN_ORDER_SIZE = 0.255            # > exchange min 0.25 so the taker-fee skim still leaves a closeable 0.25 lot
 
-# Close: min hold before exit; TP or time at max_hold (no stop-loss)
+# Close: min hold before exit; TP, time at max_hold, or stop-loss on the tail.
 MIN_HOLD_S = 1.5
-MAX_HOLD_S = 5.0
+MAX_HOLD_S = 3.0
 MIN_GROSS_TP_BPS = 1.5
+# Tail guard: cut once the adverse move breaches this (~p99.5 of moves), above normal
+# rebate-covered noise, so it fires only on the tail that dominates the cubed LPM3.
+STOP_LOSS_BPS = 30.0
 
 MIN_REOPEN_GAP_S = 4.0
+STOP_COOLDOWN_S = 10.0             # after a stop, wait this long before re-opening the book
 
 # Open side: microprice vs mid (order book only)
 SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insufficient
@@ -72,6 +76,7 @@ class _Position:
 @dataclass
 class _BookState:
     last_rt_ns: int = 0
+    last_stop_ns: int = 0
     pending_open: bool = False
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
@@ -106,6 +111,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
+        self.stop_cooldown_ns = int(STOP_COOLDOWN_S * (0.9 + 0.2 * jitter) * _NS)
         self.min_reopen_gap_ns = int(MIN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
@@ -121,7 +127,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] lot={MIN_ORDER_SIZE} "
-            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps books/step={BOOKS_PER_STEP} "
+            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={STOP_LOSS_BPS}bps books/step={BOOKS_PER_STEP} "
             f"rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
@@ -582,6 +588,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ open gates
     def _reopen_ok(self, st: _BookState, now: int) -> bool:
+        if st.last_stop_ns and (now - st.last_stop_ns) < self.stop_cooldown_ns:
+            return False
         return st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
 
     def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
@@ -682,6 +690,14 @@ class RebateScalperAgent(FinanceSimulationAgent):
         return (pos.avg - exit_px) / pos.avg * 1e4
 
     @staticmethod
+    def _adverse_bps(pos: _Position, mid: float) -> float:
+        """Adverse move vs entry on mid (excludes entry spread, so a fresh fill can't
+        trip the stop). Positive = underwater."""
+        if pos.qty > 0:
+            return (pos.avg - mid) / pos.avg * 1e4
+        return (mid - pos.avg) / pos.avg * 1e4
+
+    @staticmethod
     def _loan_settlement(account) -> LoanSettlementOption:
         quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
         return LoanSettlementOption.FIFO if quote_loan > 0 else LoanSettlementOption.NONE
@@ -721,13 +737,22 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if abs(pos.qty) < self._min_qty or pos.avg <= 0:
             return
 
+        bid = book.bids[0].price if book.bids else None
+        ask = book.asks[0].price if book.asks else None
+        gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
+
+        # Tail guard first: cut a big adverse move even before min_hold, so a jump can't
+        # ride to a catastrophic loss (the cubed LPM3 term that crushes kappa).
+        if self._adverse_bps(pos, mid) >= STOP_LOSS_BPS:
+            self._bstate(validator, book_id).last_stop_ns = now
+            self._set_rt_close_reason(validator, book_id, "stop")
+            self._close_position(response, account, book_id, pos, vol_dp)
+            return
+
         hold_ns = (now - pos.entry_ts) if pos.entry_ts else 0
         if hold_ns < self.min_hold_ns:
             return
 
-        bid = book.bids[0].price if book.bids else None
-        ask = book.asks[0].price if book.asks else None
-        gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
         if gross_bps >= MIN_GROSS_TP_BPS:
             close_reason = "tp"
         elif hold_ns < self.max_hold_ns:
