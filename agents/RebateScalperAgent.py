@@ -3,7 +3,7 @@ RebateScalperAgent — taker rebate round-trip engine for subnet 79.
 
 Tick flow
 ---------
-1. Close all open legs (TP / SL / max_hold).
+1. Close open legs at TP (MIN_GROSS_TP_BPS) or max_hold.
 2. Scan BOOKS_PER_STEP books per tick (round-robin over all books).
 3. Per book in RT_WINDOW_S: activity open at rt_n==0, kappa if rebate and rt_n < RT_MAX,
    skip at cap. Volume cap on kappa path only.
@@ -26,11 +26,10 @@ _NS = 1_000_000_000
 
 MIN_ORDER_SIZE = 0.25
 
-# Hold / exit
+# Close: min hold before exit; TP or time at max_hold (no stop-loss)
 MIN_HOLD_S = 1.5
 MAX_HOLD_S = 5.0
-MIN_GROSS_TP_BPS = 2.5
-MAX_GROSS_SL_BPS = 6.0
+MIN_GROSS_TP_BPS = 1.5
 
 MIN_REOPEN_GAP_S = 4.0
 
@@ -49,7 +48,7 @@ KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
 KAPPA_PROJ_TOLERANCE = 0.008
 
-BOOKS_PER_STEP = 5
+BOOKS_PER_STEP = 10
 
 # Volume cap (kappa path only)
 CAPITAL_TURNOVER_CAP = 10.0
@@ -120,7 +119,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] lot={MIN_ORDER_SIZE} "
-            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s books/step={BOOKS_PER_STEP} "
+            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps books/step={BOOKS_PER_STEP} "
             f"rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
@@ -712,15 +711,13 @@ class RebateScalperAgent(FinanceSimulationAgent):
         ask = book.asks[0].price if book.asks else None
         gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
         if gross_bps >= MIN_GROSS_TP_BPS:
-            exit_reason = "tp"
-        elif gross_bps <= -MAX_GROSS_SL_BPS:
-            exit_reason = "sl"
-        elif hold_ns >= self.max_hold_ns:
-            exit_reason = "time"
-        else:
+            close_reason = "tp"
+        elif hold_ns < self.max_hold_ns:
             return
+        else:
+            close_reason = "time"
 
-        self._set_rt_close_reason(validator, book_id, exit_reason)
+        self._set_rt_close_reason(validator, book_id, close_reason)
         self._close_position(response, account, book_id, pos, vol_dp)
 
     def _taker_open(
