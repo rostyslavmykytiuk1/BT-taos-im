@@ -4,9 +4,9 @@ RebateScalperAgent — taker rebate round-trip engine for subnet 79.
 Tick flow
 ---------
 1. Close all open legs (TP / SL / max_hold).
-2. Scan BOOKS_PER_STEP books per tick (0 RT in 10m first, then rotating window).
-3. Per book in RT_WINDOW_S: force if 0 RTs, kappa if rebate and count < RT_MAX,
-   skip if at cap. Volume cap on kappa path only.
+2. Scan BOOKS_PER_STEP books per tick (round-robin over all books).
+3. Per book in RT_WINDOW_S: activity open at rt_n==0, kappa if rebate and rt_n < RT_MAX,
+   skip at cap. Volume cap on kappa path only.
 4. Open side from order book: microprice vs mid → long (BUY) or short (SELL).
 """
 
@@ -39,7 +39,7 @@ SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insuffici
 
 # RT window for opens (validator activity sampling = 10m)
 RT_WINDOW_S = 570.0                # ~10 min
-RT_MAX = 20                         # max RTs per book in window
+RT_MAX = 20                        # max RTs per book in window
 
 # Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
@@ -121,7 +121,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] lot={MIN_ORDER_SIZE} "
             f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s books/step={BOOKS_PER_STEP} "
-            f"rt_window={RT_WINDOW_S / 60:.0f}m force=0 max={RT_MAX} "
+            f"rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
 
@@ -157,7 +157,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         is_taker = self.uid == event.takerAgentId
         if is_taker:
-            direction = OrderDirection.BUY if event.side == OrderDirection.BUY else OrderDirection.SELL
+            direction = event.side
         elif self.uid == event.makerAgentId:
             direction = OrderDirection.SELL if event.side == OrderDirection.BUY else OrderDirection.BUY
         else:
@@ -189,7 +189,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 bt.logging.warning(f"[RebateScalper uid={self.uid}] close {book_id}: {ex}")
 
         open_step = self._open_step.get(validator, 0)
-        for book_id in self._open_book_batch(validator, open_step, now):
+        for book_id in self._open_book_batch(open_step):
             book = state.books.get(book_id)
             account = self.accounts.get(book_id) if book else None
             if book is None or account is None:
@@ -310,7 +310,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 validator=validator,
                 book_id=book_id,
                 ts=ts,
-                side="long" if prev > 0 else "short",
                 hold_s=(ts - entry_ts) / _NS if entry_ts else None,
                 entry_avg=entry_avg,
                 exit_px=price,
@@ -518,8 +517,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
     def _set_rt_close_reason(self, validator: str, book_id: int, close_reason: str) -> None:
         if not self._rt_log_enabled(validator):
             return
-        ctx = self._rt_log.setdefault((validator, book_id), _RtLogCtx())
-        ctx.close_reason = close_reason
+        ctx = self._rt_log.get((validator, book_id))
+        if ctx is not None:
+            ctx.close_reason = close_reason
 
     def _log_rt(
         self,
@@ -527,7 +527,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
         validator: str,
         book_id: int,
         ts: int,
-        side: str,
         hold_s: float | None,
         entry_avg: float,
         exit_px: float,
@@ -571,37 +570,14 @@ class RebateScalperAgent(FinanceSimulationAgent):
         cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
-    def _books_needing_force(self, validator: str, now: int) -> list[int]:
-        """Flat books with 0 RTs in the window — scanned first each tick."""
-        stale: list[tuple[int, int]] = []
-        for book_id in sorted(self.accounts.keys()):
-            st = self._bstate(validator, book_id)
-            pos = self._book_positions(validator).get(book_id, _Position())
-            if abs(pos.qty) >= self._min_qty or st.pending_open or self._rt_count(st, now) > 0:
-                continue
-            stale.append((now if st.last_rt_ns == 0 else now - st.last_rt_ns, book_id))
-        stale.sort(reverse=True)
-        return [book_id for _, book_id in stale]
-
-    def _open_book_batch(self, validator: str, step: int, now: int) -> list[int]:
+    def _open_book_batch(self, step: int) -> list[int]:
         book_ids = sorted(self.accounts.keys())
         if not book_ids:
             return []
 
         batch_count = (len(book_ids) + BOOKS_PER_STEP - 1) // BOOKS_PER_STEP
         start = (step % batch_count) * BOOKS_PER_STEP
-        rotated = book_ids[start:start + BOOKS_PER_STEP]
-
-        merged: list[int] = []
-        seen: set[int] = set()
-        for book_id in self._books_needing_force(validator, now) + rotated:
-            if book_id in seen:
-                continue
-            seen.add(book_id)
-            merged.append(book_id)
-            if len(merged) >= BOOKS_PER_STEP:
-                break
-        return merged
+        return book_ids[start:start + BOOKS_PER_STEP]
 
     def _open_decision(
         self,
@@ -623,7 +599,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
             return False, None, None
 
         rate = self._taker_fee_rate(account)
-        direction, _, mid = self._book_bias(book)
+        direction, mid = self._book_bias(book)
         if mid is None or rate is None:
             return False, None, None
 
@@ -671,15 +647,14 @@ class RebateScalperAgent(FinanceSimulationAgent):
         return (ask.price * bid.quantity + bid.price * ask.quantity) / denom
 
     @classmethod
-    def _book_bias(cls, book) -> tuple[OrderDirection, float, float | None]:
-        """microprice vs mid → direction and micro_bps; tie → long."""
+    def _book_bias(cls, book) -> tuple[OrderDirection, float | None]:
+        """microprice vs mid → direction; tie → long."""
         mid = cls._mid(book)
         micro = cls._microprice(book)
         if mid is None or micro is None:
-            return OrderDirection.BUY, 0.0, mid
-        micro_bps = (micro - mid) / mid * 1e4
+            return OrderDirection.BUY, mid
         direction = OrderDirection.SELL if micro < mid else OrderDirection.BUY
-        return direction, micro_bps, mid
+        return direction, mid
 
     @staticmethod
     def _exit_gross_bps(pos: _Position, bid: float | None, ask: float | None, mid: float) -> float:
