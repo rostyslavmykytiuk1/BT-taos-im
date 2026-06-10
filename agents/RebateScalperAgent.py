@@ -3,7 +3,7 @@ RebateScalperAgent — taker rebate round-trip engine for subnet 79.
 
 Tick flow
 ---------
-1. Close open legs at TP (MIN_GROSS_TP_BPS), max_hold, or STOP_LOSS_BPS (tail guard).
+1. Close all open legs (TP / SL / max_hold).
 2. Scan BOOKS_PER_STEP books per tick (round-robin over all books).
 3. Per book in RT_WINDOW_S: activity open at rt_n==0, kappa if rebate and rt_n < RT_MAX,
    skip at cap. Volume cap on kappa path only.
@@ -19,23 +19,20 @@ import bittensor as bt
 from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
-from taos.im.protocol.events import OrderPlacementEvent, SimulationStartEvent, TradeEvent
+from taos.im.protocol.events import OrderPlacementEvent, TradeEvent
 from taos.im.protocol.models import LoanSettlementOption, OrderCurrency, OrderDirection, STP
 
 _NS = 1_000_000_000
 
-MIN_ORDER_SIZE = 0.255            # > exchange min 0.25 so the taker-fee skim still leaves a closeable 0.25 lot
+MIN_ORDER_SIZE = 0.25
 
-# Close: min hold before exit; TP, time at max_hold, or stop-loss on the tail.
+# Hold / exit (from uid 215 RT study: tail losses at ~6s hold dominate LPM3; 6bps SL was noise)
 MIN_HOLD_S = 1.5
 MAX_HOLD_S = 3.0
 MIN_GROSS_TP_BPS = 1.5
-# Tail guard: cut once the adverse move breaches this (~p99.5 of moves), above normal
-# rebate-covered noise, so it fires only on the tail that dominates the cubed LPM3.
-STOP_LOSS_BPS = 30.0
+MAX_GROSS_SL_BPS = 30.0
 
 MIN_REOPEN_GAP_S = 4.0
-STOP_COOLDOWN_S = 10.0             # after a stop, wait this long before re-opening the book
 
 # Open side: microprice vs mid (order book only)
 SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insufficient
@@ -47,8 +44,6 @@ RT_MAX = 20                        # max RTs per book in window
 # Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
 KAPPA_MIN_OBS = 3
-KAPPA_MIN_SAMPLE = 15             # under this RT count, keep trading the +EV rebate
-KAPPA_EMPIRICAL_MIN_N = 6         # min RTs before the bypass trusts realized PnL to drop a -EV book
 KAPPA_MIN_LOOKBACK_S = 5400.0      # 90 min
 KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
@@ -76,7 +71,6 @@ class _Position:
 @dataclass
 class _BookState:
     last_rt_ns: int = 0
-    last_stop_ns: int = 0
     pending_open: bool = False
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
@@ -111,7 +105,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
-        self.stop_cooldown_ns = int(STOP_COOLDOWN_S * (0.9 + 0.2 * jitter) * _NS)
         self.min_reopen_gap_ns = int(MIN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
@@ -127,60 +120,40 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] lot={MIN_ORDER_SIZE} "
-            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={STOP_LOSS_BPS}bps books/step={BOOKS_PER_STEP} "
+            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={MAX_GROSS_SL_BPS}bps "
+            f"books/step={BOOKS_PER_STEP} "
             f"rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
 
-    def onStart(self, event: SimulationStartEvent) -> None:
-        self.positions.clear()
-        self.books_state.clear()
-        self._sim_id.clear()
-        self._open_step.clear()
-        self._rt_log.clear()
-
     def update(self, state: MarketSimulationStateUpdate) -> None:
         self._step_ts_ns = int(state.timestamp)
         self._active_validator = state.dendrite.hotkey
+        self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
 
-    def onOrderRejected(self, event: OrderPlacementEvent) -> None:
-        if event.bookId is None:
+    def _ensure_simulation(self, validator: str, simulation_id: str | None) -> None:
+        """Drop per-validator state when the validator starts a new simulation."""
+        if self._sim_id.get(validator) == simulation_id:
             return
-        if self._active_validator:
-            self._bstate(self._active_validator, event.bookId).pending_open = False
-            self._rt_log.pop((self._active_validator, event.bookId), None)
-            return
-        for v in self.books_state:
-            self._bstate(v, event.bookId).pending_open = False
-            self._rt_log.pop((v, event.bookId), None)
-
-    def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
-        if event.bookId is None:
-            return
-        validator = validator or self._active_validator
-        if validator is None:
-            return
-
-        is_taker = self.uid == event.takerAgentId
-        if is_taker:
-            direction = event.side
-        elif self.uid == event.makerAgentId:
-            direction = OrderDirection.SELL if event.side == OrderDirection.BUY else OrderDirection.BUY
+        self._book_positions(validator).clear()
+        self.books_state.pop(validator, None)
+        self._rt_log = {k: v for k, v in self._rt_log.items() if k[0] != validator}
+        self._open_step.pop(validator, None)
+        if simulation_id is not None:
+            self._sim_id[validator] = simulation_id
         else:
-            return
-
-        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns
-        self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
-        fee = event.takerFee if is_taker else event.makerFee
-        self._apply_fill(validator, event.bookId, direction, event.quantity, event.price, fee, ts_ns)
+            self._sim_id.pop(validator, None)
+        bt.logging.info(
+            f"[RebateScalper uid={self.uid}] new simulation: {validator[:8]} "
+            f"sim_id={simulation_id}"
+        )
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
         response = FinanceAgentResponse(agent_id=self.uid)
         validator = state.dendrite.hotkey
         cfg = self.simulation_config
         self._sync_order_size(cfg.volumeDecimals)
-        self._ensure_validator(validator, cfg.simulation_id)
 
         vol_dp = cfg.volumeDecimals
         volume_cap = CAPITAL_TURNOVER_CAP * cfg.miner_wealth * VOLUME_SAFETY
@@ -196,7 +169,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 bt.logging.warning(f"[RebateScalper uid={self.uid}] close {book_id}: {ex}")
 
         open_step = self._open_step.get(validator, 0)
-        for book_id in self._open_book_batch(open_step, cfg.book_count):
+        for book_id in self._open_book_batch(open_step):
             book = state.books.get(book_id)
             account = self.accounts.get(book_id) if book else None
             if book is None or account is None:
@@ -220,6 +193,34 @@ class RebateScalperAgent(FinanceSimulationAgent):
         self._open_step[validator] = open_step + 1
         return response
 
+    # ------------------------------------------------------------------ events
+    def onOrderRejected(self, event: OrderPlacementEvent) -> None:
+        if event.bookId is None or not self._active_validator:
+            return
+        validator = self._active_validator
+        self._bstate(validator, event.bookId).pending_open = False
+        self._rt_log.pop((validator, event.bookId), None)
+
+    def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
+        if event.bookId is None:
+            return
+        validator = validator or self._active_validator
+        if validator is None:
+            return
+
+        is_taker = self.uid == event.takerAgentId
+        if is_taker:
+            direction = event.side
+        elif self.uid == event.makerAgentId:
+            direction = OrderDirection.SELL if event.side == OrderDirection.BUY else OrderDirection.BUY
+        else:
+            return
+
+        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns
+        self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
+        fee = event.takerFee if is_taker else event.makerFee
+        self._apply_fill(validator, event.bookId, direction, event.quantity, event.price, fee, ts_ns)
+
     # ------------------------------------------------------------------ state
     @staticmethod
     def _effective_min_order_size(volume_decimals: int) -> float:
@@ -235,15 +236,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
         bt.logging.info(
             f"[RebateScalper uid={self.uid}] volumeDecimals={volume_decimals} effective_min={lot}"
         )
-
-    def _ensure_validator(self, validator: str, simulation_id: str) -> None:
-        if self._sim_id.get(validator) == simulation_id:
-            return
-        self._book_positions(validator).clear()
-        self.books_state.pop(validator, None)
-        self._rt_log = {k: v for k, v in self._rt_log.items() if k[0] != validator}
-        self._open_step[validator] = 0
-        self._sim_id[validator] = simulation_id
 
     def _book_positions(self, validator: str) -> dict[int, _Position]:
         return self.positions.setdefault(validator, {})
@@ -442,13 +434,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
         gross = (bid - ask) * qty
         return gross - taker_rate * (ask + bid) * qty
 
-    def _book_rt_median_pnl(self, st: _BookState, now: int) -> float | None:
-        cutoff = now - self.kappa_rt_history_ns
-        pnls = [p for ts, p in st.rt_events if ts >= cutoff]
-        if not pnls:
-            return None
-        return self._median(pnls)
-
     def _project_kappa(
         self, validator: str, book_id: int, now: int, estimated_pnl: float,
     ) -> float | None:
@@ -461,18 +446,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if estimated <= 0.0:
             return False
 
-        rt_n = self._rt_count(st, now, self.kappa_rt_history_ns)
-        if rt_n < KAPPA_MIN_SAMPLE:
-            # Under-sampled: keep round-tripping the +EV rebate so one early loss can't
-            # freeze the book at a low-n negative kappa (more obs heal the cubed downside).
-            # Once enough RTs exist, drop the book if its typical (median) RT actually loses.
-            if rt_n >= KAPPA_EMPIRICAL_MIN_N:
-                med = self._book_rt_median_pnl(st, now)
-                if med is not None and med < 0.0:
-                    return False
-            return True
-
         projected = self._project_kappa(validator, book_id, now, estimated)
+        rt_n = self._rt_count(st, now, self.kappa_rt_history_ns)
         if projected is None:
             return rt_n < KAPPA_MIN_OBS
 
@@ -588,21 +563,20 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ open gates
     def _reopen_ok(self, st: _BookState, now: int) -> bool:
-        if st.last_stop_ns and (now - st.last_stop_ns) < self.stop_cooldown_ns:
-            return False
         return st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
 
     def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
         cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
-    def _open_book_batch(self, step: int, book_count: int) -> list[int]:
-        if book_count <= 0:
+    def _open_book_batch(self, step: int) -> list[int]:
+        book_ids = sorted(self.accounts.keys())
+        if not book_ids:
             return []
 
-        batch_count = (book_count + BOOKS_PER_STEP - 1) // BOOKS_PER_STEP
+        batch_count = (len(book_ids) + BOOKS_PER_STEP - 1) // BOOKS_PER_STEP
         start = (step % batch_count) * BOOKS_PER_STEP
-        return list(range(start, min(start + BOOKS_PER_STEP, book_count)))
+        return book_ids[start:start + BOOKS_PER_STEP]
 
     def _open_decision(
         self,
@@ -690,14 +664,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
         return (pos.avg - exit_px) / pos.avg * 1e4
 
     @staticmethod
-    def _adverse_bps(pos: _Position, mid: float) -> float:
-        """Adverse move vs entry on mid (excludes entry spread, so a fresh fill can't
-        trip the stop). Positive = underwater."""
-        if pos.qty > 0:
-            return (pos.avg - mid) / pos.avg * 1e4
-        return (mid - pos.avg) / pos.avg * 1e4
-
-    @staticmethod
     def _loan_settlement(account) -> LoanSettlementOption:
         quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
         return LoanSettlementOption.FIFO if quote_loan > 0 else LoanSettlementOption.NONE
@@ -737,30 +703,23 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if abs(pos.qty) < self._min_qty or pos.avg <= 0:
             return
 
-        bid = book.bids[0].price if book.bids else None
-        ask = book.asks[0].price if book.asks else None
-        gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
-
-        # Tail guard first: cut a big adverse move even before min_hold, so a jump can't
-        # ride to a catastrophic loss (the cubed LPM3 term that crushes kappa).
-        if self._adverse_bps(pos, mid) >= STOP_LOSS_BPS:
-            self._bstate(validator, book_id).last_stop_ns = now
-            self._set_rt_close_reason(validator, book_id, "stop")
-            self._close_position(response, account, book_id, pos, vol_dp)
-            return
-
         hold_ns = (now - pos.entry_ts) if pos.entry_ts else 0
         if hold_ns < self.min_hold_ns:
             return
 
+        bid = book.bids[0].price if book.bids else None
+        ask = book.asks[0].price if book.asks else None
+        gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
         if gross_bps >= MIN_GROSS_TP_BPS:
-            close_reason = "tp"
-        elif hold_ns < self.max_hold_ns:
-            return
+            exit_reason = "tp"
+        elif gross_bps <= -MAX_GROSS_SL_BPS:
+            exit_reason = "sl"
+        elif hold_ns >= self.max_hold_ns:
+            exit_reason = "time"
         else:
-            close_reason = "time"
+            return
 
-        self._set_rt_close_reason(validator, book_id, close_reason)
+        self._set_rt_close_reason(validator, book_id, exit_reason)
         self._close_position(response, account, book_id, pos, vol_dp)
 
     def _taker_open(
