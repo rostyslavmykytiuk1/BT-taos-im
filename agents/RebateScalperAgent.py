@@ -42,7 +42,7 @@ SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insuffici
 
 # RT window for opens (validator activity sampling = 10m)
 RT_WINDOW_S = 570.0                # ~10 min
-RT_MAX = 3                         # max RTs per book in window
+RT_MAX = 20                         # max RTs per book in window
 
 # Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
@@ -52,7 +52,7 @@ KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
 KAPPA_PROJ_TOLERANCE = 0.008
 
-BOOKS_PER_STEP = 32
+BOOKS_PER_STEP = 5
 
 # Volume cap (kappa path only)
 CAPITAL_TURNOVER_CAP = 10.0
