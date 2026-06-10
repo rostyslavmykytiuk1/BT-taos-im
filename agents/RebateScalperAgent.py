@@ -24,7 +24,7 @@ from taos.im.protocol.models import LoanSettlementOption, OrderCurrency, OrderDi
 
 _NS = 1_000_000_000
 
-MIN_ORDER_SIZE = 0.25
+MIN_ORDER_SIZE = 0.255            # > exchange min 0.25 so the taker-fee skim still leaves a closeable 0.25 lot
 
 # Close: min hold before exit; TP or time at max_hold (no stop-loss)
 MIN_HOLD_S = 1.5
@@ -43,6 +43,8 @@ RT_MAX = 20                        # max RTs per book in window
 # Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
 KAPPA_MIN_OBS = 3
+KAPPA_MIN_SAMPLE = 15             # under this RT count, keep trading the +EV rebate
+KAPPA_EMPIRICAL_MIN_N = 6         # min RTs before the bypass trusts realized PnL to drop a -EV book
 KAPPA_MIN_LOOKBACK_S = 5400.0      # 90 min
 KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
@@ -188,7 +190,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
                 bt.logging.warning(f"[RebateScalper uid={self.uid}] close {book_id}: {ex}")
 
         open_step = self._open_step.get(validator, 0)
-        for book_id in self._open_book_batch(open_step):
+        for book_id in self._open_book_batch(open_step, cfg.book_count):
             book = state.books.get(book_id)
             account = self.accounts.get(book_id) if book else None
             if book is None or account is None:
@@ -434,6 +436,13 @@ class RebateScalperAgent(FinanceSimulationAgent):
         gross = (bid - ask) * qty
         return gross - taker_rate * (ask + bid) * qty
 
+    def _book_rt_median_pnl(self, st: _BookState, now: int) -> float | None:
+        cutoff = now - self.kappa_rt_history_ns
+        pnls = [p for ts, p in st.rt_events if ts >= cutoff]
+        if not pnls:
+            return None
+        return self._median(pnls)
+
     def _project_kappa(
         self, validator: str, book_id: int, now: int, estimated_pnl: float,
     ) -> float | None:
@@ -446,8 +455,18 @@ class RebateScalperAgent(FinanceSimulationAgent):
         if estimated <= 0.0:
             return False
 
-        projected = self._project_kappa(validator, book_id, now, estimated)
         rt_n = self._rt_count(st, now, self.kappa_rt_history_ns)
+        if rt_n < KAPPA_MIN_SAMPLE:
+            # Under-sampled: keep round-tripping the +EV rebate so one early loss can't
+            # freeze the book at a low-n negative kappa (more obs heal the cubed downside).
+            # Once enough RTs exist, drop the book if its typical (median) RT actually loses.
+            if rt_n >= KAPPA_EMPIRICAL_MIN_N:
+                med = self._book_rt_median_pnl(st, now)
+                if med is not None and med < 0.0:
+                    return False
+            return True
+
+        projected = self._project_kappa(validator, book_id, now, estimated)
         if projected is None:
             return rt_n < KAPPA_MIN_OBS
 
@@ -569,14 +588,13 @@ class RebateScalperAgent(FinanceSimulationAgent):
         cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
-    def _open_book_batch(self, step: int) -> list[int]:
-        book_ids = sorted(self.accounts.keys())
-        if not book_ids:
+    def _open_book_batch(self, step: int, book_count: int) -> list[int]:
+        if book_count <= 0:
             return []
 
-        batch_count = (len(book_ids) + BOOKS_PER_STEP - 1) // BOOKS_PER_STEP
+        batch_count = (book_count + BOOKS_PER_STEP - 1) // BOOKS_PER_STEP
         start = (step % batch_count) * BOOKS_PER_STEP
-        return book_ids[start:start + BOOKS_PER_STEP]
+        return list(range(start, min(start + BOOKS_PER_STEP, book_count)))
 
     def _open_decision(
         self,
