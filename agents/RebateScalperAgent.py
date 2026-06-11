@@ -28,7 +28,7 @@ MIN_ORDER_SIZE = 0.255
 
 # Hold / exit (from uid 215 RT study: tail losses at ~6s hold dominate LPM3; 6bps SL was noise)
 MIN_HOLD_S = 1.5
-MAX_HOLD_S = 5.0
+MAX_HOLD_S = 4.0
 MIN_GROSS_TP_BPS = 2.5
 MAX_GROSS_SL_BPS = 4.0
 
