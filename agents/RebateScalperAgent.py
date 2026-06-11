@@ -1,13 +1,38 @@
 """
-RebateScalperAgent — taker rebate round-trip engine for subnet 79.
+RebateScalperAgent — rebate round-trip + activity-maintenance engine for subnet 79.
+
+Two open modes, one fee router. Activity factor MUST stay 1.0 on every book, so
+every book completes >=1 round-trip per validator sampling window no matter what.
 
 Tick flow
 ---------
-1. Close all open legs (TP / SL / max_hold).
+1. Close all open legs (TP / SL / max_hold).  [unchanged exit logic]
 2. Scan BOOKS_PER_STEP books per tick (round-robin over all books).
-3. Per book in RT_WINDOW_S: activity open at rt_n==0, kappa if rebate and rt_n < RT_MAX,
-   skip at cap. Volume cap on kappa path only.
-4. Open side from order book: microprice vs mid → long (BUY) or short (SELL).
+3. Per flat book, decide via the fee router (`_manage_open`). Two concerns, in order:
+
+   PROFIT ENGINE  (runs every visit; source of the rebate income)
+     paid := (taker_fee <= 0 AND est_pnl > 0)        # genuinely paid to take, +EV
+     if paid AND kappa OK AND vol < cap AND rt_n < RT_MAX:
+         -> TAKER open, microprice side ("kappa")    # scalp; the gate opens freely
+                                                      # for the first few RTs, so
+                                                      # start-up trades flow through here
+     (if the engine opens nothing, fall through to the activity backstop)
+
+   ACTIVITY BACKSTOP  (guarantees >=1 RT per book per validator window)
+     T := seconds since the last completed RT (anchored to first-sight at start-up,
+          so we never see a huge "overdue" gap before any RT exists)
+     Phase A   T <  MAKER_START (~427-450s)   -> idle (a recent RT still counts)
+     Phase B   MAKER_START <= T < DEADLINE    -> if paid: TAKER open ("taker_force")
+                                                 else:    rest one post-only BUY @ bid
+                                                          (maker), re-quote if buried
+     Phase C   T >= DEADLINE (~509-525s)      -> MUST cross now, profitable or not:
+                                                 TAKER ("taker_force" if paid, else
+                                                 BUY "scratch_taker"). DEADLINE is kept
+                                                 below RT_WINDOW (570s) so the RT always
+                                                 lands inside the activity window.
+
+4. At most ONE of {resting maker quote, in-flight taker, open position} per book.
+   Logging (RT close + scratch events) is emitted for the main validator only.
 """
 
 import math
@@ -20,7 +45,13 @@ from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
 from taos.im.protocol.events import OrderPlacementEvent, TradeEvent
-from taos.im.protocol.models import LoanSettlementOption, OrderCurrency, OrderDirection, STP
+from taos.im.protocol.models import (
+    LoanSettlementOption,
+    OrderCurrency,
+    OrderDirection,
+    STP,
+    TimeInForce,
+)
 
 _NS = 1_000_000_000
 
@@ -32,14 +63,19 @@ MAX_HOLD_S = 4.0
 MIN_GROSS_TP_BPS = 2.5
 MAX_GROSS_SL_BPS = 4.0
 
-MIN_REOPEN_GAP_S = 4.0
-
-# Open side: microprice vs mid (order book only)
-SHORT_LEVERAGE = 1.0             # margin for SELL when base inventory insufficient
+# Margin leverage used for a SELL open when free base inventory is insufficient.
+SHORT_LEVERAGE = 1.0
 
 # RT window for opens (validator activity sampling = 10m)
 RT_WINDOW_S = 570.0                # ~10 min
 RT_MAX = 20                        # max RTs per book in window
+
+# Scratch (activity-maintenance) timing, measured as seconds since the last RT.
+# All thresholds stay safely below the validator's ~600s sampling window so a
+# completed RT is always registered in time. Jittered per-uid in initialize().
+SCRATCH_MAKER_START_S = 450.0      # begin resting a maker quote for activity
+SCRATCH_TAKER_DEADLINE_S = 525.0   # hard backstop: cross with a taker to guarantee the RT
+SCRATCH_REQUOTE_THROTTLE_S = 12.0  # min gap between maker re-quotes (preserve queue priority)
 
 # Kappa-3 (3h history for score projection)
 KAPPA_TAU = 0.0
@@ -75,6 +111,8 @@ class _BookState:
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
+    window_anchor_ns: int = 0          # first-sight ts; activity clock anchor before any RT
+    scratch_reposted_ns: int = 0       # last maker (re)quote ts, for throttle
 
 
 @dataclass
@@ -105,10 +143,17 @@ class RebateScalperAgent(FinanceSimulationAgent):
 
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
-        self.min_reopen_gap_ns = int(MIN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
+
+        # Scratch timing, jittered per-uid so 10 miners don't act in lockstep.
+        # Deadline stays < RT_WINDOW_S so the maintenance RT always lands in time.
+        scratch_start_s = SCRATCH_MAKER_START_S * (0.95 + 0.05 * jitter)      # ~427-450s
+        scratch_deadline_s = SCRATCH_TAKER_DEADLINE_S * (0.97 + 0.03 * jitter)  # ~509-525s
+        self.scratch_maker_start_ns = int(scratch_start_s * _NS)
+        self.scratch_taker_deadline_ns = int(scratch_deadline_s * _NS)
+        self.scratch_requote_throttle_ns = int(SCRATCH_REQUOTE_THROTTLE_S * _NS)
 
         self.positions: dict[str, dict[int, _Position]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
@@ -123,6 +168,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
             f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={MAX_GROSS_SL_BPS}bps "
             f"books/step={BOOKS_PER_STEP} "
             f"rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
+            f"scratch_maker={scratch_start_s:.0f}s taker={scratch_deadline_s:.0f}s "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
 
@@ -175,18 +221,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
             if book is None or account is None:
                 continue
             try:
-                do_open, direction, open_reason = self._open_decision(
-                    validator, book_id, book, account, vol_dp, volume_cap, now,
+                self._manage_open(
+                    response, validator, book_id, book, account, vol_dp, volume_cap, now,
                 )
-                if (
-                    do_open
-                    and direction is not None
-                    and self._taker_open(response, validator, book_id, account, book, direction)
-                ):
-                    self._prune_vol_log(self._bstate(validator, book_id), now)
-                    self._stash_rt_open(
-                        validator, book_id, book, account, direction, now, open_reason,
-                    )
             except Exception as ex:
                 bt.logging.warning(f"[RebateScalper uid={self.uid}] open {book_id}: {ex}")
 
@@ -202,6 +239,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
         self._rt_log.pop((validator, event.bookId), None)
 
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
+        """Route our fills into position accounting. The traded direction is the
+        aggressor side for our taker fills, and its inverse for our maker fills."""
         if event.bookId is None:
             return
         validator = validator or self._active_validator
@@ -275,11 +314,18 @@ class RebateScalperAgent(FinanceSimulationAgent):
         trade_fee: float,
         ts: int,
     ) -> None:
+        """Update the per-book position from a fill (taker or maker leg).
+
+        Opening/adding accumulates the volume-weighted entry and entry fee; a fill
+        that reduces the position realizes a clean per-RT PnL (gross minus allocated
+        open+close fees), records it for kappa, and logs the round-trip.
+        """
         pos = self._book_positions(validator).setdefault(book_id, _Position())
         signed = qty if direction == OrderDirection.BUY else -qty
         prev = pos.qty
         entry_avg = pos.avg
 
+        # Same side (or opening from flat): grow the position, blend the entry price.
         if prev == 0 or (prev > 0) == (signed > 0):
             total = abs(prev) + qty
             pos.avg = (pos.avg * abs(prev) + price * qty) / total if total > 0 else price
@@ -340,6 +386,7 @@ class RebateScalperAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         self._prune_rt_events(st, ts)
         st.rt_events.append((ts, net_pnl))
+        st.window_anchor_ns = ts          # reset the activity clock at each completed RT
         self._refresh_book_kappa(validator, book_id, ts)
 
     def _sync_book_rt_state(self, validator: str, book_id: int, now: int) -> _BookState:
@@ -561,10 +608,28 @@ class RebateScalperAgent(FinanceSimulationAgent):
             f"close_rt_n={rt_window_n} close_rt_pnl={self._fmt_rt_pnl_list(st, ts)}"
         )
 
-    # ------------------------------------------------------------------ open gates
-    def _reopen_ok(self, st: _BookState, now: int) -> bool:
-        return st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
+    def _log_scratch_post(
+        self, validator: str, book_id: int, price: float, taker_rate: float,
+        account, elapsed_ns: int,
+    ) -> None:
+        if not self._rt_log_enabled(validator):
+            return
+        maker_rate = self._maker_fee_rate(account)
+        maker_bps = f"{maker_rate * 1e4:.2f}" if maker_rate is not None else "n/a"
+        bt.logging.info(
+            f"[RebateScalper uid={self.uid} SCR] book={book_id} post BUY@{price:.4f} "
+            f"T={elapsed_ns / _NS:.0f}s maker_bps={maker_bps} taker_bps={taker_rate * 1e4:.2f}"
+        )
 
+    def _log_scratch_taker(self, validator: str, book_id: int, elapsed_ns: int) -> None:
+        if not self._rt_log_enabled(validator):
+            return
+        bt.logging.info(
+            f"[RebateScalper uid={self.uid} SCR] book={book_id} taker BUY (deadline) "
+            f"T={elapsed_ns / _NS:.0f}s"
+        )
+
+    # ------------------------------------------------------------------ open gates
     def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
         cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
@@ -578,8 +643,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
         start = (step % batch_count) * BOOKS_PER_STEP
         return book_ids[start:start + BOOKS_PER_STEP]
 
-    def _open_decision(
+    def _manage_open(
         self,
+        response,
         validator: str,
         book_id: int,
         book,
@@ -587,36 +653,149 @@ class RebateScalperAgent(FinanceSimulationAgent):
         vol_dp: int,
         volume_cap: float,
         now: int,
-    ) -> tuple[bool, OrderDirection | None, str | None]:
-        pos = self._book_positions(validator).get(book_id, _Position())
+    ) -> None:
+        """Fee router for a single book. Holds at most one in-flight action per book
+        and guarantees a maintenance RT before the activity window lapses."""
+        pos = self._book_positions(validator).setdefault(book_id, _Position())
         self._reconcile_position(account, pos, vol_dp)
+
+        st = self._bstate(validator, book_id)
+        if st.window_anchor_ns == 0:
+            st.window_anchor_ns = now
+
+        # We already hold a position -> the close path manages it; never stack opens.
         if abs(pos.qty) >= self._min_qty:
-            return False, None, None
+            return
 
         st = self._sync_book_rt_state(validator, book_id, now)
-        if st.pending_open or not self._reopen_ok(st, now):
-            return False, None, None
+        # A taker open is in flight (submitted, fill not yet confirmed) -> wait.
+        if st.pending_open:
+            return
 
         rate = self._taker_fee_rate(account)
         direction, mid = self._book_bias(book)
         if mid is None or rate is None:
-            return False, None, None
+            return
 
+        resting = self._resting_order(account)
         rt_n = self._rt_count(st, now)
-        if rt_n >= RT_MAX:
-            return False, None, None
-        if rt_n == 0:
-            return True, direction, "force"
+        est_pnl = self._estimate_rt_pnl(rate, book, self.min_order_size)
+        paid = rate <= 0.0 and est_pnl > 0.0   # genuinely paid to take, +EV round-trip
 
-        estimated = self._estimate_rt_pnl(rate, book, self.min_order_size)
-        if (
-            rate <= 0.0
-            and self._rolled_quote_volume(validator, book_id, now) < volume_cap
-            and self._kappa_open_ok(st, validator, book_id, estimated, now)
-        ):
-            return True, direction, "kappa"
+        # Activity clock: seconds since the last completed RT, anchored to first-sight
+        # before any RT exists (so start-up never sees a huge "overdue" gap).
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.window_anchor_ns
+        elapsed_ns = now - ref
 
-        return False, None, None
+        # ---------------------------------- PROFIT ENGINE (runs every visit) --------
+        # The rebate income comes from here: when genuinely paid to take, scalp as many
+        # kappa-gated round-trips as quality/volume allow. The gate opens freely for the
+        # first few RTs, so start-up trades flow through here as normal profitable opens.
+        if paid:
+            if resting is not None:
+                # Regime favours taking; drop any stale maker quote first.
+                self._cancel_scratch(response, validator, book_id, resting)
+                return
+            if (
+                rt_n < RT_MAX
+                and self._rolled_quote_volume(validator, book_id, now) < volume_cap
+                and self._kappa_open_ok(st, validator, book_id, est_pnl, now)
+            ):
+                if self._taker_open(response, validator, book_id, account, book, direction):
+                    self._prune_vol_log(st, now)
+                    self._stash_rt_open(validator, book_id, book, account, direction, now, "kappa")
+                return
+            # Paid but kappa paused / capped -> fall through to the activity backstop,
+            # which still crosses for us (we are not flat on activity time).
+
+        # ---------------------------------- ACTIVITY BACKSTOP (anchored phases) -----
+        # Reached only when the profit engine did not open. Guarantees >=1 RT per book
+        # per validator window, regardless of fee regime.
+
+        # Phase A: a recent RT still satisfies activity -> idle, hold no stray quote.
+        if elapsed_ns < self.scratch_maker_start_ns:
+            if resting is not None:
+                self._cancel_scratch(response, validator, book_id, resting)
+            return
+
+        # Phase C: deadline reached -> MUST complete the RT this window; cross now,
+        # profitable or not (losing the activity factor is far costlier than the spread).
+        if elapsed_ns >= self.scratch_taker_deadline_ns:
+            if resting is not None:
+                # Drop the quote this tick; the taker fires next visit when truly flat.
+                self._cancel_scratch(response, validator, book_id, resting)
+                return
+            side = direction if paid else OrderDirection.BUY
+            if self._taker_open(response, validator, book_id, account, book, side):
+                tag = "taker_force" if paid else "scratch_taker"
+                self._stash_rt_open(validator, book_id, book, account, side, now, tag)
+                if not paid:
+                    self._log_scratch_taker(validator, book_id, elapsed_ns)
+            return
+
+        # Phase B (maker window): cross if we are paid to (kappa just paused the open);
+        # otherwise rest a single post-only BUY @ bid and re-quote only if buried.
+        if paid:
+            if self._taker_open(response, validator, book_id, account, book, direction):
+                self._stash_rt_open(validator, book_id, book, account, direction, now, "taker_force")
+            return
+        if resting is None:
+            self._post_scratch_maker(response, validator, book_id, book, account, st, now, rate, elapsed_ns)
+        else:
+            self._maybe_reprice_scratch(response, validator, book_id, book, st, resting, now)
+
+    def _resting_order(self, account):
+        """Our only resting orders are scratch maker quotes (all other opens are
+        market orders), so the first open order, if any, is that quote."""
+        orders = getattr(account, "orders", None)
+        if not orders:
+            return None
+        return orders[0]
+
+    def _post_scratch_maker(
+        self, response, validator: str, book_id: int, book, account, st: _BookState,
+        now: int, rate: float, elapsed_ns: int,
+    ) -> None:
+        if not book.bids:
+            return
+        bid_px = book.bids[0].price
+        qty = self.min_order_size
+        if bid_px <= 0 or account.quote_balance.free < qty * bid_px:
+            return
+        response.limit_order(
+            book_id=book_id,
+            direction=OrderDirection.BUY,
+            quantity=qty,
+            price=bid_px,
+            currency=OrderCurrency.BASE,
+            stp=STP.CANCEL_OLDEST,
+            timeInForce=TimeInForce.GTC,
+            postOnly=True,
+        )
+        st.scratch_reposted_ns = now
+        self._stash_rt_open(
+            validator, book_id, book, account, OrderDirection.BUY, now, "scratch_maker",
+        )
+        self._log_scratch_post(validator, book_id, bid_px, rate, account, elapsed_ns)
+
+    def _maybe_reprice_scratch(
+        self, response, validator: str, book_id: int, book, st: _BookState, resting, now: int,
+    ) -> None:
+        if not book.bids:
+            return
+        best_bid = book.bids[0].price
+        # Keep queue priority unless the market has left our quote behind.
+        if resting.price is None or resting.price >= best_bid:
+            return
+        if (now - st.scratch_reposted_ns) < self.scratch_requote_throttle_ns:
+            return
+        # Cancel now; a fresh quote is posted next visit once flat with no resting order.
+        self._cancel_scratch(response, validator, book_id, resting)
+
+    def _cancel_scratch(self, response, validator: str, book_id: int, resting) -> None:
+        response.cancel_order(book_id=book_id, order_id=resting.id)
+        if self._rt_log_enabled(validator):
+            self._rt_log.pop((validator, book_id), None)
 
     # ------------------------------------------------------------------ market
     @staticmethod
@@ -669,10 +848,17 @@ class RebateScalperAgent(FinanceSimulationAgent):
         return LoanSettlementOption.FIFO if quote_loan > 0 else LoanSettlementOption.NONE
 
     def _taker_fee_rate(self, account) -> float | None:
+        return self._fee_rate(account, "taker_fee_rate")
+
+    def _maker_fee_rate(self, account) -> float | None:
+        return self._fee_rate(account, "maker_fee_rate")
+
+    @staticmethod
+    def _fee_rate(account, attr: str) -> float | None:
         fees = getattr(account, "fees", None)
         if fees is None:
             return None
-        rate = getattr(fees, "taker_fee_rate", None)
+        rate = getattr(fees, attr, None)
         if rate is None:
             return None
         try:
@@ -690,6 +876,8 @@ class RebateScalperAgent(FinanceSimulationAgent):
     def _handle_close(
         self, response, validator: str, book_id: int, book, vol_dp: int, now: int,
     ) -> None:
+        """Exit an open position after the min hold on TP / SL / max-hold, whichever
+        triggers first. Shared by every open mode (rebate, kappa, scratch)."""
         mid = self._mid(book)
         if mid is None or mid <= 0:
             return
@@ -731,6 +919,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
         book,
         direction: OrderDirection,
     ) -> bool:
+        """Cross the spread for one lot. BUY needs quote balance; SELL uses base
+        inventory, falling back to a margin short. Sets pending_open and returns
+        whether the order was submitted."""
         qty = self.min_order_size
         st = self._bstate(validator, book_id)
 
@@ -763,7 +954,9 @@ class RebateScalperAgent(FinanceSimulationAgent):
     def _close_position(
         self, response, account, book_id: int, pos: _Position, vol_dp: int,
     ) -> None:
-        qty = round(min(self.min_order_size, abs(pos.qty)), vol_dp)
+        # Flatten the entire position in one market order so a partial-fill stack
+        # (partial maker fill + deadline taker) never leaves base dust behind.
+        qty = round(abs(pos.qty), vol_dp)
         if qty < self._min_qty:
             return
 
@@ -806,12 +999,15 @@ class RebateScalperAgent(FinanceSimulationAgent):
         response.market_order(**kwargs)
 
     def _reconcile_position(self, account, pos: _Position, vol_dp: int) -> None:
+        # Clamp tracked size to real free base (covers external settlement drift). We do
+        # NOT cap at one lot: a partial-fill stack can legitimately exceed it, and the
+        # close path flattens the whole position so nothing is left as untracked dust.
         if pos.qty > 0 and account.base_balance is not None:
             free = account.base_balance.free
             if free < self._min_qty:
                 self._clear_position(pos)
             else:
-                pos.qty = round(min(pos.qty, free, self.min_order_size), vol_dp)
+                pos.qty = round(min(pos.qty, free), vol_dp)
 
 
 if __name__ == "__main__":
