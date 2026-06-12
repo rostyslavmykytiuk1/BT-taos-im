@@ -767,7 +767,6 @@ class RebateScalperAgent(FinanceSimulationAgent):
             direction=OrderDirection.BUY,
             quantity=qty,
             price=bid_px,
-            currency=OrderCurrency.BASE,
             stp=STP.CANCEL_OLDEST,
             timeInForce=TimeInForce.GTC,
             postOnly=True,
