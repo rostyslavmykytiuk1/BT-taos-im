@@ -85,7 +85,7 @@ KAPPA_RT_HISTORY_S = 10_800.0      # 3h RT history kept for kappa
 KAPPA_PROJ_IMPROVE = 0.003
 KAPPA_PROJ_TOLERANCE = 0.008
 
-BOOKS_PER_STEP = 10
+BOOKS_PER_STEP = 32
 
 # Volume cap (kappa path only)
 CAPITAL_TURNOVER_CAP = 10.0
