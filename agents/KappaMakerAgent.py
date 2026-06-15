@@ -30,8 +30,8 @@ Strategy (mirrors the top miners: tiny tight inventory, fast recycling, cut lose
                      worst lot so every consumed lot is FIFO-positive; the price WALKS from the
                      profit target down to the touch as the lot ages, so it keeps filling instead
                      of resting at an unreachable entry price.
-    * Managed exit-> IOC-cut the WHOLE reducible side once its oldest lot is too old (~45s) OR
-                     underwater beyond a hard stop (~40bps). Capped slippage -> each loss bounded.
+    * Managed exit-> IOC-cut the WHOLE reducible side once its oldest lot is too old (~20s) OR
+                     underwater beyond a hard stop (~25bps). Capped slippage -> each loss bounded.
     * Dust        -> a sub-min residual (|net| < exch_min) from partial fills cannot be closed by
                      one order; it is treated as flat so two-sided quoting recycles it fast.
     * Activity    -> ultimate floor at ~480s: if a book still has not closed, force a one-lot
@@ -69,16 +69,16 @@ EXCHANGE_MIN_ORDER_SIZE = 0.25
 # Per-side quote lot. Small so fills accumulate smoothly (we embrace partial fills).
 QUOTE_LOT = 0.25
 
-# ---- inventory bounds (tight: keep small bags like the top miners, trim hard breaches) ----
-MAX_INVENTORY_LOTS = 2.0           # hard per-book lot cap; excess is risk-trimmed
+# ---- inventory bounds (allow passive reduce to work; trim only real breaches) ----
+MAX_INVENTORY_LOTS = 3.0           # hard per-book lot cap; excess is risk-trimmed
 MAX_INVENTORY_EQUITY_FRAC = 0.15   # hard per-book notional cap as a fraction of book equity
-RISK_TRIM_SLIPPAGE_BPS = 8.0       # max adverse slippage allowed on a forced (loss) trim
+RISK_TRIM_SLIPPAGE_BPS = 6.0       # max adverse slippage allowed on a forced (loss) trim
 
 # ---- exit / round-trip economics ----
-TP_BPS = 12.0                      # initial profit target over the OLDEST lot, in bps
+TP_BPS = 13.0                      # initial profit target over the OLDEST lot, in bps
 TP_FEE_MULT = 2.2                  # require target >= TP_FEE_MULT × maker_fee (both legs + buffer)
 MAX_ENTRY_MAKER_FEE = 0.0015       # skip opening a side while the maker fee exceeds this
-QUOTE_EXPIRY_S = 20.0              # GTT expiry; reconcile refreshes each step; longer keeps queue priority
+QUOTE_EXPIRY_S = 12.0              # GTT expiry; reconcile refreshes each step; match fast recycle
 
 # ---- managed exit: recycle FAST and cut losers SMALL (top miners flip in seconds, never bag) ----
 # Kappa-3 downside is CUBED: one big forced loss dwarfs many tiny ones. So instead of resting a
@@ -86,18 +86,18 @@ QUOTE_EXPIRY_S = 20.0              # GTT expiry; reconcile refreshes each step; 
 # we (a) walk the passive reduce price from the profit target down to the touch as the lot ages,
 # and (b) IOC-cut the oldest lot once it is too old OR underwater beyond a hard stop — bounding the
 # loss on each cut and keeping the realized-P&L distribution tight.
-EXIT_WALK_START_S = 15.0           # below this oldest-lot age, rest the reduce at the full profit target
-EXIT_GIVEUP_S = 45.0               # by this age the reduce has walked to the touch; then IOC-cut the lot
-EXIT_STOP_LOSS_BPS = 40.0          # IOC-cut immediately if the oldest lot is underwater beyond this
-EXIT_CUT_SLIPPAGE_BPS = 8.0        # capped adverse slippage on a forced IOC cut
-REENTRY_COOLDOWN_S = 10.0          # after a forced cut, pause fresh entries so we don't re-bag a trend
+EXIT_WALK_START_S = 10.0           # below this oldest-lot age, rest the reduce at the full profit target
+EXIT_GIVEUP_S = 20.0               # by this age the reduce has walked to the touch; then IOC-cut the lot
+EXIT_STOP_LOSS_BPS = 16.0          # IOC-cut immediately if the oldest lot is underwater beyond this
+EXIT_CUT_SLIPPAGE_BPS = 6.0        # capped adverse slippage on a forced IOC cut
+REENTRY_COOLDOWN_S = 75.0          # after a forced cut, pause fresh entries so we don't re-bag a trend
 
 # ---- activity: guarantee a round-trip close on every book every window ----
 # Validator samples round-trip volume every 600s; we keep this internal RT-budget/display
 # window just under that so per-window RT counts line up with the scorer.
 RT_WINDOW_S = 570.0
 ACTIVITY_DEADLINE_S = 480.0        # ultimate floor: force a close this long since the last close
-RT_MAX = 40                        # max RTs per book per window (avoid needless churn)
+RT_MAX = 10                        # max RTs per book per window (≥1 RT/10m via activity backstop)
 FORCE_TRIM_SLIPPAGE_BPS = 6.0      # slippage cap for an activity cross-close
 
 # ---- volume cap (avoid the capital_turnover_cap ceiling) ----
@@ -372,7 +372,7 @@ class KappaMakerAgent(FinanceSimulationAgent):
         first) frees our resting orders on the exchange this step. If genuinely flat, seed a
         small long so a close follows on the next step (last_rt_ns is unchanged by the seed,
         so the backstop re-fires and closes it within seconds — well inside the 600s window).
-        With managed exits running from ~180s, holding books rarely reach this 480s floor;
+        With managed exits cutting by ~20s, holding books rarely reach this 480s floor;
         when they do, a tiny capped loss is acceptable versus losing activity."""
         slip = FORCE_TRIM_SLIPPAGE_BPS / 1e4
         self._cancel_all(response, account, book_id)
