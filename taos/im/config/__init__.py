@@ -317,22 +317,28 @@ def add_im_validator_args(cls, parser):
     parser.add_argument(
         "--scoring.activity.impact",
         type=float,
-        help="Multiplied onto activity factors to modify the impact of volume weighting in scoring calculations.",
+        help="Volume boost above neutral activity (1.0). At 0.0, any round-trip in the "
+             "last trade_volume_sampling_interval yields activity factor 1.0; higher volume "
+             "does not boost further.",
         default=0.0,
     )
     
     parser.add_argument(
         "--scoring.activity.decay_grace_period",
         type=int,
-        help="The period in simulation timesteps for which the decay factor is unaccelerated. After this duration of not trading/round-tripping, activity factor decay accelerates.",
+        help="Simulation nanoseconds after the last counted round-trip before activity-factor "
+             "decay accelerates. Matches trade_volume_sampling_interval (10min) so missing "
+             "a round-trip in the current window triggers decay immediately.",
         default=600_000_000_000,
     )
     
     parser.add_argument(
         "--scoring.activity.decay_rate",
         type=float,
-        help="Rate of the decay applied to activity factor when no trading has occurred.",
-        default=0.0,
+        help="Decay rate applied per scoring tick when no round-trip closed in the last "
+             "trade_volume_sampling_interval (10min). Must be >0 so activity factor 1.0 "
+             "requires a recent round-trip; 0 disables decay and lets inactive books coast.",
+        default=1.0,
     )
 
     parser.add_argument(

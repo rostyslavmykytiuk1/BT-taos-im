@@ -5,9 +5,9 @@ Market orders only: they fill fully and immediately and leave nothing resting, s
 are no partial-fill quotes to manage. One position per book, strictly sequential.
 
 Rules:
-  1. Activity 1.0: every book completes >=1 RT per ~570s window. Force a taker RT once
-     ~500s have passed since the last RT (or since the book first appeared); max_hold
-     bounds the close so it lands in time.
+  1. Activity 1.0: every book completes >=1 RT per ~570s window. No forced RT during the
+     first ~570s after agent/sim start; after that, force once ~500s have passed since the
+     last RT (agent start time stands in for last RT until the first close).
   2. One position per book: a book is FLAT xor HELD; the open path runs only when flat.
   3. Wait for full fill: after any submit, st.pending_ns blocks the book until a fill
      resolves it (timeout-recovered).
@@ -95,7 +95,6 @@ class _BookState:
     last_rt_ns: int = 0
     pending_ns: int = 0                 # last order submit ts (rule 3: wait for the fill)
     pending_kind: str = ""              # tag of the in-flight open (for RT logging)
-    seen_ns: int = 0                    # first-seen ts; activity clock before the first RT
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
@@ -145,6 +144,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._sim_id: dict[str, str] = {}
         self._rt_log: dict[tuple[str, int], _RtLogCtx] = {}
         self._step_ts_ns: int = 0
+        self._agent_start_ns: int = 0     # activity clock before the first RT (per sim)
         self._active_validator: str | None = None
 
         bt.logging.info(
@@ -161,6 +161,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._active_validator = state.dendrite.hotkey
         # Reset before super().update() so the new sim's first fills don't hit stale state.
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
+        if self._agent_start_ns == 0 and self._step_ts_ns > 0:
+            self._agent_start_ns = self._step_ts_ns
         super().update(state)
 
     def _ensure_simulation(self, validator: str, simulation_id: str | None) -> None:
@@ -170,6 +172,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._book_positions(validator).clear()
         self.books_state.pop(validator, None)
         self._rt_log = {k: v for k, v in self._rt_log.items() if k[0] != validator}
+        self._agent_start_ns = 0
         if simulation_id is not None:
             self._sim_id[validator] = simulation_id
         else:
@@ -210,8 +213,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._reconcile_position(account, pos, vol_dp)
 
         st = self._bstate(validator, book_id)
-        if st.seen_ns == 0:
-            st.seen_ns = now
+        if self._agent_start_ns == 0 and now > 0:
+            self._agent_start_ns = now
         if self._prune_rt_events(st, now):
             self._refresh_book_kappa(validator, book_id, now)
 
@@ -279,11 +282,20 @@ class TakerScalperAgent(FinanceSimulationAgent):
     def _side_label(direction: OrderDirection) -> str:
         return "long" if direction == OrderDirection.BUY else "short"
 
-    @staticmethod
-    def _activity_elapsed(st: _BookState, now: int) -> int:
-        """Elapsed ns since last RT, or since first-seen before the first RT."""
-        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
-        return now - ref
+    def _activity_force_due(self, st: _BookState, now: int) -> bool:
+        """True when a forced RT is needed to stay inside the activity window.
+
+        Before the first RT on a book, agent/sim start time is the reference clock.
+        The first full RT_WINDOW after start is grace — kappa can trade without a
+        backstop. After that, force once ACTIVITY_DEADLINE has passed since the
+        last RT (or since start if still none).
+        """
+        if self._agent_start_ns <= 0:
+            return False
+        if st.last_rt_ns == 0 and (now - self._agent_start_ns) < self.rt_window_ns:
+            return False
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns
+        return (now - ref) >= self.activity_deadline_ns
 
     def _record_trade_volume(
         self, validator: str, book_id: int, qty: float, price: float, ts_ns: int,
@@ -616,7 +628,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
             return
 
         # Activity backstop: guarantee >=1 RT per book per window.
-        if self._activity_elapsed(st, now) >= self.activity_deadline_ns:
+        if self._activity_force_due(st, now):
             tag = "taker_force" if paid else "activity"
             self._try_open(response, validator, book_id, book, account, direction, now, tag)
 
