@@ -1,57 +1,33 @@
 """
 DualEdgeAgent — fee-adaptive maker/taker agent for Subnet 79 (taos)
-===================================================================
 
-Designed from the validator source (taos/im/validator/reward.py and
-taos/im/neurons/validator.py ``_match_trade_fifo``), the active DynamicFeePolicy
-(simulation_0.xml), and the live behaviour of the top agents (114 / 165).
+Scoring (from validator reward.py / _match_trade_fifo):
+  * Kappa-3 rewards the SHAPE of realized round-trip PnL; LPM3 cubes downside, so
+    one realized loss is very expensive. pnl.impact = 0 and activity.impact = 0:
+    PnL size, deployed capital, and trade volume do not score.
+  * One round-trip per book per ~600s bucket pins activity_factor to 1.0; missing
+    the bucket decays the book toward 0 — far worse than a tiny forced loss.
+  * Realized PnL is FIFO and net of fees, using the fee stored at fill time.
+  * A sell with no prior in-sim buy opens a SHORT (0 PnL, 0 round-trip), so we
+    keep a long-only FIFO ladder of our in-sim buys and never sell beyond it; the
+    Pareto base endowment is left as reserve (selling it would open a short).
+  * max_instructions_per_book = 5; we emit <= 2 per book per tick.
 
-Verified facts that drive every decision
-----------------------------------------
-  * Score = activity-weighted, MAD-normalized Kappa-3 per book, medianed across
-    books with an outlier penalty. ``kappa.pnl.impact = 0`` and
-    ``activity.impact = 0`` today, so:
-      - Only the SHAPE of realized round-trip PnL matters (many small same-signed
-        wins beat a few big ones; LPM3 cubes downside, so one realized loss is
-        very expensive). Absolute PnL size and deployed capital do NOT score.
-      - One COMPLETED round-trip per book per ~600s sampling bucket pins
-        activity_factor to 1.0; trade VOLUME is irrelevant. Miss the bucket and
-        the book decays toward 0 — far worse than a tiny forced loss.
-  * Realized PnL is FIFO and NET OF FEES, using the fee STORED AT FILL TIME
-    (fees are dynamic, so the open and close legs can carry different rates).
-  * The validator FIFO only knows about in-sim trades: a SELL with no prior
-    in-sim BUY opens a SHORT (0 PnL, 0 round-trip). Therefore every book must
-    BUY before it SELLs. We hold a long-only FIFO ladder of our in-sim buys and
-    never sell more than that ladder, so every sell closes a real long and the
-    ladder always mirrors the validator's positions exactly. The Pareto base
-    endowment the sim hands us is left as reserve (selling it would open shorts,
-    and using it would not raise Kappa since capital is not rewarded).
-  * max_instructions_per_book = 5: excess per-book instructions are dropped.
-    We emit <= 2 per book per tick (a cancel-list counts as one instruction).
-
-Strategy (per book, every tick) — the approved decision tree
-------------------------------------------------------------
-  1. Reconcile the ladder DOWN to on-chain base (never up): never sell base we
-     do not hold; ignore the base endowment.
-  2. ROUTER (a switch is COMMITTED only when the book has no open position):
-         taker rebate covers the spread -> TAKER ; else -> MAKER.
-  3. ACTIVITY FLOOR (overrides trading): if no round-trip closed within the
-     window, cancel resting quotes (freeing the reserve) and force a min-lot
-     taker round-trip. Buy first when flat, sell to close otherwise.
-  4. MAKER: post-only, long-only.
-         bid (accumulate) rests below mid by a width that beats the maker fee,
-             only while inventory < cap, under the volume cap, not into a dump,
-             and not winding down for a mode switch;
-         ask (harvest) bundles the OLDEST FIFO lots up to >= one clip and sells
-             at the WORST per-lot fee-clearing break-even in the bundle (using
-             each lot's stored fee), so EVERY FIFO prefix — including a partial
-             fill that consumes only the priciest oldest lots — closes >= 0, and
-             partial-fill dust never strands. Quotes rest (GTT), reprice on a move.
-  5. TAKER: one sequential clip cycle. Open a long (market buy) only when the
-         rebate makes the round-trip +EV; exit with an IOC limit sell at the lots'
-         worst break-even, sent ONLY when the book bid already covers it — so the
-         exit fills at >= break-even or not at all (no market-dump slippage can
-         realize a loss). Otherwise hold; the activity floor is the last resort.
+Strategy (per book, every tick):
+  1. Reconcile the ladder down to on-chain base (never up).
+  2. Router: taker if the rebate covers the spread, else maker. A switch is
+     committed only when the book has no open position.
+  3. Activity, two-stage so the deadline close is rarely a loss:
+       soft — past ACTIVITY_SOFT_FRAC of the window, sell at the no-loss break-even
+              via IOC the instant the bid covers it;
+       hard — at the deadline, force a min-lot round-trip with a guaranteed market
+              fill even at a small loss (losing activity_factor is worse).
+  4. Maker (post-only, long-only): bid accumulates below mid and deepens as
+     inventory fills; ask harvests the oldest FIFO lots at the worst per-lot
+     break-even (every FIFO prefix closes >= 0). The ask is not repriced up on a
+     rally (it gets lifted) — only to stay >= break-even or back down after a drop.
+  5. Taker: market-buy a clip when the rebate makes it +EV; exit with an IOC sell
+     at break-even, sent only when the bid covers it. Else hold.
 
 Run (local proxy test):  python DualEdgeAgent.py --port 8904 --agent_id 0
 Deploy: set AGENT_NAME=DualEdgeAgent in the miner env, then pm2 restart <miner>.
@@ -75,10 +51,11 @@ _NS = 1_000_000_000
 # Tunables — edit here, then pm2 restart the miner
 # ===========================================================================
 
-# --- size (small per-book tail risk; volume is not rewarded) ---
+# --- size ---
 EXCHANGE_MIN_ORDER_SIZE = 0.25     # sim minOrderSize floor
-LOT = 0.30                         # clip per quote/scalp (matches 114/165 ~0.3)
-MAX_INVENTORY_LOTS = 10            # max long inventory (114 rode ~3 BASE in a dip)
+LOT = 0.30                         # clip per quote/scalp (~0.3, matches top agents)
+MAX_INVENTORY_LOTS = 5             # max long lots (smaller bag => cheaper, lower break-even)
+MAKER_INVENTORY_SKEW_BPS = 30.0    # extra bid depth as inventory fills (cheaper scale-in)
 
 # --- dynamic-fee router (all thresholds in bps; rebate = negative fee) ---
 ROUTER_TAKER_MARGIN_BPS = 1.0      # need (-taker_fee) >= half_spread + this for TAKER
@@ -88,8 +65,7 @@ ASSUMED_FEE_BPS = 2.3              # fallback per-side fee if account.fees missi
 # --- maker engine ---
 MAKER_MIN_HALF_SPREAD_BPS = 8.0    # min distance of a resting quote from mid
 MAKER_EDGE_MARGIN_BPS = 4.0        # quote width on top of the maker fee
-MAKER_HARVEST_BUFFER_BPS = 3.0     # profit above the round-trip fee on the ask; also
-                                   # cushions a same-tick maker-fee rise before a fill
+MAKER_HARVEST_BUFFER_BPS = 3.0     # cushion above break-even; absorbs fee rise before fill
 MAKER_REPRICE_BPS = 8.0            # reprice a resting quote only past this drift
 QUOTE_EXPIRY_S = 30.0              # GTT lifetime of resting maker quotes
 
@@ -104,16 +80,15 @@ TAKER_MIN_HOLD_S = 1.5             # min dwell before attempting the no-loss exi
 TAKER_MIN_REOPEN_GAP_S = 4.0       # throttle: min gap between a close and next open
 PENDING_TIMEOUT_S = 5.0            # assume a market order is lost after this
 
-# --- activity floor (UNCONDITIONAL: miss the ~600s bucket and the book decays
-#     toward 0). 480s leaves margin against bucket alignment + UID jitter. ---
+# --- activity (miss the ~600s bucket and the book decays; 480s leaves jitter margin) ---
 PING_INTERVAL_S = 480.0
-PING_SUBMIT_COOLDOWN_S = 5.0       # anti-burst gap between ping orders on a book
+PING_SUBMIT_COOLDOWN_S = 5.0       # min gap between ping orders on a book
+ACTIVITY_SOFT_FRAC = 0.6           # fraction of window before soft no-loss IOC banking
 
 # --- logging ---
 LOG_HEARTBEAT_S = 120.0           # per-book state heartbeat cadence
 
-# --- volume cap (self-imposed safety; volume is neither rewarded nor, here,
-#     penalized — kept conservative to avoid the exchange turnover limit) ---
+# --- volume cap (safety; volume is not scored here) ---
 CAPITAL_TURNOVER_CAP = 10.0
 VOLUME_SAFETY = 0.5
 VOLUME_ASSESSMENT_NS = 86_400_000_000_000   # rolling 24h
@@ -124,28 +99,22 @@ MODE_TAKER = "taker"
 
 @dataclass
 class _Position:
-    """Long-only FIFO ladder of our in-sim buys (mirrors the validator's FIFO
-    longs deque). Each lot is [price, qty, fee] where fee is the QUOTE fee paid
-    on that buy (stored so the no-loss harvest is exact under dynamic fees)."""
+    """FIFO ladder of in-sim buys. Each lot is [price, qty, fee] (fee at buy time,
+    stored so the no-loss harvest is exact under dynamic fees)."""
     lots: deque = field(default_factory=deque)
 
     @property
     def qty(self) -> float:
         return sum(lot[1] for lot in self.lots)
 
-    @property
-    def oldest_price(self) -> float:
-        return self.lots[0][0] if self.lots else 0.0
-
     def add(self, price: float, qty: float, fee: float) -> None:
         if qty > 0:
             self.lots.append([float(price), float(qty), float(fee)])
 
     def reduce(self, qty: float, price: float = 0.0) -> tuple[float, float, float]:
-        """Consume `qty` from the front (FIFO), shrinking each lot's fee pro rata
-        to mirror the validator. Returns (closed_qty, price_pnl, open_fee) where
-        price_pnl = sum((price - lot_price) * take) and open_fee is the stored buy
-        fee consumed — so the net realized PnL is price_pnl - open_fee - close_fee."""
+        """FIFO-consume `qty` from the front, shrinking each lot's fee pro rata.
+        Returns (closed_qty, price_pnl, open_fee); net realized = price_pnl -
+        open_fee - close_fee."""
         remaining = qty
         closed = 0.0
         price_pnl = 0.0
@@ -165,15 +134,11 @@ class _Position:
         return closed, price_pnl, open_fee
 
     def harvest_bundle(self, min_qty: float) -> tuple[float, float]:
-        """Oldest lots bundled (FIFO) until cumulative qty reaches `min_qty`.
-        Returns (qty, worst_unit_cost) where worst_unit_cost = max over the bundled
-        lots of (price + fee/qty), i.e. the HIGHEST per-base break-even in the
-        bundle. Pricing the ask at worst_unit_cost / (1 - close_rate) (plus a
-        buffer) makes EVERY FIFO prefix of the bundle close at >= its own
-        break-even — so even a partial fill that consumes only the most expensive
-        (oldest) lots cannot realize a loss (critical in a falling market, where
-        the oldest lot is the priciest). Bundling also absorbs sub-min partial
-        dust. Returns (0, 0) when total inventory cannot form a min clip."""
+        """Bundle the oldest FIFO lots until cumulative qty >= `min_qty`. Returns
+        (qty, worst_unit_cost), worst_unit_cost = max(price + fee/qty) over the
+        bundle (the highest per-base break-even). Pricing a sell at this level keeps
+        every FIFO prefix >= break-even even on a partial fill, and absorbs sub-min
+        dust. Returns (0, 0) when inventory cannot form a min clip."""
         cum_q = 0.0
         worst_unit = 0.0
         for price, q, fee in self.lots:
@@ -186,9 +151,6 @@ class _Position:
             if cum_q >= min_qty - 1e-12:
                 return cum_q, worst_unit
         return 0.0, 0.0
-
-    def clear(self) -> None:
-        self.lots.clear()
 
 
 @dataclass
@@ -227,6 +189,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
         self.max_inventory = MAX_INVENTORY_LOTS * LOT
         self.ping_interval_ns = int(PING_INTERVAL_S * self._jit * _NS)
+        self.activity_soft_ns = int(PING_INTERVAL_S * ACTIVITY_SOFT_FRAC * self._jit * _NS)
         self.ping_cooldown_ns = int(PING_SUBMIT_COOLDOWN_S * _NS)
         self.quote_expiry_ns = int(QUOTE_EXPIRY_S * _NS)
         self.crash_window_ns = int(CRASH_WINDOW_S * _NS)
@@ -252,11 +215,8 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     # --------------------------------------------------------------- lifecycle
     def onStart(self, event: SimulationStartEvent) -> None:
-        # Dispatched inside super().update(), so _active_validator is the validator
-        # whose simulation just (re)started. Reset ONLY that validator's state so a
-        # restart on one validator never wipes another validator's live books. Do
-        # not touch _sim_id here — _ensure_simulation owns it (and already ran this
-        # tick); resetting positions/books_state also covers a reused simulation_id.
+        # Reset only the active validator's state so a restart on one validator
+        # never wipes another's live books. _sim_id is owned by _ensure_simulation.
         v = self._active_validator
         if v is None:
             self.positions.clear()
@@ -269,8 +229,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         )
 
     def onEnd(self, event) -> None:
-        """Log a per-validator summary at simulation end (investigation aid) and
-        drop that validator's state so the next simulation starts clean."""
+        """Log a per-validator summary and reset that validator's state."""
         v = self._active_validator
         if v is None:
             return
@@ -290,9 +249,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         super().update(state)
 
     def _reset_validator(self, validator: str) -> None:
-        """Drop all per-book ladders and state for one validator (used on sim
-        change / start / end). _BookState and _Position are recreated lazily with
-        clean defaults on next access, so nothing carries across simulations."""
+        """Drop per-book ladders and state for one validator (recreated lazily)."""
         self.positions.pop(validator, None)
         self.books_state.pop(validator, None)
 
@@ -308,16 +265,15 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------- fill tracking
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
-        """Track each of our fills (maker or taker leg, incl. partial fills) into
-        the FIFO ladder. Each TradeEvent is one fill slice, so partials accumulate
-        naturally. The per-fill fee is stored on buys for the exact no-loss floor."""
+        """Record each fill (maker or taker leg) into the FIFO ladder; store the
+        per-fill fee on buys for the exact no-loss floor."""
         if event.bookId is None:
             return
         if self.uid == event.takerAgentId:
             direction = OrderDirection.BUY if event.side == OrderDirection.BUY else OrderDirection.SELL
             fee = float(getattr(event, "takerFee", 0.0) or 0.0)
         elif self.uid == event.makerAgentId:
-            # As the resting maker we are the opposite side of the aggressor.
+            # As resting maker we are the opposite side of the aggressor.
             direction = OrderDirection.SELL if event.side == OrderDirection.BUY else OrderDirection.BUY
             fee = float(getattr(event, "makerFee", 0.0) or 0.0)
         else:
@@ -339,7 +295,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         else:
             closed, price_pnl, open_fee = pos.reduce(qty, price)
             if closed > 1e-12:
-                # Any reducing fill (incl. a partial) completes a round-trip.
+                # Any reducing fill (incl. a partial) is a round-trip.
                 st.last_rt_ns = ts
                 close_fee = fee * (closed / qty) if qty > 0 else fee
                 net = price_pnl - open_fee - close_fee
@@ -360,9 +316,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
                     bt.logging.info(msg)
 
     def onOrderRejected(self, event: OrderPlacementEvent) -> None:
-        """Surface rejections (post-only cross, insufficient balance, max open
-        orders, instruction-budget drops) so we can diagnose them from the log,
-        and clear any pending/ping flag the rejected order was holding."""
+        """Log rejections and clear any pending/ping flag the order was holding."""
         if event.bookId is None or not self._active_validator:
             return
         st = self._bstate(self._active_validator, event.bookId)
@@ -390,12 +344,26 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     @staticmethod
     def _avail(balance) -> float:
-        """Spendable this step once our resting orders are cancelled: free +
-        reserved (reserved is locked only in our own orders, which we cancel
-        earlier in the same response before any market exit)."""
+        """Free + reserved (our resting orders are cancelled earlier in the same
+        response, freeing their reserve for a market leg)."""
         if balance is None:
             return 0.0
         return (balance.free or 0.0) + (balance.reserved or 0.0)
+
+    @staticmethod
+    def _ceil_tick(px: float, price_dp: int) -> float:
+        """Round up to the price grid so a break-even sell never rounds below cost."""
+        tick = 10 ** (-price_dp)
+        return round(-(-px // tick) * tick, price_dp)
+
+    @staticmethod
+    def _noloss_floor(worst_unit: float, close_rate_bps: float) -> float:
+        """Lowest sell price netting >= 0 (plus buffer) on the worst lot after the
+        close fee, so every FIFO prefix closes >= 0. close_rate_bps is the closing
+        order's rate: maker for a resting ask, taker for an IOC (negative = rebate).
+        net/unit = s*(1-c) - worst_unit >= 0  <=>  s >= worst_unit / (1-c)."""
+        buffer = 1.0 + MAKER_HARVEST_BUFFER_BPS / 1e4
+        return worst_unit * buffer / max(0.5, 1.0 - close_rate_bps / 1e4)
 
     def _maker_fee_bps(self, account) -> float:
         fees = getattr(account, "fees", None)
@@ -426,8 +394,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     # --------------------------------------------------------------- features
     def _falling(self, st: _BookState, mid: float, now: int) -> bool:
-        """True if the book dropped >= crash_drop_bps over the crash window —
-        pause accumulation so we do not bid into a knife."""
+        """True if mid dropped >= crash_drop_bps over the crash window (pause bids)."""
         cutoff = now - self.crash_window_ns
         hi = mid
         for t, m in st.mids:
@@ -437,7 +404,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     def _heartbeat(self, st: _BookState, book_id, inv, mid, maker_fee_bps,
                    taker_fee_bps, half_spread_bps, n_orders, now) -> None:
-        """Throttled per-book state line so a quiet book is still observable."""
+        """Throttled per-book diagnostic line."""
         if st.last_log_ns and (now - st.last_log_ns) < int(LOG_HEARTBEAT_S * _NS):
             return
         st.last_log_ns = now
@@ -451,10 +418,9 @@ class DualEdgeAgent(FinanceSimulationAgent):
 
     # --------------------------------------------------------------- reconcile
     def _reconcile(self, pos: _Position, account) -> None:
-        """Clamp the ladder DOWN to the real on-chain base (free + reserved) so we
-        never try to sell base we do not hold. We never seed UP: the Pareto base
-        endowment is not an in-sim long, so selling it would open a validator
-        short — the ladder must contain only our in-sim buys."""
+        """Clamp the ladder down to on-chain base so we never sell base we do not
+        hold. Never seed up: the Pareto endowment is not an in-sim long (selling it
+        would open a short)."""
         bal = account.base_balance
         if bal is None:
             return
@@ -522,7 +488,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         pending = bool(st.pending_ns) and (now - st.pending_ns) < self.pending_timeout_ns
         no_position = inv < self._flat_eps and not pending
 
-        # --- ROUTER: choose the mode, but COMMIT a switch only with no position. ---
+        # Router: commit a mode switch only when flat.
         self._heartbeat(st, book_id, inv, mid, maker_fee_bps, taker_fee_bps,
                         half_spread_bps, len(account.orders), now)
 
@@ -536,24 +502,41 @@ class DualEdgeAgent(FinanceSimulationAgent):
                 )
                 st.mode = desired
             elif no_position and account.orders:
-                # No position but quotes still resting: pull them, switch next tick.
+                # Flat but quotes still resting: pull them, switch next tick.
                 response.cancel_orders(book_id, [o.id for o in account.orders])
                 return
 
-        # --- ACTIVITY FLOOR (overrides trading): guarantee one RT per window. ---
+        # Activity hard deadline: guarantee one round-trip per window.
         if self._activity_due(st, now):
             if pending:
                 return
-            # Free any reserve locked in resting quotes so the market leg can fill.
+            # Free reserve locked in resting quotes so the market leg can fill.
             if account.orders:
                 response.cancel_orders(book_id, [o.id for o in account.orders])
             if inv < self.min_order_size:
                 self._ping_open(response, st, account, book_id, best_ask, now)
             else:
-                self._ping_close(response, st, account, pos, book_id, vol_dp, now)
+                best_bid_qty = book.bids[0].quantity if book.bids else 0.0
+                self._ping_close(response, st, account, pos, book_id, best_bid_qty, vol_dp, now)
             return
 
-        # --- trade in the committed mode ---
+        # Activity soft window: bank a no-loss round-trip early via IOC at break-even
+        # when the bid covers it, so the deadline (loss-bearing) close rarely fires.
+        if (not pending and inv >= self.min_order_size
+                and self._activity_soft_due(st, now)):
+            b_qty, worst_unit = pos.harvest_bundle(self.min_order_size)
+            if b_qty >= self.min_order_size and worst_unit > 0:
+                limit_px = self._ceil_tick(self._noloss_floor(worst_unit, taker_fee_bps), price_dp)
+                if best_bid >= limit_px:
+                    if account.orders:   # free reserved base so the IOC can fill
+                        response.cancel_orders(book_id, [o.id for o in account.orders])
+                    qty = round(min(b_qty, self._avail(account.base_balance)), vol_dp)
+                    if qty >= self.min_order_size:
+                        st.sell_tag = "soft"
+                        self._ioc_sell(response, st, book_id, qty, limit_px)
+                    return
+
+        # Trade in the committed mode.
         if st.mode == MODE_TAKER:
             self._taker_step(response, st, pos, account, book_id,
                              best_bid, best_ask, taker_fee_bps, half_spread_bps,
@@ -565,15 +548,13 @@ class DualEdgeAgent(FinanceSimulationAgent):
                              price_dp, vol_dp, cap, now)
 
     def _desired_mode(self, half_spread_bps, taker_fee_bps) -> str:
-        # Taker is best only when the rebate more than pays for crossing the spread.
+        # Taker only when the rebate more than pays for crossing the spread.
         if -taker_fee_bps >= half_spread_bps + ROUTER_TAKER_MARGIN_BPS \
                 and -taker_fee_bps >= TAKER_REBATE_GATE_BPS:
             return MODE_TAKER
         return MODE_MAKER
 
-    # =====================================================================
-    # MAKER engine — post-only, long-only, FIFO no-loss harvest
-    # =====================================================================
+    # ===================== MAKER engine (post-only, long-only) =====================
     def _maker_step(self, response, st, pos, account, book_id,
                     mid, best_bid, best_ask, maker_fee_bps, allow_accumulate,
                     price_dp, vol_dp, cap, now) -> None:
@@ -581,9 +562,8 @@ class DualEdgeAgent(FinanceSimulationAgent):
         tick = 10 ** (-price_dp)
         width_bps = max(MAKER_MIN_HALF_SPREAD_BPS, maker_fee_bps + MAKER_EDGE_MARGIN_BPS)
 
-        # Accumulate only when allowed (mode stable, not dumping), the maker fee is
-        # not punitive, inventory has room, and we are under the volume cap.
-        # Otherwise "defensive": harvest what we hold, never add.
+        # Accumulate only when allowed (stable, not dumping), the maker fee is not
+        # punitive, inventory has room, and under the volume cap. Else harvest only.
         accumulate = (
             allow_accumulate
             and maker_fee_bps <= MAKER_FEE_DEFENSIVE_BPS
@@ -594,27 +574,26 @@ class DualEdgeAgent(FinanceSimulationAgent):
         bid_orders = [o for o in account.orders if o.side == OrderDirection.BUY]
         ask_orders = [o for o in account.orders if o.side == OrderDirection.SELL]
 
-        # ---- BID: accumulate a long clip below mid (post-only) ----
+        # BID: accumulate a long clip below mid; bid deeper (cheaper) as inventory
+        # fills, so later lots lower the average cost and accumulation self-throttles.
         if accumulate:
             bid_qty = round(min(LOT, self.max_inventory - inv), vol_dp)
             if bid_qty >= self.min_order_size:
-                target_bid = round(min(mid * (1 - width_bps / 1e4), best_ask - tick), price_dp)
+                inv_frac = inv / self.max_inventory if self.max_inventory > 0 else 0.0
+                bid_width_bps = width_bps + MAKER_INVENTORY_SKEW_BPS * inv_frac
+                target_bid = round(min(mid * (1 - bid_width_bps / 1e4), best_ask - tick), price_dp)
                 self._maintain_quote(response, book_id, OrderDirection.BUY, bid_orders,
                                      target_bid, bid_qty, mid,
                                      affordable=account.quote_balance.free >= bid_qty * target_bid)
         elif bid_orders:
             response.cancel_orders(book_id, [o.id for o in bid_orders])
 
-        # ---- ASK: harvest the OLDEST FIFO lots (bundled past dust) at their exact
-        #      fee-clearing break-even (FIFO match guaranteed >= 0) ----
+        # ASK: harvest the oldest FIFO lots (bundled past dust) at the worst per-base
+        # break-even, so every FIFO prefix closes >= 0.
         b_qty, worst_unit = pos.harvest_bundle(self.min_order_size)
         if b_qty >= self.min_order_size:
             ask_qty = round(b_qty, vol_dp)
-            maker_rate = maker_fee_bps / 1e4
-            buffer = 1.0 + MAKER_HARVEST_BUFFER_BPS / 1e4
-            # Cover the WORST per-base break-even in the bundle, grossed up for the
-            # close fee: ask*(1-rate) >= worst_unit*buffer => every FIFO prefix >=0.
-            floor = worst_unit * buffer / max(0.5, 1.0 - maker_rate)
+            floor = self._noloss_floor(worst_unit, maker_fee_bps)
             target_ask = round(max(mid * (1 + width_bps / 1e4), floor, best_bid + tick), price_dp)
             self._maintain_quote(response, book_id, OrderDirection.SELL, ask_orders,
                                  target_ask, ask_qty, mid,
@@ -626,31 +605,37 @@ class DualEdgeAgent(FinanceSimulationAgent):
     def _maintain_quote(self, response, book_id, direction, existing,
                         target_px, qty, mid, affordable, floor_px=0.0) -> None:
         """Keep exactly one resting post-only quote per side. Place when missing;
-        reprice (cancel now, repost next tick) only on a material drift, which
-        avoids a same-tick balance race and preserves queue priority on stable
-        quotes. A partially-filled order keeps resting (matched on price, not qty)
-        so the remainder fills. A stray duplicate self-heals via the len>1 cancel.
+        reprice (cancel now, repost next tick) only when needed, to avoid a same-tick
+        balance race and preserve queue priority. A partial fill keeps resting; a
+        stray duplicate self-heals via the len>1 cancel.
 
-        `floor_px` (sell asks only): the CURRENT no-loss break-even. Maker fees are
-        dynamic, so a fee rise while the ask rests can push the live break-even above
-        a quote priced at the old, lower fee — letting it fill below cost. If the
-        resting ask is now under the floor we force a reprice regardless of drift, so
-        a resting ask can never sit below the current break-even."""
+        Reprice is direction-aware:
+          * BID: symmetric drift — keep it near target.
+          * ASK: do NOT reprice up on a rally (it should get lifted, not chase peaks
+            on a mean-reverting book). Reprice only when forced — below the live
+            break-even (`floor_px`, after a fee rise), or stale-high after a mid drop
+            (move it back down so the next rebound fills it)."""
         if not existing:
             if affordable and target_px > 0:
                 response.limit_order(book_id=book_id, direction=direction, quantity=qty,
                                      price=target_px, postOnly=True, timeInForce=TimeInForce.GTT,
                                      expiryPeriod=self.quote_expiry_ns, stp=STP.CANCEL_OLDEST)
             return
-        resting_px = existing[0].price or target_px
-        under_floor = floor_px > 0 and resting_px < floor_px
-        drift_bps = abs(resting_px - target_px) / mid * 1e4
-        if under_floor or drift_bps > MAKER_REPRICE_BPS or len(existing) > 1:
+        if len(existing) > 1:
             response.cancel_orders(book_id, [o.id for o in existing])
+            return
+        resting_px = existing[0].price or target_px
+        if direction == OrderDirection.SELL:
+            under_floor = floor_px > 0 and resting_px < floor_px
+            stale_high = (resting_px - target_px) / mid * 1e4 > MAKER_REPRICE_BPS
+            if under_floor or stale_high:
+                response.cancel_orders(book_id, [o.id for o in existing])
+        else:
+            drift_bps = abs(resting_px - target_px) / mid * 1e4
+            if drift_bps > MAKER_REPRICE_BPS:
+                response.cancel_orders(book_id, [o.id for o in existing])
 
-    # =====================================================================
-    # TAKER engine — rebate-cushioned long scalp, one sequential cycle
-    # =====================================================================
+    # ================ TAKER engine (rebate-cushioned long scalp) ================
     def _taker_step(self, response, st, pos, account, book_id,
                     best_bid, best_ask, taker_fee_bps, half_spread_bps,
                     price_dp, vol_dp, cap, now, pending) -> None:
@@ -660,26 +645,17 @@ class DualEdgeAgent(FinanceSimulationAgent):
         inv = pos.qty
 
         if inv >= self._flat_eps:
-            # HELD: strictly no-loss exit. Post an IOC SELL limit at the bundle's
-            # WORST per-lot break-even, but ONLY when the book bid already covers it.
-            # The IOC matches resting bids from best down to the limit, so every fill
-            # (and every FIFO prefix on a partial) clears break-even — no slippage can
-            # realize a loss, unlike a market dump. When the bid is below break-even we
-            # simply HOLD (unrealized PnL is invisible to Kappa) and wait for price to
-            # recover or, as a last resort, the activity floor banks the round-trip.
+            # HELD: no-loss exit. IOC sell at the bundle's worst break-even, sent only
+            # when the bid already covers it, so every fill (and FIFO prefix on a
+            # partial) nets >= 0. Else hold (unrealized PnL is invisible to Kappa) and
+            # wait for recovery or the activity floor.
             held_ns = (now - st.taker_open_ns) if st.taker_open_ns else self.taker_min_hold_ns
             if held_ns < self.taker_min_hold_ns:
                 return
             b_qty, worst_unit = pos.harvest_bundle(self.min_order_size)
             if b_qty < self.min_order_size or worst_unit <= 0:
                 return
-            # Close fee here is a taker rebate (fee<0), so requiring bid >= worst_unit
-            # is conservative: any fill at >= worst_unit nets strictly positive. Round
-            # the limit UP to the price grid so the resting price never dips below
-            # break-even; since best_bid is itself a grid price >= worst_unit, the
-            # ceiled limit stays <= best_bid and therefore crosses.
-            tick = 10 ** (-price_dp)
-            limit_px = round(-(-worst_unit // tick) * tick, price_dp)
+            limit_px = self._ceil_tick(self._noloss_floor(worst_unit, taker_fee_bps), price_dp)
             if best_bid >= limit_px:
                 qty = round(min(b_qty, account.base_balance.free), vol_dp)
                 if qty >= self.min_order_size:
@@ -692,7 +668,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
             return
         if -taker_fee_bps < TAKER_REBATE_GATE_BPS:
             return
-        est_bps = (-taker_fee_bps) * 2.0 - half_spread_bps * 2.0   # rebate both legs - full spread
+        est_bps = (-taker_fee_bps) * 2.0 - half_spread_bps * 2.0   # rebate both legs - spread
         if est_bps < TAKER_EDGE_MARGIN_BPS:
             return
         if self._rolled_quote_volume(st, now) >= cap:
@@ -705,9 +681,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         self._market(response, st, book_id, OrderDirection.BUY, qty)
         st.taker_open_ns = now
 
-    # =====================================================================
-    # ACTIVITY FLOOR — unconditional min-lot taker round-trip per window
-    # =====================================================================
+    # ================ ACTIVITY FLOOR (min-lot round-trip per window) ================
     def _activity_due(self, st: _BookState, now: int) -> bool:
         ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
         if ref == 0:
@@ -716,25 +690,35 @@ class DualEdgeAgent(FinanceSimulationAgent):
             return False
         return (st.last_ping_submit_ns == 0) or ((now - st.last_ping_submit_ns) >= self.ping_cooldown_ns)
 
+    def _activity_soft_due(self, st: _BookState, now: int) -> bool:
+        """Past the soft fraction of the window with no round-trip yet — accept a
+        break-even close to pre-empt the deadline dump. Strictly earlier than
+        _activity_due."""
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
+        if ref == 0:
+            return False
+        return (now - ref) >= self.activity_soft_ns
+
     def _ping_open(self, response, st, account, book_id, best_ask, now) -> None:
         """Open leg: market-buy one min lot (buy-first => a real in-sim long).
-        Sized off free+reserved quote because resting bids were cancelled in this
-        same response."""
+        Sized off free+reserved quote (resting bids were cancelled this response)."""
         if st.ping_awaiting_open and (now - st.last_ping_submit_ns) <= int(60 * _NS):
             return
         qty = self.min_order_size
         if best_ask <= 0 or self._avail(account.quote_balance) < qty * best_ask:
             return
         st.ping_awaiting_open = True
+        st.last_ping_submit_ns = self._step_ts_ns
         bt.logging.info(f"[DualEdge uid={self.uid} PING] book={book_id} open qty={qty:.4f} ({st.mode})")
         self._market(response, st, book_id, OrderDirection.BUY, qty)
 
-    def _ping_close(self, response, st, account, pos, book_id, vol_dp, now) -> None:
-        """Close leg: market-sell a lot-aligned min slice = a completed round-trip.
-        FIFO closes the oldest in-sim long; if underwater this banks a tiny loss,
-        the accepted price of keeping activity_factor = 1.0. Sized off free+reserved
-        base (asks were cancelled in this response); sells the whole position when a
-        min slice would leave sub-min dust."""
+    def _ping_close(self, response, st, account, pos, book_id, best_bid_qty, vol_dp, now) -> None:
+        """Last-resort activity close: the window stayed below break-even, so bank one
+        round-trip or lose activity_factor (worse than a small loss). Market order for
+        a guaranteed fill — the loss here is the price gap, not depth slippage. The
+        clip is capped to the top-of-book size when that still forms a valid order so a
+        thin book is not swept deep; the whole position is sold when a min slice would
+        leave sub-min dust. Sized off free+reserved base (asks cancelled this response)."""
         avail = self._avail(account.base_balance)
         target = self.min_order_size
         if pos.qty - target < self.min_order_size:
@@ -742,7 +726,11 @@ class DualEdgeAgent(FinanceSimulationAgent):
         qty = round(min(target, avail, pos.qty), vol_dp)
         if qty < self.min_order_size:
             return
+        # Cap to top-of-book so we do not sweep deep levels.
+        if best_bid_qty >= self.min_order_size:
+            qty = round(min(qty, best_bid_qty), vol_dp)
         st.sell_tag = "ping"
+        st.last_ping_submit_ns = self._step_ts_ns
         bt.logging.info(f"[DualEdge uid={self.uid} PING] book={book_id} close qty={qty:.4f} ({st.mode})")
         self._market(response, st, book_id, OrderDirection.SELL, qty)
 
@@ -753,14 +741,11 @@ class DualEdgeAgent(FinanceSimulationAgent):
         response.market_order(book_id=book_id, direction=direction, quantity=qty,
                               currency=OrderCurrency.BASE, stp=STP.CANCEL_OLDEST)
         st.pending_ns = self._step_ts_ns
-        st.last_ping_submit_ns = self._step_ts_ns
 
     def _ioc_sell(self, response, st, book_id, qty, price) -> None:
-        """Aggressive no-loss exit: an IOC limit sell crosses only resting bids at
-        or above `price`, filling at their (>=price) levels and cancelling any
-        remainder — so it can never rest or fill below break-even. Marks pending so
-        the sequential taker cycle waits for the fill (or the timeout) before acting
-        again, mirroring _market."""
+        """No-loss exit: an IOC limit sell crosses only bids >= `price` and cancels
+        any remainder, so it never fills below break-even. Marks pending so the
+        sequential taker cycle waits for the fill (or timeout), mirroring _market."""
         if qty < self.exch_min or price <= 0:
             return
         response.limit_order(book_id=book_id, direction=OrderDirection.SELL, quantity=qty,
