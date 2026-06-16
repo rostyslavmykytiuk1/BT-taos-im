@@ -13,21 +13,27 @@ Scoring (from validator reward.py / _match_trade_fifo):
     Pareto base endowment is left as reserve (selling it would open a short).
   * max_instructions_per_book = 5; we emit <= 2 per book per tick.
 
+Risk philosophy: LPM3 cubes the downside, so one big realized loss (e.g. -8) costs
+more than hundreds of tiny ones. Inventory is therefore capped small and a position
+is never held into a deep move: it is cut early at a small bounded loss (the stop)
+rather than accumulated and force-dumped whole at the activity deadline.
+
 Strategy (per book, every tick):
   1. Reconcile the ladder down to on-chain base (never up).
   2. Router: taker if the rebate covers the spread, else maker. A switch is
      committed only when the book has no open position.
-  3. Activity, two-stage so the deadline close is rarely a loss:
-       soft — past ACTIVITY_SOFT_FRAC of the window, sell at the no-loss break-even
-              via IOC the instant the bid covers it;
-       hard — at the deadline, force a min-lot round-trip with a guaranteed market
-              fill even at a small loss (losing activity_factor is worse).
-  4. Maker (post-only, long-only): bid accumulates below mid and deepens as
-     inventory fills; ask harvests the oldest FIFO lots at the worst per-lot
-     break-even (every FIFO prefix closes >= 0). The ask is not repriced up on a
+  3. Activity hard deadline: force a min-lot round-trip near the bucket edge.
+  4. Risk stop: if the oldest (FIFO-next) lot is underwater past STOP_LOSS_BPS, or
+     has stayed underwater past STOP_HOLD_S, cut a clip at the bid via IOC — a small
+     bounded loss that also banks a round-trip (so the deadline rarely fires).
+  5. Soft activity: past ACTIVITY_SOFT_FRAC of the window, bank a no-loss round-trip
+     via IOC at break-even the instant the bid covers it.
+  6. Maker (post-only, long-only): bid accumulates below mid (deepening as inventory
+     fills, capped at MAX_INVENTORY_LOTS); ask harvests the oldest FIFO lots at the
+     worst per-lot break-even (every FIFO prefix closes >= 0), not repriced up on a
      rally (it gets lifted) — only to stay >= break-even or back down after a drop.
-  5. Taker: market-buy a clip when the rebate makes it +EV; exit with an IOC sell
-     at break-even, sent only when the bid covers it. Else hold.
+  7. Taker: market-buy a clip when the rebate makes it +EV; exit with an IOC sell at
+     break-even when the bid covers it. Else hold (the stop bounds the downside).
 
 Run (local proxy test):  python DualEdgeAgent.py --port 8904 --agent_id 0
 Deploy: set AGENT_NAME=DualEdgeAgent in the miner env, then pm2 restart <miner>.
@@ -54,8 +60,23 @@ _NS = 1_000_000_000
 # --- size ---
 EXCHANGE_MIN_ORDER_SIZE = 0.25     # sim minOrderSize floor
 LOT = 0.30                         # clip per quote/scalp (~0.3, matches top agents)
-MAX_INVENTORY_LOTS = 5             # max long lots (smaller bag => cheaper, lower break-even)
+MAX_INVENTORY_LOTS = 2             # max long lots — small bag bounds the worst-case stop loss
 MAKER_INVENTORY_SKEW_BPS = 30.0    # extra bid depth as inventory fills (cheaper scale-in)
+
+# --- risk stop (Kappa-3 cubes the downside: bound the tail with many small losses
+#     rather than holding a bag into a dump and force-dumping it whole at the ping).
+#     Tuned by sweeping 1596 real RTs (per-book kappa = sum(pnl)/cbrt(sum loss^3))
+#     and top-agent price paths: kappa peaks for a stop in the 10-15bps band; the
+#     joint width x stop optimum sits at width 10 / stop 15. ---
+STOP_LOSS_BPS = 15.0               # oldest lot this far below entry -> cut at the bid.
+                                   # Kappa denom = cbrt(sum loss^3): one big loss dominates,
+                                   # so a tight cap is decisive. Set just above the ~6-8bps
+                                   # median price step + the ~10bps harvest half-spread so it
+                                   # backstops trends without churning on noise. Sweep over
+                                   # 1596 real RTs + top-agent price paths peaks at 10-15bps.
+STOP_HOLD_S = 180.0                # underwater lot still stuck this long -> cut it. Between
+                                   # tops' median (~120s) and p90 (~300s) hold; the price stop
+                                   # usually fires first. After soft no-loss bank, before ping.
 
 # --- dynamic-fee router (all thresholds in bps; rebate = negative fee) ---
 ROUTER_TAKER_MARGIN_BPS = 1.0      # need (-taker_fee) >= half_spread + this for TAKER
@@ -63,7 +84,10 @@ MAKER_FEE_DEFENSIVE_BPS = 12.0     # maker fee above this -> stop accumulating
 ASSUMED_FEE_BPS = 2.3              # fallback per-side fee if account.fees missing
 
 # --- maker engine ---
-MAKER_MIN_HALF_SPREAD_BPS = 8.0    # min distance of a resting quote from mid
+MAKER_MIN_HALF_SPREAD_BPS = 10.0   # min distance of a resting quote from mid: matches top
+                                   # agents (~10bps half / ~20bps full) and is the joint
+                                   # width x stop optimum on their price paths; keeps the
+                                   # harvest target (width+buffer ~13bps) below the 15bps stop
 MAKER_EDGE_MARGIN_BPS = 4.0        # quote width on top of the maker fee
 MAKER_HARVEST_BUFFER_BPS = 3.0     # cushion above break-even; absorbs fee rise before fill
 MAKER_REPRICE_BPS = 8.0            # reprice a resting quote only past this drift
@@ -99,17 +123,21 @@ MODE_TAKER = "taker"
 
 @dataclass
 class _Position:
-    """FIFO ladder of in-sim buys. Each lot is [price, qty, fee] (fee at buy time,
-    stored so the no-loss harvest is exact under dynamic fees)."""
+    """FIFO ladder of in-sim buys. Each lot is [price, qty, fee, ts] (fee at buy
+    time for the exact no-loss harvest; ts is the fill time for the time stop)."""
     lots: deque = field(default_factory=deque)
 
     @property
     def qty(self) -> float:
         return sum(lot[1] for lot in self.lots)
 
-    def add(self, price: float, qty: float, fee: float) -> None:
+    def oldest(self):
+        """The oldest lot [price, qty, fee, ts] (next to be closed by FIFO), or None."""
+        return self.lots[0] if self.lots else None
+
+    def add(self, price: float, qty: float, fee: float, ts: int = 0) -> None:
         if qty > 0:
-            self.lots.append([float(price), float(qty), float(fee)])
+            self.lots.append([float(price), float(qty), float(fee), int(ts)])
 
     def reduce(self, qty: float, price: float = 0.0) -> tuple[float, float, float]:
         """FIFO-consume `qty` from the front, shrinking each lot's fee pro rata.
@@ -141,7 +169,7 @@ class _Position:
         dust. Returns (0, 0) when inventory cannot form a min clip."""
         cum_q = 0.0
         worst_unit = 0.0
-        for price, q, fee in self.lots:
+        for price, q, fee, _ts in self.lots:
             if q <= 0:
                 continue
             unit = price + fee / q
@@ -197,6 +225,8 @@ class DualEdgeAgent(FinanceSimulationAgent):
         self.taker_min_hold_ns = int(TAKER_MIN_HOLD_S * _NS)
         self.taker_reopen_gap_ns = int(TAKER_MIN_REOPEN_GAP_S * _NS)
         self.pending_timeout_ns = int(PENDING_TIMEOUT_S * _NS)
+        self.stop_loss_bps = STOP_LOSS_BPS * self._jit
+        self.stop_hold_ns = int(STOP_HOLD_S * self._jit * _NS)
         self.volume_assessment_ns = VOLUME_ASSESSMENT_NS
 
         self.positions: dict[str, dict[int, _Position]] = {}
@@ -210,7 +240,8 @@ class DualEdgeAgent(FinanceSimulationAgent):
             f"router(taker_margin={ROUTER_TAKER_MARGIN_BPS}bps maker_def={MAKER_FEE_DEFENSIVE_BPS}bps) "
             f"maker(width>=fee+{MAKER_EDGE_MARGIN_BPS}bps harvest_buf={MAKER_HARVEST_BUFFER_BPS}bps) "
             f"taker(rebate>={TAKER_REBATE_GATE_BPS}bps no-loss-IOC-exit) "
-            f"ping={PING_INTERVAL_S:.0f}s"
+            f"stop({STOP_LOSS_BPS:.0f}bps/{STOP_HOLD_S:.0f}s) ping={PING_INTERVAL_S:.0f}s "
+            f"soft={PING_INTERVAL_S * ACTIVITY_SOFT_FRAC:.0f}s"
         )
 
     # --------------------------------------------------------------- lifecycle
@@ -290,7 +321,7 @@ class DualEdgeAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         st.pending_ns = 0   # a fill resolves any in-flight market order
         if direction == OrderDirection.BUY:
-            pos.add(price, qty, fee)
+            pos.add(price, qty, fee, ts)
             st.ping_awaiting_open = False
         else:
             closed, price_pnl, open_fee = pos.reduce(qty, price)
@@ -401,6 +432,22 @@ class DualEdgeAgent(FinanceSimulationAgent):
             if t >= cutoff and m > hi:
                 hi = m
         return hi > 0 and (hi - mid) / hi * 1e4 >= self.crash_drop_bps
+
+    def _stop_due(self, pos: _Position, mid: float, now: int) -> bool:
+        """Cut the oldest (FIFO-next) lot when it is underwater and either fell past
+        the price stop or has aged out — so a position is never held into a deep
+        move and force-dumped whole at the activity deadline. Kappa-3 cubes the
+        downside, so many small bounded cuts beat one catastrophic loss."""
+        lot = pos.oldest()
+        if lot is None:
+            return False
+        entry, _qty, _fee, ts = lot
+        if entry <= 0 or mid >= entry:
+            return False
+        drop_bps = (entry - mid) / entry * 1e4
+        if drop_bps >= self.stop_loss_bps:
+            return True
+        return ts > 0 and (now - ts) >= self.stop_hold_ns
 
     def _heartbeat(self, st: _BookState, book_id, inv, mid, maker_fee_bps,
                    taker_fee_bps, half_spread_bps, n_orders, now) -> None:
@@ -518,6 +565,20 @@ class DualEdgeAgent(FinanceSimulationAgent):
             else:
                 best_bid_qty = book.bids[0].quantity if book.bids else 0.0
                 self._ping_close(response, st, account, pos, book_id, best_bid_qty, vol_dp, now)
+            return
+
+        # Risk stop: drain the oldest lot at the bid once it is underwater past the
+        # stop or aged out. Bounds the per-book tail (and banks a round-trip, helping
+        # activity), so the deadline dump rarely fires and never on a full bag.
+        if (not pending and inv >= self.min_order_size
+                and self._stop_due(pos, mid, now)):
+            if account.orders:   # free reserved base so the IOC can fill
+                response.cancel_orders(book_id, [o.id for o in account.orders])
+            qty = round(min(LOT, self._avail(account.base_balance), inv), vol_dp)
+            if qty >= self.min_order_size and best_bid > 0:
+                st.sell_tag = "stop"
+                st.last_close_ns = now   # throttle a taker reopen into the dump
+                self._ioc_sell(response, st, book_id, qty, round(best_bid, price_dp))
             return
 
         # Activity soft window: bank a no-loss round-trip early via IOC at break-even
