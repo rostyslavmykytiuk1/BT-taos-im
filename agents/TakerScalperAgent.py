@@ -54,12 +54,12 @@ MAX_GROSS_SL_BPS = 4.0
 SHORT_LEVERAGE = 1.0
 
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 20                        # max profit RTs per book per window
+RT_MAX = 30                        # max profit RTs per book per window
 
 # Force a taker RT once this long since the last RT (kept under RT_WINDOW_S).
 ACTIVITY_DEADLINE_S = 500.0
 # Min gap between RT closes and the next profit open (per book; throttles churn).
-MIN_REOPEN_GAP_S = 4.0
+MIN_REOPEN_GAP_S = 3.0
 # After submitting, wait this long for the fill before assuming the order was lost.
 PENDING_TIMEOUT_S = 5.0
 
