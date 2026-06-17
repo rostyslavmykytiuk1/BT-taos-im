@@ -61,7 +61,12 @@ from taos.im.protocol.models import (
 _NS = 1_000_000_000
 
 EXCHANGE_MIN_ORDER_SIZE = 0.25
-QUOTE_LOT = 0.25
+QUOTE_LOT = 0.26                    # just ABOVE the 0.25 exchange min on purpose: a fee-paying BUY is
+                                   # settled by shaving the fee out of the base received (exchange
+                                   # ClearingManager: fees_base=roundUp(fee/price)), so a 0.25 buy
+                                   # leaves ~0.2498 held — under the min and un-sellable, so the agent
+                                   # MISSES the exit until it re-accumulates. 0.26 keeps the held lot
+                                   # >= 0.25 after the shave => always closeable in one order.
 
 # ---- inventory bounds ----
 MAX_INVENTORY_LOTS = 2.0           # tighter than DualEdge: maker runs smaller book
@@ -463,13 +468,20 @@ class PureMakerAgent(FinanceSimulationAgent):
         self, is_long: bool, px0: float, age_ns: int, touch_inside: float,
         base_target: float, pdp: int,
     ) -> float:
-        """Walk the passive-reduce limit price from the profit target toward the touch with lot age."""
+        """Walk the passive-reduce limit price from the profit target toward the touch with lot age.
+        FLOOR the realized loss at the stop: a resting reduce quote must never fill worse than the
+        managed-exit IOC would. Otherwise an aged underwater lot's reduce walks all the way to the
+        touch and fills there on a gap, locking a loss many times the stop (kappa-3 cubes that tail).
+        Anything below the floor is left to _managed_exit's bounded IOC instead."""
         w = self._exit_walk(age_ns)
+        stop = EXIT_STOP_LOSS_BPS / 1e4
         if is_long:
             ideal = max(touch_inside, px0 * (1.0 + base_target))
-            return round(ideal + (touch_inside - ideal) * w, pdp)
+            px = ideal + (touch_inside - ideal) * w
+            return round(max(px, px0 * (1.0 - stop)), pdp)
         ideal = min(touch_inside, px0 * (1.0 - base_target))
-        return round(ideal + (touch_inside - ideal) * w, pdp)
+        px = ideal + (touch_inside - ideal) * w
+        return round(min(px, px0 * (1.0 + stop)), pdp)
 
     def _exit_walk(self, age_ns: int) -> float:
         if age_ns <= self.exit_walk_start_ns:

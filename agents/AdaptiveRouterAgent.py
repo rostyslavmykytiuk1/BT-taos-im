@@ -11,16 +11,27 @@ book's LIVE fee regime, mirroring the proven top miners:
   * MAKER mode  (mirrors UID 109/149): on spread-rich books, post two-sided passive quotes and
     capture spread WIDER than the maker fee + an adverse-selection margin. When holding, work only
     the reducing side priced off the FIFO worst lot (no bagging), and cap every forced exit.
-  * IDLE mode: on books that pay neither edge, do the MINIMUM — one bounded round-trip per
-    activity window to hold activity factor at 1.0 — and otherwise stay flat. (Far better for the
-    Kappa median to be neutral-flat on a hard book than to bleed small losses on it.)
+  * IDLE mode: ONLY for genuinely sub-breakeven books (spread < 2×maker_fee and no taker rebate).
+    Stay flat → the book gets Kappa=None and is DROPPED from the median (up to 37.5% are free), which
+    beats bleeding small losses on a book whose active Kappa would sit below our median anyway.
+
+Calibrated from the top agents' own trade histories (other agents data/*.csv):
+  * They ALL trade 128/128 books — none idle. So we make on every breakeven-or-better book
+    (MAKER_EDGE_ENTER = 0bps) and only idle the few truly toxic ones.
+  * They route by FEE REGIME: UID 126 (#1, Kappa 0.263) is 100% taker on rebate books; UID 66
+    (Kappa 0.104) is mixed and takes only where the taker side is rebated; UID 109/165 are pure
+    makers — 165 makes profitably even at +11.5bps fee. We do the same: take where rebated, make
+    everywhere else, no maker fee ceiling.
+  * Kappa rises with FREQUENCY (149 at 1.7 RT/book/10min → Kappa 0.040; 66/109 at ~26 → 0.10),
+    because per-book Kappa ≈ (share of step-timestamps closed positive)^(2/3). So we quote
+    continuously with short cooldowns, NOT sparse high-target round-trips.
 
 Why this wins (from taos/im/validator/reward.py + utils/kappa.py + _match_trade_fifo):
-  * Score ≈ 0.79·kappa + 0.21·pnl, BOTH per-book then median across books. The live leaderboard
-    tracks KAPPA, not the PnL sign (UID 126 is #1 with negative reported PnL). So we optimize the
-    per-book Kappa-3 median and keep activity = 1.0 everywhere.
-  * Kappa-3 cubes the downside: one big loss dwarfs many tiny ones. Every mode bounds each
-    realized loss; we never bag a long-held underwater position.
+  * Score = 0.79·kappa + 0.21·pnl, BOTH per-book then median across books. The leaderboard tracks
+    KAPPA (UID 126 is #1 with negative mark-to-market PnL). We optimize the per-book Kappa-3 median
+    and keep activity = 1.0 on as many books as possible.
+  * Kappa-3 CUBES the downside: one big loss dwarfs many tiny gains. So the dominant risk lever is
+    POSITION SIZE — small clips + a tight inventory cap keep every forced cut small. We never bag.
   * Round-trip volume (the activity signal) is produced ONLY by a CLOSING fill, sampled every
     ~600s. Each book MUST close ≥1 round-trip per window or its activity factor decays.
 
@@ -71,27 +82,38 @@ ALLOWED_MODES = {"taker", "maker", "idle"}
 
 # ---- shared sizing / precision ----
 EXCHANGE_MIN_ORDER_SIZE = 0.25     # sim minOrderSize floor for any BASE order
-TARGET_CLIP = 0.30                 # shared per-clip BASE lot; keeps per-RT PnL scale comparable
-                                   # across modes (so a book's kappa series keeps one scale)
+TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.25 exchange minimum
+                                   # on purpose: a fee-paying BUY is settled by shaving the fee out
+                                   # of the base received (ClearingManager: fees_base=roundUp(fee/px)),
+                                   # so a 0.25 buy leaves ~0.2498 held — under the min, un-sellable,
+                                   # so you MISS the exit until you re-accumulate. 0.26 keeps the held
+                                   # lot >= 0.25 after the shave => always closeable in one order.
+                                   # Still matches the top makers' clips (0.25-0.29) and stays small.
 
 # ---- routing thresholds (bps), with hysteresis so a book does not flip-flop ----
-# Taker is chosen when the taker REBATE (=-taker_fee) clears these; maker when the spread clears
-# the maker fee plus an adverse-selection margin. Enter thresholds are stricter than exit ones.
-TAKER_REBATE_ENTER_BPS = 5.0       # need >= this rebate to ROUTE a flat book to taker
-TAKER_REBATE_EXIT_BPS = 3.0        # leave taker only once rebate drops below this
-MAKER_EDGE_ENTER_BPS = 5.0         # need (half-spread - maker_fee) >= this to ROUTE to maker
-MAKER_EDGE_EXIT_BPS = 1.0          # leave maker only once edge drops below this
-MAKER_MAX_FEE_BPS = 10.0           # absolute gate: never make on books with maker_fee above this
-                                   # (high-fee books are adverse-selection territory; the fee IS
-                                   # the regime signal, so a wide spread cannot redeem them)
-MAKER_FALLBACK_EDGE_BPS = 2.0      # relaxed enter threshold used only when idle-book guard triggers
-MAX_IDLE_BOOKS = 40                # idle-book guard: if more than this many books are idle (last
-                                   # step), borderline books are promoted to maker with the fallback
-                                   # edge threshold to keep idle < 0.375×128=48 free slots
+# EVIDENCE (top-agent trade histories): every top agent trades ALL 128 books — none idle. They
+# route by fee REGIME: take where the taker side is rebated (126 is #1 with 100% taker-on-rebate,
+# kappa 0.263), make everywhere else — even at +11.5bps maker fee (165). So: low taker bar, and
+# maker is the UNIVERSAL fallback (no fee ceiling). Idle is reserved for illiquid/toxic books only.
+TAKER_REBATE_ENTER_BPS = 3.0       # route a flat book to taker once the rebate cushions the crossing
+TAKER_REBATE_EXIT_BPS = 1.5        # leave taker only once rebate drops below this
+MAKER_EDGE_ENTER_BPS = 0.0         # BREAKEVEN gate: make whenever passive capture covers both fee
+                                   # legs (half_spread - maker_fee >= 0  <=>  spread >= 2*maker_fee).
+                                   # This is exactly the bar that lets the top makers run all 128
+                                   # books; only genuinely sub-breakeven books (spread < 2*fee) idle.
+MAKER_EDGE_EXIT_BPS = -2.0         # strong hysteresis: hold maker until 2bps below breakeven
+MAKER_MAX_FEE_BPS = 1_000.0        # effectively no ceiling — 165 makes profitably at +11.5bps. A
+                                   # wide spread redeems a high fee; the per-RT TP floor (2×fee)
+                                   # already guarantees each maker round-trip covers both legs.
+MAKER_FALLBACK_EDGE_BPS = 0.0      # when the idle guard fires, make on any book with a spread at all
+MAX_IDLE_BOOKS = 8                 # idle-book guard: top agents idle ~0 books. Promote aggressively
+                                   # to maker so we stay active on nearly all 128 books.
 ROUTE_MIN_DWELL_S = 180.0          # min time in a mode before switching (only switches when flat)
 
 # ---- shared round-trip economics / risk (PnL-scale matched across modes) ----
-RT_LOSS_CAP_BPS = 6.0              # hard cap on a single forced-exit adverse move (both modes)
+RT_LOSS_CAP_BPS = 4.0              # hard cap on a single forced-exit adverse move (both modes).
+                                   # Tighter than before: kappa-3 cubes the downside, so a small,
+                                   # consistent loss tail beats an occasional large cut.
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
 RT_MAX = 30                        # max profit RTs per book per window
 CAPITAL_TURNOVER_CAP = 10.0        # volume cap = this * miner_wealth (24h) — avoid the ceiling
@@ -116,19 +138,20 @@ MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
 MK_EXIT_WALK_START_S = 25.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 75.0            # ... walk to the touch by here, then IOC-cut. Maker mean-
-                                   # reversion runs minutes, not seconds; cutting at 20s realized
-                                   # losses that usually recover. The stop-loss caps the tail.
-MK_STOP_LOSS_BPS = 10.0            # TRIGGER: IOC-cut a held lot underwater beyond this. Looser
-                                   # than taker (6) because normal bid/ask oscillation hits 5-8bps
-                                   # on low-fee maker books and a 6bps stop churns capital.
-MK_IOC_SLIPPAGE_BPS = 6.0          # CEILING: max price concession on the forced IOC cut (distinct
+MK_EXIT_GIVEUP_S = 50.0            # ... walk to the touch by here, then IOC-cut. Shorter than 75s:
+                                   # a position that has not reverted in ~50s is trending, and the
+                                   # longer it is held the bigger the eventual cut (downside cube).
+MK_STOP_LOSS_BPS = 10.0            # TRIGGER: IOC-cut a held lot underwater beyond this. Kept at 10
+                                   # (not tighter) because normal oscillation hits 5-8bps on low-fee
+                                   # maker books and a 6bps stop churns; the tighter lever is size.
+MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
-MK_REENTRY_COOLDOWN_S = 60.0       # after a forced cut, pause fresh opens (don't re-bag a trend)
-MK_LOSS_STREAK_LIMIT = 4           # consecutive losing cuts on a book before a long pause
-MK_STREAK_COOLDOWN_S = 600.0       # length of that pause (persistently toxic book -> stop quoting)
-MK_MAX_INVENTORY_LOTS = 3.0        # hard per-book lot cap; excess is risk-trimmed
-MK_MAX_INVENTORY_EQUITY_FRAC = 0.15
+MK_REENTRY_COOLDOWN_S = 20.0       # after a forced cut, brief pause then re-quote. Top makers run
+                                   # ~25 round-trips/book/10min — long cooldowns starve kappa coverage.
+MK_LOSS_STREAK_LIMIT = 5           # consecutive losing cuts on a book before a pause (toxic book)
+MK_STREAK_COOLDOWN_S = 240.0       # length of that pause; shorter so a book rejoins coverage sooner
+MK_MAX_INVENTORY_LOTS = 2.0        # hard per-book lot cap (was 3). Smaller max position => smaller
+MK_MAX_INVENTORY_EQUITY_FRAC = 0.08  # worst-case adverse move => smaller loss tail. Main risk lever.
 
 # ---- Kappa-3 (validator-faithful; 3h history) ----
 KAPPA_TAU = 0.0
@@ -1064,12 +1087,20 @@ class _MakerMode(_Mode):
         return desired
 
     def _reduce_price(self, is_long, px0, age_ns, touch_inside, base_target, pdp, agent) -> float:
+        # Walk the reduce limit from the profit target toward the touch as the lot ages, but FLOOR
+        # the realized loss at the stop: a resting reduce quote must never fill worse than the IOC
+        # cut would. Without this, an aged underwater lot's reduce walks all the way to the touch and
+        # fills there on a gap, locking a loss many times the stop (kappa-3 cubes that tail). Anything
+        # below the floor is left to _managed_exit's bounded IOC instead.
         w = self._exit_walk(age_ns, agent)
+        stop = MK_STOP_LOSS_BPS / 1e4
         if is_long:
             ideal = max(touch_inside, px0 * (1.0 + base_target))
-            return round(ideal + (touch_inside - ideal) * w, pdp)
+            px = ideal + (touch_inside - ideal) * w
+            return round(max(px, px0 * (1.0 - stop)), pdp)
         ideal = min(touch_inside, px0 * (1.0 - base_target))
-        return round(ideal + (touch_inside - ideal) * w, pdp)
+        px = ideal + (touch_inside - ideal) * w
+        return round(min(px, px0 * (1.0 + stop)), pdp)
 
     @staticmethod
     def _exit_walk(age_ns, agent) -> float:
