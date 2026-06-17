@@ -230,6 +230,66 @@ A genuinely top-ranked agent needs **both** playbooks and must **route by live f
 book**, because the regime changes over time and across books. That is the thesis behind
 DualEdge (§3.2) — which is sound in principle but not yet working in practice.
 
+### 2.4 Live leaderboard snapshot + multi-agent study (2026-06-17)
+
+The tops rotate **constantly** with the market. A snapshot of the agents table plus fresh trade
+exports of the current leaders:
+
+| Place | UID | Style | kappa | reported PnL | Note |
+|---|---|---|---|---|---|
+| 0 | **126** | pure TAKER | **0.553** | −43k | Deep-rebate scalper, huge volume |
+| 1 | 84 | (high-vol) | 0.519 | −104k | |
+| 2 | **66** | **HYBRID maker+taker** | 0.521 | −134k | **Per-book router — proves the dual thesis** |
+| 3 | **109** | pure MAKER | 0.520 | −58k | New top maker, bigger clips |
+| 6 | 119 | pure TAKER (ours) | 0.510 | −163k | Our TakerScalper |
+| 8 | 149 | pure MAKER | 0.508 | −293k | Tiny clips, long inventory holds |
+| 14 | 165 | pure MAKER | 0.504 | +288k | Older top maker |
+
+**Decisive insight — score tracks KAPPA, not PnL sign.** UID 126 is #1 with **negative**
+reported PnL (−43k) because its kappa (0.553) is highest. The `pnl` column is cumulative
+inventory mark, not the realized-RT series kappa consumes. **Optimize per-book Kappa-3 median +
+activity = 1.0; do not chase the raw PnL number.**
+
+**Per-agent trade-data findings** (clip sizes, fee regime, inventory build, cycling). NOTE: the
+CSVs are short windows, so FIFO-reconstructed *totals* are truncation-biased and not cited; the
+*structural* metrics below are robust:
+
+- **126 — pure taker (the bar to beat).** 100% taker, **99.7% rebate** fills, median rebate
+  **~9.8 bps**, clips ~0.26, **128 books**, ~78 trades/book, **~1 s** cycling. Builds **small
+  inventory** (peak abs ~1.4 median, ~3.1 p90) via **same-side runs of 2** — it averages into a
+  rebate-paid side, not strict one-in-one-out. Tiny MAD (~0.014) from a huge near-zero RT mass.
+
+- **149 — pure maker, "tiny clip / long hold".** 100% maker, **pays ~10 bps maker fee** (cost,
+  not rebate), **smallest clips ~0.17**, **very long same-side runs (median 6, max 150)** →
+  builds **large inventory** (peak abs up to ~24). Few trades/book (~8). Wins by capturing spread
+  wider than the fee, across many books, with high RT volume cushioning the cubic penalty.
+
+- **109 — pure maker, "bigger clip / slower" (new top).** 100% maker, pays ~6.4 bps, **larger
+  clips (up to 3.4)**, **slower cycling (~15 s gaps)**, holds more inventory (peak abs ~3.8
+  median). Highest reconstructed RT win-rate (~71%) of the makers — the cleanest maker.
+
+- **66 — HYBRID router (new, #2, the model for us).** **65% maker / 35% taker.** Routes **per
+  book**: of 128 books, **72 are pure-taker**, **56 are maker-with-occasional-taker** (~10% taker
+  fills, i.e. activity/inventory-reduction crosses), **0 pure-maker**. On its books the taker legs
+  **earn ~4.5 bps rebate** while the maker legs **pay ~5.7 bps fee**. Keeps **tight inventory**
+  (peak abs ~0.64 median) and flips quickly (same-side run median 1). **This is live proof that a
+  per-book maker/taker router can reach the very top** — and it does so with *small* inventory,
+  unlike the pure makers.
+
+**What the makers have in common that we missed before:** they **pay** the maker fee (6–10 bps)
+and still profit, because they **capture spread wider than the fee** and run **high RT volume**
+that builds a large per-book MAD, which cushions the cubic downside. "Maker = needs a maker
+rebate" was wrong; "maker = spread capture, fee is just a cost to clear" is right. Our failed
+KappaMaker/DualEdge maker mode quoted on books where the spread did **not** clear the fee +
+adverse selection — hence the bleed.
+
+**Routing takeaways for our build:**
+1. Mirror **126** on deep-rebate books (taker, small clips, bounded same-side build, ~1 s cycle).
+2. Mirror **109/149** on spread-rich books (maker, spread must exceed fee + adverse-selection
+   margin; tight-to-moderate inventory; force a close each window).
+3. Mirror **66**'s **per-book routing with small inventory** as the overall architecture.
+4. Everywhere: keep **activity = 1.0**, bound every loss, and **maximize per-book kappa median**.
+
 ---
 
 ## 3. What We Tried (and What Each Taught Us)
