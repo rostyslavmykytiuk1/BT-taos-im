@@ -242,7 +242,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         self.volume_assessment_ns = VOLUME_ASSESSMENT_NS
 
         # Per-UID jitter so a fleet does not act in lockstep.
-        jitter = ((self.uid * 2654435761) % 1000) / 1000.0
+        jitter = ((self.uid * 2654435761) % 1000) / 1000.0  # Knuth multiplicative hash
         self.route_min_dwell_ns = int(ROUTE_MIN_DWELL_S * (0.9 + 0.2 * jitter) * _NS)
         self.activity_deadline_ns = int(ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
@@ -292,8 +292,8 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
 
     # --------------------------------------------------------------- lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._active_validator = state.dendrite.hotkey
+        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
 
@@ -387,12 +387,16 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                     )
                     st.mode, st.mode_since_ns = MODE_IDLE, now
             else:
-                pnl_bad = (st.mode == MODE_MAKER
-                           and (now - st.mode_since_ns) >= self.route_min_dwell_ns
-                           and self._recent_pnl_bad(st))
-                want = (MODE_TAKER if pnl_bad
-                        else self._route(st, account, best_bid, best_ask, mid,
-                                         fallback_maker=fallback_maker))
+                pnl_bad = st.mode == MODE_MAKER and self._recent_pnl_bad(st)
+                if pnl_bad:
+                    taker_fee = self._taker_fee_rate(account)
+                    rebate_bps = (-taker_fee * 1e4) if taker_fee is not None else -1e9
+                    want = (MODE_TAKER if rebate_bps >= TAKER_REBATE_ENTER_BPS
+                            else self._route(st, account, best_bid, best_ask, mid,
+                                             fallback_maker=fallback_maker))
+                else:
+                    want = self._route(st, account, best_bid, best_ask, mid,
+                                       fallback_maker=fallback_maker)
                 if want != st.mode and (now - st.mode_since_ns) >= self.route_min_dwell_ns:
                     if account.orders:
                         self._cancel_all(response, account, book_id)
@@ -424,31 +428,31 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         maker_fee_bps = (maker_fee * 1e4) if maker_fee is not None else 1e9
         maker_edge_bps = half_spread_bps - maker_fee_bps   # capture half-spread, pay the maker fee
 
-        taker_thr = TAKER_REBATE_EXIT_BPS if cur == MODE_TAKER else TAKER_REBATE_ENTER_BPS
+        taker_min_rebate = TAKER_REBATE_EXIT_BPS if cur == MODE_TAKER else TAKER_REBATE_ENTER_BPS
         # When the idle-book guard fires, borderline books get a relaxed enter threshold so they
         # prefer marginal maker over idle. The fee ceiling is kept strict: a high fee signals
         # adverse selection regardless of spread, and that does not change in fallback.
-        maker_enter_thr = MAKER_FALLBACK_EDGE_BPS if fallback_maker else MAKER_EDGE_ENTER_BPS
-        maker_thr = MAKER_EDGE_EXIT_BPS if cur == MODE_MAKER else maker_enter_thr
+        maker_enter_edge = MAKER_FALLBACK_EDGE_BPS if fallback_maker else MAKER_EDGE_ENTER_BPS
+        maker_min_edge = MAKER_EDGE_EXIT_BPS if cur == MODE_MAKER else maker_enter_edge
         # Taker is only viable when the rebate covers the crossing cost (rebate > half_spread so
         # est_bps = 2×rebate − 2×half_spread > 0 and _TakerMode._open() will actually execute).
         # For books ALREADY in taker mode, skip the spread check — transient spread spikes must not
         # eject a taker book before the rebate itself drops below the exit threshold; the execution
         # gate in _open() already suppresses trading when the spread is temporarily too wide.
         spread_viable = (cur == MODE_TAKER) or (rebate_bps > half_spread_bps)
-        taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_thr and spread_viable
+        taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_min_rebate and spread_viable
         # Maker requires BOTH a net spread edge AND an absolute fee below the ceiling: a wide spread
         # on a high-fee book is adverse selection, not opportunity.
         maker_ok = ((MODE_MAKER in ALLOWED_MODES)
                     and maker_fee_bps < MAKER_MAX_FEE_BPS
-                    and maker_edge_bps >= maker_thr)
+                    and maker_edge_bps >= maker_min_edge)
 
         if taker_ok and maker_ok:
             # Both edges available -> prefer the one with more margin above its (dynamic) enter bar.
-            # Using maker_enter_thr (not the hardcoded constant) so that fallback-mode promotion of
+            # Using maker_enter_edge (not the hardcoded constant) so that fallback-mode promotion of
             # borderline maker books is correctly reflected in the tiebreaker.
             return (MODE_TAKER if (rebate_bps - TAKER_REBATE_ENTER_BPS)
-                    >= (maker_edge_bps - maker_enter_thr) else MODE_MAKER)
+                    >= (maker_edge_bps - maker_enter_edge) else MODE_MAKER)
         if taker_ok:
             return MODE_TAKER
         if maker_ok:
@@ -511,7 +515,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             st = self._bstate(validator, book_id)
             kappa_before = st.kappa3
             st.last_rt_ns = ts
-            st.last_close_ns = ts
             if st.mode == MODE_MAKER and realized > 0:
                 st.mk_loss_streak = 0          # a winning maker close clears the toxic-book streak
             self._record_rt_close(validator, book_id, ts, realized)
@@ -652,13 +655,9 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
     # ------------------------------------------------------------------ activity / volume
-    @staticmethod
-    def _activity_elapsed(st: _BookState, now: int) -> int:
-        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
-        return now - ref
-
     def _activity_due(self, st: _BookState, now: int) -> bool:
-        return self._activity_elapsed(st, now) >= self.activity_deadline_ns
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
+        return (now - ref) >= self.activity_deadline_ns
 
     def _record_trade_volume(self, validator, book_id, qty, price, ts_ns) -> None:
         vol = float(qty) * float(price)
@@ -834,7 +833,6 @@ class _Mode:
         lot, so the rare forced loss is tiny."""
         slip = RT_LOSS_CAP_BPS / 1e4
         pdp = agent._price_decimals
-        agent._cancel_all(response, account, book_id)
         long_q, short_q = agent._long_qty(inv), agent._short_qty(inv)
         lot = max(agent.clip, agent.exch_min)
         base_avail = agent._avail(account.base_balance)
@@ -843,27 +841,29 @@ class _Mode:
             q = round(min(long_q, base_avail, lot), vol_dp)
             if q < agent.exch_min:
                 return False
+            agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.SELL, q,
                                 round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
         elif short_q >= agent.exch_min:
-            q = round(min(short_q, lot), vol_dp)
+            buy_px = best_ask * (1.0 + slip)
+            q_max = quote_avail / buy_px if buy_px > 0 else short_q
+            q = round(min(short_q, lot, q_max), vol_dp)
             if q < agent.exch_min:
                 return False
-            if quote_avail < q * best_ask * (1.0 + slip):
-                return False
+            agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.BUY, q,
                                 round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False,
                                 settlement=agent._loan_settlement(account))
         else:
             q = lot
             if direction == OrderDirection.SELL and base_avail >= q:
-                # preferred: directional short seed when we hold base
+                agent._cancel_all(response, account, book_id)
                 agent._submit_limit(response, book_id, OrderDirection.SELL, q,
                                     round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
             else:
-                # fallback (or direction==BUY): seed a long — only needs quote balance
                 if quote_avail < q * best_ask * (1.0 + slip):
                     return False
+                agent._cancel_all(response, account, book_id)
                 agent._submit_limit(response, book_id, OrderDirection.BUY, q,
                                     round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False)
         return True
@@ -950,7 +950,7 @@ class _TakerMode(_Mode):
                               # so the caller does NOT call _maybe_add() on a SL/TP position
             agent._submit_market(response, book_id, OrderDirection.SELL, q)
         else:
-            q = round(abs(net), vol_dp)
+            q = round(min(abs(net), agent._avail(account.quote_balance) / best_ask if best_ask > 0 else abs(net)), vol_dp)
             if q < agent.exch_min:
                 return True   # same: prevent _maybe_add() from accumulating past the SL/TP
             agent._submit_market(response, book_id, OrderDirection.BUY, q,
@@ -1031,21 +1031,14 @@ class _MakerMode(_Mode):
 
     def step(self, agent, response, validator, book_id, book, account, st, inv, net,
              best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
-        if self._risk_trim(agent, response, book_id, account, inv, net, mid, vol_dp):
-            # Apply the same cooldown accounting as _managed_exit so that a run of trim-based
-            # IOC cuts (position repeatedly over-cap on a trending book) triggers the streak
-            # cooldown and the 20s re-entry pause, preventing immediate re-quoting after a cut.
+        if (self._risk_trim(agent, response, book_id, account, inv, net, mid, vol_dp)
+                or self._managed_exit(agent, response, validator, book_id, account, inv, net,
+                                      best_bid, best_ask, vol_dp, now)):
+            # Count forced IOC cuts (risk-trim or managed-exit) as losses until proven otherwise;
+            # a positive close in _apply_fill resets the streak. After STREAK_LIMIT consecutive
+            # cuts, pause maker entries for mk_streak_cooldown_ns to avoid re-bleeding on a
+            # persistently trending book.
             st.last_cut_ns = now
-            st.mk_loss_streak += 1
-            if st.mk_loss_streak >= MK_LOSS_STREAK_LIMIT:
-                st.mk_streak_cooldown_until_ns = now + agent.mk_streak_cooldown_ns
-            return
-        if self._managed_exit(agent, response, validator, book_id, account, inv, net,
-                              best_bid, best_ask, vol_dp, now):
-            st.last_cut_ns = now
-            # Count forced cuts as losing until proven otherwise; a positive close resets the
-            # streak in _apply_fill. After a run of cuts, pause this book for a long cooldown
-            # (mirrors the 99%-loss books that just kept re-entering and bleeding).
             st.mk_loss_streak += 1
             if st.mk_loss_streak >= MK_LOSS_STREAK_LIMIT:
                 st.mk_streak_cooldown_until_ns = now + agent.mk_streak_cooldown_ns
@@ -1075,11 +1068,16 @@ class _MakerMode(_Mode):
             return False
         slip = MK_IOC_SLIPPAGE_BPS / 1e4
         pdp = agent._price_decimals
-        agent._cancel_all(response, account, book_id)
         if net > 0:
             trim = round(min(trim, agent._avail(account.base_balance)), vol_dp)
-            if trim < agent.exch_min:
-                return False
+        else:
+            buy_px = mid * (1.0 + slip)
+            q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else trim
+            trim = round(min(trim, q_max), vol_dp)
+        if trim < agent.exch_min:
+            return False
+        agent._cancel_all(response, account, book_id)
+        if net > 0:
             agent._submit_limit(response, book_id, OrderDirection.SELL, trim,
                                 round(mid * (1.0 - slip), pdp), ioc=True, post_only=False)
         else:
@@ -1111,7 +1109,9 @@ class _MakerMode(_Mode):
             underwater = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
             if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
                 return False
-            q = round(min(agent.clip, agent._short_qty(inv)), vol_dp)
+            buy_px = best_ask * (1.0 + slip)
+            q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else agent._short_qty(inv)
+            q = round(min(agent.clip, agent._short_qty(inv), q_max), vol_dp)
             if q < agent.exch_min:
                 return False
             self._tag_close(agent, validator, book_id, "cut")
@@ -1151,17 +1151,18 @@ class _MakerMode(_Mode):
 
         if net >= agent.exch_min:
             age = now - inv.longs[0][0]
-            worst_px = max(p for _, _, p, _ in inv.longs)
-            px = self._reduce_price(True, worst_px, age, ask_inside, base_target, pdp, agent)
+            fifo_px = inv.longs[0][2]
+            px = self._reduce_price(True, fifo_px, age, ask_inside, base_target, pdp, agent)
             q = round(min(agent._long_qty(inv), base_avail), vol_dp)
             if q >= agent.exch_min and px > 0:
                 desired[OrderDirection.SELL] = (px, q)
         elif net <= -agent.exch_min:
             age = now - inv.shorts[0][0]
-            worst_px = min(p for _, _, p, _ in inv.shorts)
-            px = self._reduce_price(False, worst_px, age, bid_inside, base_target, pdp, agent)
-            q = round(agent._short_qty(inv), vol_dp)
-            if q >= agent.exch_min and px > 0 and quote_avail >= q * px:
+            fifo_px = inv.shorts[0][2]
+            px = self._reduce_price(False, fifo_px, age, bid_inside, base_target, pdp, agent)
+            q_max = quote_avail / px if px > 0 else agent._short_qty(inv)
+            q = round(min(agent._short_qty(inv), q_max), vol_dp)
+            if q >= agent.exch_min and px > 0:
                 desired[OrderDirection.BUY] = (px, q)
         elif st.mk_streak_cooldown_until_ns and now < st.mk_streak_cooldown_until_ns:
             pass   # persistently toxic book (streak of losing cuts) -> long pause, stop quoting

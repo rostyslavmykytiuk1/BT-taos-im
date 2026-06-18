@@ -144,10 +144,10 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._sim_id: dict[str, str] = {}
         self._rt_log: dict[tuple[str, int], _RtLogCtx] = {}
         self._step_ts_ns: int = 0
-        self._agent_start_ns: dict[str, int] = {}   # per-VALIDATOR activity clock before the first RT.
-        #   Each validator runs its OWN simulation with its OWN clock (sim-times differ by hours). A single
-        #   global field gets frozen to whichever validator was processed last at boot, so on validators
-        #   whose clock is behind it, (now - start) goes negative => permanent grace => the force never fires.
+        # Activity clock before the first RT, keyed PER VALIDATOR: each validator runs its own sim with its
+        # own clock (hours apart), so a single global field would freeze to one validator and break the
+        # forced-RT backstop on the others (see _activity_force_due).
+        self._agent_start_ns: dict[str, int] = {}
         self._active_validator: str | None = None
 
         bt.logging.info(
@@ -636,23 +636,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         if self._activity_force_due(validator, st, now):
             tag = "taker_force" if paid else "activity"
             opened = self._try_open(response, validator, book_id, book, account, direction, now, tag)
-            if self._rt_log_enabled(validator):   # DIAGNOSTIC: trace why activity can fall < 1.0
-                ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns.get(validator, 0)
-                gap_s = (now - ref) / _NS
-                if opened:
-                    bt.logging.info(
-                        f"[TakerScalper uid={self.uid}] ACT-FORCE-OPEN book={book_id} "
-                        f"gap={gap_s:.0f}s dir={'BUY' if direction == OrderDirection.BUY else 'SELL'}")
-                else:
-                    if direction == OrderDirection.BUY:
-                        ask_px = book.asks[0].price if book.asks else 0.0
-                        free_q = account.quote_balance.free if account.quote_balance else 0.0
-                        why = (f"BUY need={self.min_order_size * ask_px:.2f} free_quote={free_q:.2f}"
-                               if ask_px > 0 else "BUY no_ask")
-                    else:
-                        why = "SELL no_bid"
-                    bt.logging.warning(
-                        f"[TakerScalper uid={self.uid}] ACT-FORCE-SKIP book={book_id} gap={gap_s:.0f}s {why}")
+            self._log_activity_force(validator, book_id, st, account, book, direction, now, opened)
 
     def _try_open(
         self, response, validator: str, book_id: int, book, account,
@@ -666,6 +650,32 @@ class TakerScalperAgent(FinanceSimulationAgent):
             self._prune_vol_log(st, now)
         self._stash_rt_open(validator, book_id, book, account, direction, now, tag)
         return True
+
+    def _log_activity_force(
+        self, validator: str, book_id: int, st: _BookState, account, book,
+        direction: OrderDirection, now: int, opened: bool,
+    ) -> None:
+        """Diagnostic (main validator only): trace whether the forced-activity RT opened, and why it
+        skipped if not. Added while chasing the activity-clock bug; SAFE TO REMOVE once the fix is
+        confirmed live (the validator's activity_factor is the authoritative signal)."""
+        if not self._rt_log_enabled(validator):
+            return
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns.get(validator, 0)
+        gap_s = (now - ref) / _NS
+        if opened:
+            bt.logging.info(
+                f"[TakerScalper uid={self.uid}] ACT-FORCE-OPEN book={book_id} "
+                f"gap={gap_s:.0f}s dir={'BUY' if direction == OrderDirection.BUY else 'SELL'}")
+            return
+        if direction == OrderDirection.BUY:
+            ask_px = book.asks[0].price if book.asks else 0.0
+            free_q = account.quote_balance.free if account.quote_balance else 0.0
+            why = (f"BUY need={self.min_order_size * ask_px:.2f} free_quote={free_q:.2f}"
+                   if ask_px > 0 else "BUY no_ask")
+        else:
+            why = "SELL no_bid"
+        bt.logging.warning(
+            f"[TakerScalper uid={self.uid}] ACT-FORCE-SKIP book={book_id} gap={gap_s:.0f}s {why}")
 
     def _close(
         self, response, validator: str, book_id: int, book, account, pos: _Position,

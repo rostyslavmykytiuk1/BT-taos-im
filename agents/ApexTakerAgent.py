@@ -87,7 +87,14 @@ VOL_FLOOR_BPS = 1.0               # per-step mid-volatility EMA must exceed this
 CH_MAX_SPREAD_BPS = 15.0         # 136 trades WIDE-spread books (~16bps median, 8-19) — he does NOT avoid
                                  #   them. The wide spread is the entry COST he recovers by HOLDING for the
                                  #   mean-reversion (below), not by finding cheap crossings. Match his range.
-CH_DRIFT_DIR_BPS = 2.0           # |EMA drift| above this => lean WITH the trend; else lean by microprice
+CH_DRIFT_DIR_BPS = 2.0           # |EMA drift| above this => a clear deviation-from-mean to FADE; else fade
+                                 #   the microprice. ApexTaker is a MEAN-REVERSION specialist: on a ranging
+                                 #   book it fades the oscillation and holds for the revert (see _fade_direction).
+TREND_SKIP_BPS = 10.0           # REGIME GATE: |drift| above this => the book is TRENDING (a sustained
+                                 #   directional EMA gap) where hold-for-revert gets run over — skip the churn
+                                 #   and let the activity backstop keep coverage. ApexTaker is a SPECIALIST:
+                                 #   it wins the ranging / taker-good regime (like 136) and stays QUIET in
+                                 #   trends (AdaptiveRouter handles those). This is what stops the trend bleed.
 CH_SL_BPS = 15.0                 # WIDE move-stop: hold THROUGH the spread+noise so the position can revert.
                                  #   Cutting at 5bps locked in losers that would have come back; this ~matches
                                  #   136's typical loss size and the catastrophic tail is bounded by ABS_STOP.
@@ -102,9 +109,9 @@ PENDING_OPEN_TIMEOUT_S = 8.0    # after submitting an open, treat the book as in
                                 #   re-opening in that window stacks a second clip -> the over-cap churn we saw.
 
 # ===================================================================== shared exit / circuit breaker
-ABS_STOP_BPS = 30.0              # ABSOLUTE per-position circuit breaker (adverse MID move): only the
-                                 # CATASTROPHIC tail — wide enough to let 136-style reversions happen, but
-                                 # bounds a single position from riding a sustained trend. Small clip caps $.
+ABS_STOP_BPS = 20.0              # ABSOLUTE per-position circuit breaker (adverse MID move): the catastrophic
+                                 # tail. Tighter now that the regime gate keeps us OFF sustained trends, so a
+                                 # ranging revert rarely needs more room; bounds gap-driven outliers. Clip caps $.
 EXIT_SLIPPAGE_BPS = 4.0          # max concession on a normal forced IOC exit (bounds slippage)
 EXIT_SLIPPAGE_ABS_BPS = 20.0     # WIDER concession on the absolute-stop cut so it clears in ONE step on
                                  # a gap (guaranteed same-step exit; a few extra bps beats staying exposed)
@@ -325,15 +332,17 @@ class ApexTakerAgent(FinanceSimulationAgent):
         microprice = (ask.price * bid.quantity + bid.price * ask.quantity) / denom
         return (microprice - mid) / mid * 1e4
 
-    def _lean_direction(self, st: _BookState, book, mid: float) -> int:
-        """Direction to open: lean WITH the EMA drift when it is meaningful, else with order flow
-        (microprice). Always returns a side — this is a weak-but-better-than-136's-coinflip lean."""
+    def _fade_direction(self, st: _BookState, book, mid: float) -> int:
+        """Direction to open, MEAN-REVERSION (fade): price above its mean (drift > 0) => SELL expecting a
+        revert down; below the mean (drift < 0) => BUY. With no clear drift, fade the microprice pressure.
+        This is the edge over 136's coinflip — on a RANGING book the oscillation reverts toward us. The
+        regime gate (TREND_SKIP_BPS) keeps us off books that are actually trending, where a fade is run over."""
         drift = self._drift_bps(st)
         if drift >= CH_DRIFT_DIR_BPS:
-            return OrderDirection.BUY
+            return OrderDirection.SELL           # price above mean => fade the high
         if drift <= -CH_DRIFT_DIR_BPS:
-            return OrderDirection.SELL
-        return OrderDirection.BUY if self._imbalance_bps(book, mid) >= 0 else OrderDirection.SELL
+            return OrderDirection.BUY             # price below mean => fade the low
+        return OrderDirection.SELL if self._imbalance_bps(book, mid) >= 0 else OrderDirection.BUY
 
     # --------------------------------------------------------------- entry
     def _try_open(self, response, validator, book_id, account, st, book,
@@ -356,17 +365,19 @@ class ApexTakerAgent(FinanceSimulationAgent):
         if rebate_edge >= REBATE_ENTER_BPS:
             if st.last_open_ns and (now - st.last_open_ns) < self.rb_reopen_gap_ns:
                 return False
-            direction = OrderDirection.BUY if self._imbalance_bps(book, mid) >= 0 else OrderDirection.SELL
+            direction = self._fade_direction(st, book, mid)
             return self._open(response, book_id, account, st, direction, best_bid, best_ask, mid, LANE_REBATE, vol_dp, now)
 
-        # ---- CHURN lane: permissive, leaned, on VOLATILE fee books (positive-skew exit carries the EV) ----
+        # ---- CHURN lane: fade the oscillation on RANGING books and hold for the revert (mean-reversion) ----
         if st.vol_ema < VOL_FLOOR_BPS:
             return False                       # dead-calm + no rebate => no edge to harvest => idle
         if spread_bps > CH_MAX_SPREAD_BPS:
             return False                       # too wide to cross repeatedly as a taker => skip (would bleed)
+        if abs(self._drift_bps(st)) > TREND_SKIP_BPS:
+            return False                       # REGIME GATE: book is TRENDING => a fade gets run over => skip
         if st.last_open_ns and (now - st.last_open_ns) < self.ch_reopen_gap_ns:
             return False
-        direction = self._lean_direction(st, book, mid)
+        direction = self._fade_direction(st, book, mid)
         return self._open(response, book_id, account, st, direction, best_bid, best_ask, mid, LANE_CHURN, vol_dp, now)
 
     def _open(self, response, book_id, account, st, direction, best_bid, best_ask, mid, lane, vol_dp, now) -> bool:
@@ -442,9 +453,8 @@ class ApexTakerAgent(FinanceSimulationAgent):
             return None
         if move_bps <= -CH_SL_BPS:
             return "ch_sl"
-        drift = self._drift_bps(st)   # reversal: the trend we leaned into has flipped against us
-        if (net > 0 and drift <= -CH_DRIFT_DIR_BPS) or (net < 0 and drift >= CH_DRIFT_DIR_BPS):
-            return "ch_rev"
+        # No drift-"reversal" exit: we ENTER against the drift (fade), so a drift that persists/extends is
+        # expected — the revert is exactly what we hold for. A failed fade (trend continues) is cut by ch_sl/abs.
         if st.peak_move_bps >= CH_ARM_BPS and move_bps <= st.peak_move_bps - CH_TRAIL_BPS:
             return "ch_trail"
         if held >= self.ch_max_hold_ns:

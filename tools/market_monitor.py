@@ -84,16 +84,12 @@ def recommend(regime: str) -> str:
             "ApexTakerAgent  — fee-paying taker, directional SHORT lean, positive-skew exit.\n"
             "  (136 wins this regime: kappa from MAD via volume+breadth, not maker edge)"
         )
-    elif regime == "UPTREND":
-        return (
-            "ApexTakerAgent  — same structure but EMA drift flips lean to LONG.\n"
-            "  ApexTaker handles uptrend via CH_DRIFT_DIR_BPS lean; no agent swap needed."
-        )
     else:
         return (
-            "AdaptiveRouterAgent / PureMakerAgent  — maker and rebate-scalp books are profitable.\n"
-            "  126-style rebate scalp wins on rebate books; tight maker wins on low-fee books.\n"
-            "  ApexTaker REBATE lane still active — no urgent swap but maker adds edge."
+            "PureMakerAgent  — maker specialist wins in uptrend and sideways (rich spreads,\n"
+            "  mean reversion, passive capture). All PureMaker miners positive kappa in these\n"
+            "  regimes. AdaptiveRouterAgent as a hedge (routes to taker/idle per book).\n"
+            "  Only switch to ApexTakerAgent when DOWNTREND is confirmed."
         )
 
 

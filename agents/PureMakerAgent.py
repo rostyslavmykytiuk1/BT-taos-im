@@ -168,7 +168,7 @@ class _BookState:
     vol_log: list[tuple[int, float]] = field(default_factory=list)
     # per-book loss-streak cooldown
     loss_streak: int = 0                   # consecutive losing RT count
-    streak_cooldown_until_ns: int = 0      # no new entries before this timestamp
+    no_entry_until_ns: int = 0             # no new entries before this timestamp
 
 
 class PureMakerAgent(FinanceSimulationAgent):
@@ -220,8 +220,8 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._active_validator = state.dendrite.hotkey
+        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
 
@@ -313,8 +313,9 @@ class PureMakerAgent(FinanceSimulationAgent):
         #    backoff (180s) is shorter than this deadline (480s), which is shorter than the
         #    validator's 600s decay grace. Only sub-breakeven books (active=False) are allowed to go
         #    idle -> kappa=None -> dropped from the median for free (the 37.5% inactive budget).
-        if active and self._activity_elapsed(st, now) >= self.activity_deadline_ns:
-            if self._activity_close(response, validator, book_id, book, account,
+        activity_ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
+        if active and (now - activity_ref) >= self.activity_deadline_ns:
+            if self._activity_close(response, book_id, account,
                                     inv, net, best_bid, best_ask, vol_dp):
                 return
 
@@ -322,7 +323,7 @@ class PureMakerAgent(FinanceSimulationAgent):
         #    breakeven gate in _entry_ok clears. A held sub-breakeven book reduces but never re-opens.
         desired = self._desired_quotes(
             validator, book_id, book, account, inv, net,
-            best_bid, best_ask, mid, maker_fee, volume_cap, now,
+            best_bid, best_ask, mid, maker_fee, volume_cap, now, active,
         )
         self._reconcile_quotes(response, account, book_id, desired)
 
@@ -360,11 +361,16 @@ class PureMakerAgent(FinanceSimulationAgent):
         if trim < self.exch_min:
             return False
         slip = RISK_TRIM_SLIPPAGE_BPS / 1e4
-        self._cancel_all(response, account, book_id)
         if net > 0:
             trim = round(min(trim, self._avail(account.base_balance)), vol_dp)
-            if trim < self.exch_min:
-                return False
+        else:
+            buy_px = mid * (1.0 + slip)
+            q_max = self._avail(account.quote_balance) / buy_px if buy_px > 0 else trim
+            trim = round(min(trim, q_max), vol_dp)
+        if trim < self.exch_min:
+            return False
+        self._cancel_all(response, account, book_id)
+        if net > 0:
             px = round(mid * (1.0 - slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.SELL, trim, px,
                                ioc=True, post_only=False)
@@ -407,14 +413,16 @@ class PureMakerAgent(FinanceSimulationAgent):
             stopped = uw >= EXIT_STOP_LOSS_BPS
             if not (aged or stopped):
                 return False
-            q = round(self._short_qty(inv), vol_dp)
+            buy_px = best_ask * (1.0 + slip)
+            q_max = self._avail(account.quote_balance) / buy_px if buy_px > 0 else self._short_qty(inv)
+            q = round(min(self._short_qty(inv), q_max), vol_dp)
             if q < self.exch_min:
                 return False
             self._cancel_all(response, account, book_id)
             px = round(best_ask * (1.0 + slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True, post_only=False,
                                settlement=self._loan_settlement(account))
-        reason = "stop" if stopped and not aged else ("age" if aged and not stopped else "age+stop")
+        reason = "age+stop" if (aged and stopped) else ("age" if aged else "stop")
         bt.logging.info(
             f"[PureMaker uid={self.uid}] MANAGED-EXIT book={book_id} reason={reason} "
             f"net={net:+.4f} q={q} @~{px} uw={uw:.1f}bps"
@@ -423,34 +431,34 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ activity backstop
     def _activity_close(
-        self, response, validator: str, book_id: int, book, account, inv: _Inv, net: float,
+        self, response, book_id: int, account, inv: _Inv, net: float,
         best_bid: float, best_ask: float, vol_dp: int,
     ) -> bool:
-        slip = FORCE_TRIM_SLIPPAGE_BPS / 1e4
-        self._cancel_all(response, account, book_id)
         long_q = self._long_qty(inv)
         short_q = self._short_qty(inv)
+        # When flat: don't cancel resting maker quotes (they ARE our activity path) and don't
+        # force a new position — seeding a long when we have no edge is a guaranteed small loss.
+        if long_q < self.exch_min and short_q < self.exch_min:
+            return False
+        slip = FORCE_TRIM_SLIPPAGE_BPS / 1e4
         lot = max(self.quote_lot, self.exch_min)
-        base_avail = self._avail(account.base_balance)
-        quote_avail = self._avail(account.quote_balance)
-
         if long_q >= self.exch_min:
-            q = round(min(long_q, base_avail, lot), vol_dp)
+            q = round(min(long_q, self._avail(account.base_balance), lot), vol_dp)
             if q < self.exch_min:
                 return False
             px = round(best_bid * (1.0 - slip), self._price_decimals)
+            self._cancel_all(response, account, book_id)
             self._submit_limit(response, book_id, OrderDirection.SELL, q, px, ioc=True, post_only=False)
-        elif short_q >= self.exch_min:
-            q = round(min(short_q, lot), vol_dp)
+        else:
+            buy_px = best_ask * (1.0 + slip)
+            q_max = self._avail(account.quote_balance) / buy_px if buy_px > 0 else short_q
+            q = round(min(short_q, lot, q_max), vol_dp)
             if q < self.exch_min:
                 return False
             px = round(best_ask * (1.0 + slip), self._price_decimals)
+            self._cancel_all(response, account, book_id)
             self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True, post_only=False,
                                settlement=self._loan_settlement(account))
-        else:
-            # Flat: don't force a trade. Seeding a long in a downtrend locks in a stop-loss cut.
-            # Let passive quotes get hit naturally instead.
-            return False
         bt.logging.info(f"[PureMaker uid={self.uid}] ACTIVITY-CLOSE book={book_id} net={net:+.4f}")
         return True
 
@@ -458,7 +466,7 @@ class PureMakerAgent(FinanceSimulationAgent):
     def _desired_quotes(
         self, validator: str, book_id: int, book, account, inv: _Inv, net: float,
         best_bid: float, best_ask: float, mid: float, maker_fee: float | None,
-        volume_cap: float, now: int,
+        volume_cap: float, now: int, active: bool = True,
     ) -> dict[int, tuple[float, float]]:
         st = self._bstate(validator, book_id)
         tick = self._tick
@@ -483,25 +491,26 @@ class PureMakerAgent(FinanceSimulationAgent):
             bid_inside, ask_inside = round(best_bid, pdp), round(best_ask, pdp)
 
         if net >= self.exch_min:
-            # Holding long → passive SELL reduce, priced off worst lot, walking toward touch.
+            # Holding long → passive SELL reduce, priced off FIFO-next (oldest) lot.
             age = now - inv.longs[0][0]
-            worst_px = max(p for _, _, p, _ in inv.longs)
-            px = self._reduce_price(True, worst_px, age, ask_inside, base_target, pdp)
+            fifo_px = inv.longs[0][2]
+            px = self._reduce_price(True, fifo_px, age, ask_inside, base_target, pdp)
             q = round(min(self._long_qty(inv), base_avail), vdp)
             if q >= self.exch_min and px > 0:
                 desired[OrderDirection.SELL] = (px, q)
         elif net <= -self.exch_min:
-            # Holding short → passive BUY reduce.
+            # Holding short → passive BUY reduce, priced off FIFO-next (oldest) lot.
             age = now - inv.shorts[0][0]
-            worst_px = min(p for _, _, p, _ in inv.shorts)
-            px = self._reduce_price(False, worst_px, age, bid_inside, base_target, pdp)
-            q = round(self._short_qty(inv), vdp)
-            if q >= self.exch_min and px > 0 and quote_avail >= q * px:
+            fifo_px = inv.shorts[0][2]
+            px = self._reduce_price(False, fifo_px, age, bid_inside, base_target, pdp)
+            q_max = quote_avail / px if px > 0 else self._short_qty(inv)
+            q = round(min(self._short_qty(inv), q_max), vdp)
+            if q >= self.exch_min and px > 0:
                 desired[OrderDirection.BUY] = (px, q)
         elif st.last_cut_ns > 0 and now - st.last_cut_ns < self.reentry_cooldown_ns:
             # Post-cut cooldown: don't re-enter immediately after a managed exit.
             pass
-        elif self._entry_ok(maker_fee, spread, mid, validator, book_id, st, now, volume_cap):
+        elif self._entry_ok(active, validator, book_id, st, now, volume_cap):
             # Flat and all gates clear → quote both sides.
             q = round(self.quote_lot, vdp)
             if q >= self.exch_min and free_base >= q:
@@ -523,11 +532,11 @@ class PureMakerAgent(FinanceSimulationAgent):
         w = self._exit_walk(age_ns)
         stop = EXIT_STOP_LOSS_BPS / 1e4
         if is_long:
-            ideal = max(touch_inside, px0 * (1.0 + base_target))
-            px = ideal + (touch_inside - ideal) * w
+            target_px = max(touch_inside, px0 * (1.0 + base_target))
+            px = target_px + (touch_inside - target_px) * w
             return round(max(px, px0 * (1.0 - stop)), pdp)
-        ideal = min(touch_inside, px0 * (1.0 - base_target))
-        px = ideal + (touch_inside - ideal) * w
+        target_px = min(touch_inside, px0 * (1.0 - base_target))
+        px = target_px + (touch_inside - target_px) * w
         return round(min(px, px0 * (1.0 + stop)), pdp)
 
     def _exit_walk(self, age_ns: int) -> float:
@@ -539,13 +548,13 @@ class PureMakerAgent(FinanceSimulationAgent):
         return (age_ns - self.exit_walk_start_ns) / span if span > 0 else 1.0
 
     def _entry_ok(
-        self, maker_fee: float | None, spread: float, mid: float, validator: str, book_id: int,
+        self, active: bool, validator: str, book_id: int,
         st: _BookState, now: int, volume_cap: float,
     ) -> bool:
         """Gate new inventory: breakeven gate, streak cooldown, RT budget, volume cap."""
-        if not self._is_active_book(maker_fee, spread, mid):
+        if not active:
             return False
-        if now < st.streak_cooldown_until_ns:
+        if now < st.no_entry_until_ns:
             return False
         vol_ok = self._rolled_quote_volume(validator, book_id, now) < volume_cap
         rt_ok = self._rt_count(st, now) < RT_MAX
@@ -636,22 +645,13 @@ class PureMakerAgent(FinanceSimulationAgent):
         return self._long_qty(inv) - self._short_qty(inv)
 
     @staticmethod
-    def _activity_elapsed(st: _BookState, now: int) -> int:
-        ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
-        return now - ref
-
-    @staticmethod
     def _avail(balance) -> float:
         if balance is None:
             return 0.0
         return (balance.free or 0.0) + (balance.reserved or 0.0)
 
     def _book_equity(self, account, mid: float) -> float:
-        q = account.quote_balance
-        b = account.base_balance
-        quote = ((q.free or 0.0) + (q.reserved or 0.0)) if q else 0.0
-        base = ((b.free or 0.0) + (b.reserved or 0.0)) if b else 0.0
-        return quote + base * mid
+        return self._avail(account.quote_balance) + self._avail(account.base_balance) * mid
 
     def _record_trade_volume(self, validator, book_id, qty, price, ts_ns) -> None:
         vol = float(qty) * float(price)
@@ -683,7 +683,7 @@ class PureMakerAgent(FinanceSimulationAgent):
             self._regime_backoff(st, book_id, ts)
             self._log_rt(
                 validator=validator, book_id=book_id, ts=ts,
-                hold_s=(ts - matched_ts) / _NS if matched_ts else None,
+                hold_s=(ts - matched_ts) / _NS if matched_ts is not None else None,
                 side="buy" if is_buy else "sell", exit_px=price, rtv=rtv,
                 gross_pnl=gross, net_pnl=realized,
                 kappa_before=kappa_before, kappa_after=st.kappa3,
@@ -692,13 +692,13 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     def _update_streak(self, st: _BookState, book_id: int, realized_pnl: float, now_ns: int) -> None:
         """Track consecutive losses. After STREAK_LIMIT in a row, pause new entries."""
-        if realized_pnl > 0:
+        if realized_pnl >= 0:
             st.loss_streak = 0
         else:
             st.loss_streak += 1
             if st.loss_streak >= STREAK_LIMIT:
-                st.streak_cooldown_until_ns = max(
-                    st.streak_cooldown_until_ns, now_ns + self.streak_cooldown_ns)
+                st.no_entry_until_ns = max(
+                    st.no_entry_until_ns, now_ns + self.streak_cooldown_ns)
                 bt.logging.info(
                     f"[PureMaker uid={self.uid}] STREAK-COOLDOWN book={book_id} "
                     f"streak={st.loss_streak} cooldown={STREAK_COOLDOWN_S}s"
@@ -721,8 +721,8 @@ class PureMakerAgent(FinanceSimulationAgent):
         avg_win = (sum(wins) / len(wins)) if wins else 0.0
         if net < -BACKOFF_NET_WINS * avg_win:   # avg_win==0 (all losses) => any net<0 trips it
             until = now_ns + self.backoff_cooldown_ns
-            if until > st.streak_cooldown_until_ns:
-                st.streak_cooldown_until_ns = until
+            if until > st.no_entry_until_ns:
+                st.no_entry_until_ns = until
                 bt.logging.info(
                     f"[PureMaker uid={self.uid}] REGIME-BACKOFF book={book_id} "
                     f"net={net:+.3f} avg_win={avg_win:.3f} n={len(recent)} idle={BACKOFF_COOLDOWN_S:.0f}s"
@@ -733,7 +733,8 @@ class PureMakerAgent(FinanceSimulationAgent):
     ) -> tuple[float, float, int | None, float]:
         close_book = inv.shorts if is_buy else inv.longs
         open_book = inv.longs if is_buy else inv.shorts
-        realized = 0.0; gross = 0.0; rtv = 0.0; remaining = qty
+        realized = gross = rtv = 0.0
+        remaining = qty
         matched_ts: int | None = None
         qinv = 1.0 / qty if qty > 0 else 0.0
 
@@ -744,13 +745,17 @@ class PureMakerAgent(FinanceSimulationAgent):
             take = min(o_qty, remaining)
             price_pnl = (o_px - price) * take if is_buy else (price - o_px) * take
             if o_qty <= remaining + self._flat_eps:
-                close_fee = fee * o_qty * qinv; open_fee = o_fee
+                close_fee = fee * o_qty * qinv
+                open_fee = o_fee
                 close_book.popleft()
             else:
-                close_fee = fee * take * qinv; open_fee = o_fee * (take / o_qty)
+                close_fee = fee * take * qinv
+                open_fee = o_fee * (take / o_qty)
                 close_book[0] = (o_ts, o_qty - take, o_px, o_fee - open_fee)
             realized += price_pnl - open_fee - close_fee
-            gross += price_pnl; rtv += take; remaining -= take
+            gross += price_pnl
+            rtv += take
+            remaining -= take
 
         if remaining > self._flat_eps:
             open_book.append((ts, remaining, price, fee * remaining * qinv))
@@ -778,8 +783,12 @@ class PureMakerAgent(FinanceSimulationAgent):
                     ts_set.add(ts)
         return sorted(ts_set)
 
-    def _book_pnl_series(self, validator: str, book_id: int, now: int) -> list[float]:
-        timestamps = self._global_rt_timestamps(validator, now)
+    def _book_pnl_series(
+        self, validator: str, book_id: int, now: int,
+        timestamps: list[int] | None = None,
+    ) -> list[float]:
+        if timestamps is None:
+            timestamps = self._global_rt_timestamps(validator, now)
         if not timestamps:
             return []
         cutoff = now - self.kappa_rt_history_ns
@@ -814,16 +823,13 @@ class PureMakerAgent(FinanceSimulationAgent):
             return (mean_r - tau) / ((upm3 + reg) ** (1.0 / 3.0))
         return 0.0
 
-    def _kappa_history_ready(self, validator: str, now: int) -> bool:
-        ts = self._global_rt_timestamps(validator, now)
-        return len(ts) >= 2 and ts[-1] - ts[0] >= self.kappa_min_lookback_ns
-
     def _refresh_book_kappa(self, validator: str, book_id: int, now: int) -> None:
         st = self._bstate(validator, book_id)
-        if not self._kappa_history_ready(validator, now):
+        timestamps = self._global_rt_timestamps(validator, now)
+        if len(timestamps) < 2 or timestamps[-1] - timestamps[0] < self.kappa_min_lookback_ns:
             st.kappa3 = None
             return
-        st.kappa3 = self._kappa3_raw(self._book_pnl_series(validator, book_id, now))
+        st.kappa3 = self._kappa3_raw(self._book_pnl_series(validator, book_id, now, timestamps))
 
     def _rt_count(self, st: _BookState, now: int) -> int:
         cutoff = now - self.rt_window_ns
