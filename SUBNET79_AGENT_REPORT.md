@@ -290,6 +290,53 @@ adverse selection — hence the bleed.
 3. Mirror **66**'s **per-book routing with small inventory** as the overall architecture.
 4. Everywhere: keep **activity = 1.0**, bound every loss, and **maximize per-book kappa median**.
 
+### 2.5 Top churn-taker archetype (UID 136) — surviving trends via MAD, not skill
+
+A third, distinct taker archetype, captured from the then-#1 miner (`136_trades_top_taker_down_trends.csv`,
+4,793 trades). It is **not** a rebate harvester (that is 126) and **not** a directional accumulator:
+
+| Metric | Value | Reading |
+|---|---|---|
+| Role | **100% TAKER** | crosses to enter on every fill |
+| Rebate fills | **~7%** (PAYS ~1.7bps fee on the other 93%) | works on **fee** books, not rebate |
+| Books | **128** | full breadth |
+| Same-side run | **1** (flips every trade) | strictly two-sided, never stacks |
+| Peak abs inventory | **~0.73 lot median, ~1.6 p90** | **NEAR-FLAT** — never accumulates a bag |
+| Hold / gap | **~30–100s hold, ~10s gaps** | moderate churn, not 126's ~1s scalp |
+| Books' price drift | **−35bps median (80/119 down)** | operates in **trending** books |
+| Directional win-rate | **~11% per-RT; sell-fraction 0.50 even on down-books** | **~ZERO directional skill** |
+
+**The decisive finding:** 136 was #1 (kappa ~0.105) with ~zero directional edge and a net fee bill. He
+wins on a **POSITIVE-SKEW** profile (cut losers tiny, let the occasional move RUN) whose many near-zero,
+fee-paying round-trips build a **large per-book MAD**. Because kappa-3 cubes the downside, a large MAD
+normalizes each loss small, so the cubic penalty barely bites. He **rents kappa via VOLUME + BREADTH +
+activity=1.0**, not via predicting price.
+
+**Why a churn-TAKER beats a MAKER on a trending book** (the regime where our makers bled): the maker
+posts a passive bid that the falling price runs through (adverse selection) and accumulates an underwater
+long that must eventually be dumped — a concentrated, cubic-killing loss. The churn-taker **crosses to
+enter** (a controlled, self-timed entry, not adversely selected) and stays **near-flat** (run=1, no bag),
+so it eats only small bounded losses that MAD cushions. It pays the spread+fee to *buy* that safety — and
+in a fee-heavy regime, **paying fees to manufacture MAD out-scores idling**.
+
+**Routing implication — add a second axis.** §2.1–§2.4 routed by FEE regime alone (rebate→taker,
+spread→maker, none→idle). 136 proves that is incomplete: a spread-rich book can be *calm* (maker-good,
+mean-reverting) or *trending* (maker-death), and a fee book can be *volatile* (churn-harvestable) or
+*dead-calm* (idle). The real routing matrix is **FEE × VOLATILITY**:
+
+| | Deep rebate | Spread ≥ 2·fee | Fee, thin |
+|---|---|---|---|
+| **Calm** | rebate-scalp (126) | MAKER (109/149) | idle |
+| **Volatile / trending** | rebate-scalp | **CHURN-TAKER (136)** | **CHURN-TAKER** or idle |
+
+**How to beat 136** (→ `ApexTakerAgent`): keep his structure — high volume, 128-book breadth, near-flat
+run=1, activity=1.0 → large MAD — and ADD the per-trade edge he lacks: (1) a directional **LEAN** (EMA
+drift, else microprice) vs his coin-flip → higher mean_r; (2) **REBATE** harvest (126) where the rebate
+covers the spread → unconditional +EV he ignores; (3) a **positive-skew exit** (tiny stop, ride winners
+to a drift-reversal / trailing give-back). Crucially, do **not** idle fee books in a fee-heavy regime
+(starves the MAD that carries the score) — churn the volatile ones permissively and let the asymmetric
+exit, **not** a per-trade cost hurdle, carry the EV.
+
 ---
 
 ## 3. What We Tried (and What Each Taught Us)
