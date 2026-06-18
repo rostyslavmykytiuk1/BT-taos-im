@@ -1,42 +1,51 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """
-PureMakerAgent — fee-gated two-sided maker for Subnet 79 (τaos).
+PureMakerAgent — breakeven-gated two-sided maker for Subnet 79 (τaos).
+
+A maker SPECIALIST: the goal is to be TOP when the market is maker-favorable (rich spreads, mean
+reversion), NOT to be all-weather robust — AdaptiveRouter covers trending regimes. So it quotes
+aggressively (symmetric 10/10 economics, breakeven coverage, high frequency) and carries ONE
+reactive safety net (_regime_backoff) that idles a book only once making there is clearly losing.
 
 Design derived from analysis of UID 165 (top maker) trade history vs validator scoring:
 
-FEE GATE — the primary book selector:
-  Only quote on books where maker_fee_rate < MAKER_FEE_GATE_BPS (12bps).
-  From 165's data: fee <5bps → 94% of books profitable (spread_net ~16bps after fees);
-  5-10bps → 56% profitable; 10-12bps → borderline positive with proper stop-losses;
-  >12bps → 22% profitable and generally adverse-selection dominated → idle.
-  At 12bps gate: 107/128 books qualify; the 21 idle books fall inside the 37.5%
-  inactive-book tolerance (48 books free), so they drop from the median for free.
+BREAKEVEN GATE — the primary book selector:
+  Quote on any book where capturing the spread covers both maker-fee legs: spread >= 2*maker_fee*mid
+  (evaluated live per book). A wide-spread book is +EV even at a high fee — the top makers (109/165)
+  make on ALL 128 books, 165 even at +11.5bps — and a thin-spread book loses even at a low fee. This
+  replaces the old fixed 12bps fee ceiling, which idled profitable wide-spread high-fee books and
+  quoted unprofitable thin-spread ones. Sub-breakeven books idle and fall inside the 37.5%
+  inactive-book tolerance (48 free), dropping from the median at no cost.
 
-PROFIT MECHANISM on fee-gated books:
-  Low maker-fee books carry heavy aggressive (taker) flow → price oscillates (mean-reverts).
-  Posting passive quotes captures the oscillation: fill on the way down, exit on the bounce.
-  Typical hold window: 2-5 min. Profit comes from directional noise, not pure spread capture.
+PROFIT MECHANISM on active books:
+  Posting passive quotes captures the spread plus the mean-reversion of heavy aggressive flow:
+  fill on the way down, exit on the bounce. Hold window typically ~1-2 min. Per-RT win target >=
+  the stop (positive skew) so the cubed downside in kappa-3 stays small.
 
 KEY FAILURE MODE OF UID 165 (and what we fix):
   165 ran no stop-loss. Books 116 (−106 PnL) and 106 (−48 PnL) held positions 500-660s as
-  the price trended without reverting. Simulation: adding SL@15bps to 165's trades raises
-  total PnL from +152 to +649. A per-book loss-streak cooldown further prevents re-entering
-  after consecutive losses on a consistently trending book.
+  the price trended without reverting. We add a stop (EXIT_STOP_LOSS_BPS) plus a reduce-price
+  floor, a per-book loss-streak cooldown, and the reactive regime backoff below.
 
 MECHANICS (per book, each step):
-  prune/kappa → risk-guard → gate-check (fee gate + streak cooldown) → managed exit →
-  activity backstop → quote desired → reconcile orders.
+  prune/kappa → managed exit → risk guard → breakeven gate → activity backstop → quote → reconcile.
+  Managed exit runs FIRST so a stop is never blocked by the risk guard's early return.
 
-  * Flat  → quote both sides inside the touch, fee-gated, streak-gated, RT-budget gated.
-  * Hold  → ONLY the reducing side (never average into the bag). Price walks from profit
-            target toward touch with lot age so it keeps filling.
-  * Managed exit → IOC-cut if price underwater >= EXIT_STOP_BPS OR lot age >= EXIT_GIVEUP_S.
-            Slippage capped. Both paths bound each realized loss.
-  * Loss streak → last STREAK_LIMIT RTs all negative → pause entries on that book for
-            STREAK_COOLDOWN_S. Prevents the 116/106 disaster pattern.
-  * Activity → only on books that pass the fee gate. Idle books (fee >= gate) get zero
-            trades and drop into the 37.5% inactive bucket naturally.
+  * Managed exit → IOC-cut the held side if underwater >= EXIT_STOP_LOSS_BPS OR lot age >=
+            EXIT_GIVEUP_S. Slippage capped. Bounds each realized loss.
+  * Breakeven gate → take new inventory only where spread >= 2*maker_fee*mid. Held inventory on a
+            book that drops sub-breakeven is still managed DOWN (never force-dumped), so a volatile
+            spread can't churn the book active/idle.
+  * Flat  → quote both sides inside the touch, gated by breakeven + cooldowns + RT/volume budget.
+  * Hold  → ONLY the reducing side (never average into the bag). Reduce price walks from the profit
+            target toward the touch with lot age, FLOORED at the stop so a reduce fill never loses
+            more than the IOC cut would.
+  * Loss streak → STREAK_LIMIT consecutive losing RTs → pause new entries for STREAK_COOLDOWN_S.
+  * Regime backoff → window net realized PnL < -(BACKOFF_NET_WINS × avg win) → idle the book for
+            BACKOFF_COOLDOWN_S, then re-test. The maker specialist's safety net; free in good regimes.
+  * Activity → an active book always closes >= 1 RT per window (activity factor 1.0), even while
+            backed off; only sub-breakeven books go idle -> kappa=None -> dropped (37.5% free budget).
   * FIFO inventory mirrors the validator's _match_trade_fifo exactly (oldest-lot matching).
 """
 
@@ -73,33 +82,53 @@ MAX_INVENTORY_LOTS = 2.0           # tighter than DualEdge: maker runs smaller b
 MAX_INVENTORY_EQUITY_FRAC = 0.10
 RISK_TRIM_SLIPPAGE_BPS = 6.0
 
-# ---- fee gate: only make on books where the exchange actually pays close to breakeven ----
-# Simulation on UID 165 trades: fee<12bps covers 107/128 books (21 idle ≤ 48-book free limit).
-# 0-5bps → 94% books profitable; 5-10bps → 56%; 10-12bps → marginal but rescued by stop-loss.
-MAKER_FEE_GATE_BPS = 12.0
+# ---- breakeven gate: make on any book where the spread covers both maker-fee legs ----
+# Condition is spread >= 2*maker_fee*mid (computed live per book), NOT a fixed fee ceiling: a fixed
+# ceiling wrongly idled profitable wide-spread high-fee books (UID 165 makes at +11.5bps) and quoted
+# unprofitable thin-spread low-fee ones. The tight stop + reduce floor keep high-fee books kappa-safe.
 
 # ---- profit target ----
-# Lower than KappaMaker's 13bps: mean-reverting books fill faster at 8bps target.
+# Target >= stop on purpose. Kappa-3 CUBES the downside, so the realized win must be at least as
+# big as the realized loss (non-negative skew) — the opposite of the old PnL-tuned 8bps target,
+# which sat BELOW the 15bps stop and guaranteed losses bigger than wins (negative skew that drags
+# kappa even at a high win rate). Now matches the symmetric 10/10 economics proven on the router.
 # Adaptive floor: max(TP_BPS_BASE, TP_FEE_MULT × maker_fee_bps) ensures two-leg cost coverage.
-TP_BPS_BASE = 8.0
+TP_BPS_BASE = 10.0
 TP_FEE_MULT = 2.0                  # floor = 2× maker_fee (covers both legs + small buffer)
 QUOTE_EXPIRY_S = 12.0
 
 # ---- managed exit: cut fast and small ----
-# mean-reverting books bounce within ~2 min; if they haven't by EXIT_GIVEUP_S, they're trending.
-# KappaMaker used 20s giveup — far too short. 165's data: 120s giveup nearly optimal (+712 PnL).
+# mean-reverting books bounce within ~1-1.5 min; if they haven't by EXIT_GIVEUP_S, they're trending.
+# Stop tightened 15->10bps: the dominant kappa lever is keeping every realized loss small (the cube),
+# and the reduce-price FLOOR (=stop) plus this stop cap the loss tail. Smaller stop also = positive
+# skew vs the ~10bps target. Size (clip + inventory cap), not a wide stop, absorbs noise.
 EXIT_WALK_START_S = 30.0           # start walking reduce toward touch after 30s
-EXIT_GIVEUP_S = 120.0              # IOC-cut at 2min (vs KappaMaker's 20s)
-EXIT_STOP_LOSS_BPS = 15.0          # immediate IOC-cut: price moved 15bps against oldest lot
-EXIT_CUT_SLIPPAGE_BPS = 5.0
-REENTRY_COOLDOWN_S = 120.0         # after any managed cut: 2min pause
+EXIT_GIVEUP_S = 90.0              # IOC-cut at 1.5min if still not reverted (was 120)
+EXIT_STOP_LOSS_BPS = 10.0          # immediate IOC-cut: price moved 10bps against oldest lot (was 15)
+EXIT_CUT_SLIPPAGE_BPS = 4.0        # tighter cut concession (was 5)
+REENTRY_COOLDOWN_S = 30.0         # after a managed cut, re-quote fast (was 120): kappa rewards
+                                   # FREQUENCY (coverage^2/3); long pauses starve a book's RT count.
 
 # ---- per-book loss-streak cooldown ----
 # If the last STREAK_LIMIT round-trips are ALL losses on a book: halt new entries for
 # STREAK_COOLDOWN_S. Prevents the "keep re-entering on a trending book" disaster.
 # (165's book 116: 98.9% loss rate → -106 total PnL. This gate would have paused after 4 RTs.)
 STREAK_LIMIT = 4
-STREAK_COOLDOWN_S = 600.0
+STREAK_COOLDOWN_S = 300.0           # shorter toxic-book pause (was 600) so the book rejoins coverage
+
+# ---- reactive regime backoff: the maker specialist's safety net ----
+# PureMaker MAXIMIZES maker-favorable regimes (rich spreads, mean reversion) — that is its job, not
+# all-weather robustness (AdaptiveRouter handles trends). But the validator scores continuously, so
+# when a book's regime turns hostile, making must not keep bleeding. Signal = recent NET realized PnL
+# relative to the book's OWN average win (scale-free across price levels, and — unlike a win-rate
+# trigger — it catches a SKEW bleed: a 65%-win book whose few losses are 2-3x the wins still nets
+# negative). When the net loss over the window exceeds BACKOFF_NET_WINS average wins, idle the book
+# and re-test. FREE in good regimes: a net-positive book never trips it, so it never costs upside.
+BACKOFF_WINDOW_S = 600.0           # rolling window of realized RTs used to judge the book's regime
+BACKOFF_MIN_RTS = 6                # need >= this many RTs in the window before judging (enough signal)
+BACKOFF_NET_WINS = 3.0             # back off when window net PnL < -(this × avg win); conservative so
+                                   # good-regime upside is never sacrificed to a false positive
+BACKOFF_COOLDOWN_S = 180.0         # idle the book this long, then re-test the regime
 
 # ---- activity (active books only) ----
 RT_WINDOW_S = 570.0
@@ -165,6 +194,8 @@ class PureMakerAgent(FinanceSimulationAgent):
         self.exit_giveup_ns = int(giveup_s * _NS)
         self.reentry_cooldown_ns = int(REENTRY_COOLDOWN_S * _NS)
         self.streak_cooldown_ns = int(STREAK_COOLDOWN_S * _NS)
+        self.backoff_window_ns = int(BACKOFF_WINDOW_S * _NS)
+        self.backoff_cooldown_ns = int(BACKOFF_COOLDOWN_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
 
@@ -176,7 +207,7 @@ class PureMakerAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"[PureMaker uid={self.uid}] PURE-MAKER lot={QUOTE_LOT} exch_min={self.exch_min} "
-            f"fee_gate<{MAKER_FEE_GATE_BPS}bps "
+            f"gate=breakeven(spread>=2*fee) "
             f"tp_base={self.tp_bps_base:.1f}bps tp_floor={TP_FEE_MULT}×fee "
             f"exit_walk={EXIT_WALK_START_S:.0f}-{giveup_s:.1f}s stop={EXIT_STOP_LOSS_BPS}bps "
             f"reentry={REENTRY_COOLDOWN_S}s "
@@ -249,46 +280,63 @@ class PureMakerAgent(FinanceSimulationAgent):
 
         net = self._net_qty(inv)
         maker_fee = self._maker_fee_rate(account)
+        active = self._is_active_book(maker_fee, best_ask - best_bid, mid)
+        holding = abs(net) >= self.exch_min
 
-        # 1) RISK GUARD — always runs regardless of fee gate; drains breached inventory.
-        if self._risk_trim(response, validator, book_id, account, inv, net, mid, vol_dp):
-            return
-
-        # 2) FEE GATE — books where maker_fee >= gate are idle: no quotes, no backstop.
-        #    Drain any inventory left from a prior active window, then stop.
-        #    These 21 books fall inside the 37.5% inactive tolerance and drop from the median.
-        if not self._is_active_book(maker_fee):
-            if abs(net) >= self.exch_min:
-                if not self._managed_exit(response, book_id, account, inv, net,
-                                          best_bid, best_ask, vol_dp, now):
-                    self._activity_close(response, validator, book_id, book, account,
-                                         inv, net, best_bid, best_ask, vol_dp)
-            return
-
-        # 3) MANAGED EXIT — IOC-cut if oldest lot is too old or too far underwater.
+        # 1) MANAGED EXIT — stop-loss / giveup takes priority over everything, including the
+        #    inventory risk guard. Without this ordering, _risk_trim's early-return blocks
+        #    _managed_exit on any over-cap book, leaving underwater positions with no stop-loss
+        #    protection until the trim IOC finally fills (which can take hundreds of steps on
+        #    illiquid books, letting losses grow to hundreds of bps).
         if self._managed_exit(response, book_id, account, inv, net, best_bid, best_ask, vol_dp, now):
             st.last_cut_ns = now
             return
 
-        # 4) ACTIVITY BACKSTOP — guarantee one round-trip per 570s window.
-        if self._activity_elapsed(st, now) >= self.activity_deadline_ns:
+        # 2) RISK GUARD — drains breached inventory after stop-loss has had its turn.
+        if self._risk_trim(response, validator, book_id, account, inv, net, mid, vol_dp):
+            return
+
+        # 3) BREAKEVEN GATE — a sub-breakeven book takes NO new inventory. If flat, it idles here.
+        #    If it still HOLDS inventory from a prior active window (or the spread just tightened
+        #    under it), fall through and MANAGE it down gracefully (managed exit + passive reduce)
+        #    rather than force-dumping via IOC. Because the spread is volatile, the gate is checked
+        #    only for new entries — never to trigger a forced exit — so a book hovering at breakeven
+        #    cannot churn IOC losses by flickering active/idle.
+        if not active and not holding:
+            return
+
+        # 4) ACTIVITY BACKSTOP — guarantee >=1 RT per window so the activity factor stays 1.0 on
+        #    EVERY book we make on, INCLUDING a backed-off one. The backoff only blocks voluntary
+        #    quoting (the bleed); this floor keeps activity alive. It cannot starve the factor: the
+        #    backoff (180s) is shorter than this deadline (480s), which is shorter than the
+        #    validator's 600s decay grace. Only sub-breakeven books (active=False) are allowed to go
+        #    idle -> kappa=None -> dropped from the median for free (the 37.5% inactive budget).
+        if active and self._activity_elapsed(st, now) >= self.activity_deadline_ns:
             if self._activity_close(response, validator, book_id, book, account,
                                     inv, net, best_bid, best_ask, vol_dp):
                 return
 
-        # 5) DESIRED QUOTES — two-sided when flat, reduce-only when holding.
+        # 5) DESIRED QUOTES — reduce-only when holding (any book); two-sided entry only when the
+        #    breakeven gate in _entry_ok clears. A held sub-breakeven book reduces but never re-opens.
         desired = self._desired_quotes(
             validator, book_id, book, account, inv, net,
             best_bid, best_ask, mid, maker_fee, volume_cap, now,
         )
         self._reconcile_quotes(response, account, book_id, desired)
 
-    # ------------------------------------------------------------------ fee gate
-    def _is_active_book(self, maker_fee: float | None) -> bool:
-        """True when the book's maker fee qualifies for active quoting."""
+    # ------------------------------------------------------------------ breakeven gate
+    def _is_active_book(self, maker_fee: float | None, spread: float, mid: float) -> bool:
+        """BREAKEVEN gate: quote only when capturing the spread covers both maker-fee legs,
+        i.e. spread >= 2*maker_fee*mid. A wide-spread book is +EV even at a HIGH fee (UID 165
+        makes profitably at +11.5bps); a thin-spread book loses even at a LOW fee. This replaces a
+        fixed fee ceiling, which wrongly idled profitable wide-spread high-fee books and quoted
+        unprofitable thin-spread low-fee ones. The tight stop + reduce floor bound the per-trade
+        loss, so high-fee (potentially adverse) books stay kappa-safe."""
         if maker_fee is None:
-            return True   # unknown fee → optimistic; entry gate in _entry_ok handles the rest
-        return maker_fee < MAKER_FEE_GATE_BPS / 1e4   # compare in native rate units to avoid fp drift
+            return True   # unknown fee → optimistic; other entry gates still apply
+        if mid <= 0:
+            return False
+        return spread >= 2.0 * maker_fee * mid
 
     # ------------------------------------------------------------------ risk guard
     def _risk_trim(
@@ -332,8 +380,8 @@ class PureMakerAgent(FinanceSimulationAgent):
         self, response, book_id: int, account, inv: _Inv, net: float,
         best_bid: float, best_ask: float, vol_dp: int, now: int,
     ) -> bool:
-        """IOC-cut the whole reducible side when the oldest lot is too old or too underwater.
-        EXIT_GIVEUP_S = 120s gives the mean-reversion window before giving up on a bounce."""
+        """IOC-cut the whole reducible side when the oldest lot is too old (EXIT_GIVEUP_S, the
+        mean-reversion window) or too underwater (EXIT_STOP_LOSS_BPS). Either path bounds the loss."""
         if abs(net) < self.exch_min:
             return False
         slip = EXIT_CUT_SLIPPAGE_BPS / 1e4
@@ -454,7 +502,7 @@ class PureMakerAgent(FinanceSimulationAgent):
         elif st.last_cut_ns > 0 and now - st.last_cut_ns < self.reentry_cooldown_ns:
             # Post-cut cooldown: don't re-enter immediately after a managed exit.
             pass
-        elif self._entry_ok(maker_fee, validator, book_id, st, now, volume_cap):
+        elif self._entry_ok(maker_fee, spread, mid, validator, book_id, st, now, volume_cap):
             # Flat and all gates clear → quote both sides.
             q = round(self.quote_lot, vdp)
             if q >= self.exch_min and free_base >= q:
@@ -492,11 +540,11 @@ class PureMakerAgent(FinanceSimulationAgent):
         return (age_ns - self.exit_walk_start_ns) / span if span > 0 else 1.0
 
     def _entry_ok(
-        self, maker_fee: float | None, validator: str, book_id: int,
+        self, maker_fee: float | None, spread: float, mid: float, validator: str, book_id: int,
         st: _BookState, now: int, volume_cap: float,
     ) -> bool:
-        """Gate new inventory: fee gate, streak cooldown, RT budget, volume cap."""
-        if not self._is_active_book(maker_fee):
+        """Gate new inventory: breakeven gate, streak cooldown, RT budget, volume cap."""
+        if not self._is_active_book(maker_fee, spread, mid):
             return False
         if now < st.streak_cooldown_until_ns:
             return False
@@ -632,7 +680,8 @@ class PureMakerAgent(FinanceSimulationAgent):
             rt_window_n = self._rt_count(st, ts)
             st.last_rt_ns = ts
             self._record_rt_close(validator, book_id, ts, realized)
-            self._update_streak(st, realized, ts)
+            self._update_streak(st, book_id, realized, ts)
+            self._regime_backoff(st, book_id, ts)
             self._log_rt(
                 validator=validator, book_id=book_id, ts=ts,
                 hold_s=(ts - matched_ts) / _NS if matched_ts else None,
@@ -642,17 +691,42 @@ class PureMakerAgent(FinanceSimulationAgent):
                 rt_window_n=rt_window_n, st=st,
             )
 
-    def _update_streak(self, st: _BookState, realized_pnl: float, now_ns: int) -> None:
+    def _update_streak(self, st: _BookState, book_id: int, realized_pnl: float, now_ns: int) -> None:
         """Track consecutive losses. After STREAK_LIMIT in a row, pause new entries."""
         if realized_pnl > 0:
             st.loss_streak = 0
         else:
             st.loss_streak += 1
             if st.loss_streak >= STREAK_LIMIT:
-                st.streak_cooldown_until_ns = now_ns + self.streak_cooldown_ns
+                st.streak_cooldown_until_ns = max(
+                    st.streak_cooldown_until_ns, now_ns + self.streak_cooldown_ns)
                 bt.logging.info(
-                    f"[PureMaker uid={self.uid}] STREAK-COOLDOWN book=? "
+                    f"[PureMaker uid={self.uid}] STREAK-COOLDOWN book={book_id} "
                     f"streak={st.loss_streak} cooldown={STREAK_COOLDOWN_S}s"
+                )
+
+    def _regime_backoff(self, st: _BookState, book_id: int, now_ns: int) -> None:
+        """Idle a book whose recent making has turned net-LOSING. Trigger = window net realized PnL
+        below -(BACKOFF_NET_WINS × avg win), i.e. the losses have eaten more than a few wins' worth.
+        Net-based (not win-rate) so it catches a skew bleed (few but oversized losses). Sets the same
+        cooldown the streak guard uses, so _entry_ok blocks new entries while existing inventory is
+        still managed down. Re-tests after the cooldown. A net-positive book never trips this."""
+        cutoff = now_ns - self.backoff_window_ns
+        recent = [p for t, p in st.rt_events if t >= cutoff]
+        if len(recent) < BACKOFF_MIN_RTS:
+            return
+        net = sum(recent)
+        if net >= 0:
+            return
+        wins = [p for p in recent if p > 0]
+        avg_win = (sum(wins) / len(wins)) if wins else 0.0
+        if net < -BACKOFF_NET_WINS * avg_win:   # avg_win==0 (all losses) => any net<0 trips it
+            until = now_ns + self.backoff_cooldown_ns
+            if until > st.streak_cooldown_until_ns:
+                st.streak_cooldown_until_ns = until
+                bt.logging.info(
+                    f"[PureMaker uid={self.uid}] REGIME-BACKOFF book={book_id} "
+                    f"net={net:+.3f} avg_win={avg_win:.3f} n={len(recent)} idle={BACKOFF_COOLDOWN_S:.0f}s"
                 )
 
     def _match_fifo(

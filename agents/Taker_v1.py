@@ -808,5 +808,11 @@ class TakerScalperAgent(FinanceSimulationAgent):
                 pos.qty = round(min(pos.qty, held), vol_dp)
 
 
+# The miner loader resolves --agent.name via getattr(module, name), so expose this class under the
+# file's own name. AGENT_NAME=Taker_v1 then loads THIS (v1) implementation, distinct from the class
+# of the same name in agents/TakerScalperAgent.py.
+Taker_v1 = TakerScalperAgent
+
+
 if __name__ == "__main__":
     launch(TakerScalperAgent)
