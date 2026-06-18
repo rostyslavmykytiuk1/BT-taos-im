@@ -56,9 +56,9 @@ _NS = 1_000_000_000
 
 # ===================================================================== sizing
 EXCHANGE_MIN_ORDER_SIZE = 0.25
-CLIP = 0.26                        # just above the 0.25 min so a fee-shaved BASE buy (the exchange
-                                   # takes the fee out of base) still leaves >= 0.25 held => always
-                                   # closeable. Small + fixed so no single position can be a large loss.
+CLIP = 0.30                        # ~matches 136's 0.30 clip (more volume => bigger MAD cushion); still well
+                                   # above the 0.25 min so a fee-shaved BASE buy (the exchange takes the fee
+                                   # out of base) still leaves >= 0.25 held => always closeable, bounded loss.
 
 # ===================================================================== inventory bounds
 MAX_INVENTORY_LOTS = 1.5           # hard per-book cap (near-flat, tighter than 136's ~1.6 p90). We open
@@ -72,7 +72,8 @@ REBATE_ENTER_BPS = 1.0             # required net rebate edge (2*rebate - spread
 RB_TP_BPS = 2.5                    # small gross target; the rebate is the real profit
 RB_SL_BPS = 4.0                    # gross stop; net stays positive while 2*rebate >= RB_SL (re-checked live)
 RB_MIN_HOLD_S = 1.0
-RB_MAX_HOLD_S = 5.0
+RB_MAX_HOLD_S = 60.0               # if the rebate scalp doesn't hit TP fast, HOLD for the revert instead of
+                                   # dumping at 5s — those 579 five-second dumps were our biggest drag vs 136
 RB_REOPEN_GAP_S = 1.5              # fast recycle between scalps (rebate is +EV, churn it)
 
 # ===================================================================== CHURN lane (136's volume, leaned)
@@ -80,29 +81,32 @@ RB_REOPEN_GAP_S = 1.5              # fast recycle between scalps (rebate is +EV,
 # an asymmetric POSITIVE-SKEW exit. We do NOT demand the move clear the fee up front (that starves MAD,
 # the rebate-maximalist's failure mode); the tiny-stop / ride-winner skew + the occasional big move pays
 # for the many small fee-paying losers, exactly as 136 does — but our lean beats his coin-flip.
-VOL_FLOOR_BPS = 1.5               # per-step mid-volatility EMA must exceed this to churn a fee book;
-                                  # dead-calm books (no move to harvest, no rebate) idle -> kappa=None.
-CH_MAX_SPREAD_BPS = 3.0          # do NOT churn wider-spread fee books: a TAKER crosses the FULL spread
-                                 #   every round-trip, so a wide spread is a guaranteed loss the weak lean
-                                 #   cannot out-run (this was the death-by-abs-stop bleed). 136 traded
-                                 #   tight-spread books; only churn books that are cheap to cross.
+VOL_FLOOR_BPS = 1.0               # per-step mid-volatility EMA must exceed this to churn a book. 136 is on
+                                  # ALL 128 books; keep a LOW floor so anything with motion churns and only
+                                  # dead-calm books (no revert to harvest) fall through to the activity backstop.
+CH_MAX_SPREAD_BPS = 15.0         # 136 trades WIDE-spread books (~16bps median, 8-19) — he does NOT avoid
+                                 #   them. The wide spread is the entry COST he recovers by HOLDING for the
+                                 #   mean-reversion (below), not by finding cheap crossings. Match his range.
 CH_DRIFT_DIR_BPS = 2.0           # |EMA drift| above this => lean WITH the trend; else lean by microprice
-CH_SL_BPS = 5.0                  # TIGHT stop on the ADVERSE MID-MOVE — cut the many small losers fast
-CH_TRAIL_BPS = 4.0               # once armed, exit if the move gives back this much from its peak
-CH_ARM_BPS = 6.0                 # trailing arms only after the move clears the round-trip cost (~spread +
-                                 #   2*fee); below this a "winner" would trail out net-negative — let it breathe
-CH_MIN_HOLD_S = 2.0
-CH_MAX_HOLD_S = 90.0             # ride a move up to ~1.5min (136 holds 30-100s)
-CH_REOPEN_GAP_S = 3.0            # ~matches 136's ~10s cycle once hold time is added
+CH_SL_BPS = 15.0                 # WIDE move-stop: hold THROUGH the spread+noise so the position can revert.
+                                 #   Cutting at 5bps locked in losers that would have come back; this ~matches
+                                 #   136's typical loss size and the catastrophic tail is bounded by ABS_STOP.
+CH_TRAIL_BPS = 8.0               # once armed, exit if the move gives back this much from its peak (ride far)
+CH_ARM_BPS = 10.0                # arm trailing only after a real reversion move develops — let winners run
+CH_MIN_HOLD_S = 12.0             # do NOT exit in the dead <12s zone (~11% positive); give it time to revert.
+                                 #   Our OWN 40-90s holds are already positive-mean; that is where to live.
+CH_MAX_HOLD_S = 120.0           # ride the reversion up to 2min (136 holds 30-100s and lets the 90s+ tail run)
+CH_REOPEN_GAP_S = 5.0           # re-enter ~5s after going flat => ~always in market like 136 (100% time-in)
 PENDING_OPEN_TIMEOUT_S = 8.0    # after submitting an open, treat the book as in-flight until the fill is
                                 #   seen (or this elapses). A market fill can lag past the reopen gap, and
                                 #   re-opening in that window stacks a second clip -> the over-cap churn we saw.
 
 # ===================================================================== shared exit / circuit breaker
-ABS_STOP_BPS = 8.0               # ABSOLUTE per-position circuit breaker: cut ANY position underwater
-                                 # beyond this regardless of lane. The hard cubic-loss backstop.
+ABS_STOP_BPS = 30.0              # ABSOLUTE per-position circuit breaker (adverse MID move): only the
+                                 # CATASTROPHIC tail — wide enough to let 136-style reversions happen, but
+                                 # bounds a single position from riding a sustained trend. Small clip caps $.
 EXIT_SLIPPAGE_BPS = 4.0          # max concession on a normal forced IOC exit (bounds slippage)
-EXIT_SLIPPAGE_ABS_BPS = 14.0     # WIDER concession on the absolute-stop cut so it clears in ONE step on
+EXIT_SLIPPAGE_ABS_BPS = 20.0     # WIDER concession on the absolute-stop cut so it clears in ONE step on
                                  # a gap (guaranteed same-step exit; a few extra bps beats staying exposed)
 
 # ===================================================================== toxic-book backoff (skew-safe)

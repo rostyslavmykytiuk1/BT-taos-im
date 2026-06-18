@@ -8,20 +8,14 @@ Rules:
   1. Activity 1.0: every book completes >=1 RT per ~570s window. No forced RT during the
      first ~570s after agent/sim start; after that, force once ~500s have passed since the
      last RT (agent start time stands in for last RT until the first close).
-  2. Bounded inventory: a book is FLAT or HELD. When flat we open one directional clip; when
-     held we may STACK more same-side clips (mirroring the top takers, who average into a
-     rebate-paid edge) up to a hard inventory cap — but only while the rebate cushion is DEEP,
-     so a stacked stop stays net-positive. We never fight our own side and never bag a big
-     position; close always flattens the whole book at once.
+  2. One position per book: a book is FLAT xor HELD; the open path runs only when flat.
   3. Wait for full fill: after any submit, st.pending_ns blocks the book until a fill
      resolves it (timeout-recovered).
   4. Kappa-3 + PnL: open a directional scalp only when the kappa gate clears; close on
      TP / SL / max-hold.
 
 Per book each tick:
-  reconcile -> pending? wait
-            : held? close(TP/SL/time) else stack(bounded, deep-rebate)
-            : open(kappa | activity | idle)
+  reconcile -> pending? wait : held? close(TP/SL/time) : open(kappa | activity | idle)
 
 RT logging -> main validator only.
 """
@@ -60,16 +54,7 @@ MAX_GROSS_SL_BPS = 4.0
 SHORT_LEVERAGE = 1.0
 
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 30                        # max profit RTs per book per window
-
-# ---- bounded inventory building (mirror the top takers: average into a rebate-paid edge) ----
-# Inventory is capped HARD so a stacked stop-loss stays small and rebate-cushioned; we only add
-# while the rebate is DEEP (stricter than a single open), so building never turns -EV. This is
-# the defining behaviour of the strongest takers: they hold ~1-2 lots and press a paid side
-# rather than strictly flipping one clip at a time.
-MAX_INVENTORY_LOTS = 3             # hard cap on stacked same-side clips before we must flatten
-PYRAMID_MIN_GAP_S = 1.0           # min gap between successive same-side adds on a book
-PYRAMID_MIN_REBATE_BPS = 4.0       # only stack while the per-leg rebate is at least this deep
+RT_MAX = 28                        # max profit RTs per book per window
 
 # Force a taker RT once this long since the last RT (kept under RT_WINDOW_S).
 ACTIVITY_DEADLINE_S = 500.0
@@ -108,7 +93,6 @@ class _Position:
 @dataclass
 class _BookState:
     last_rt_ns: int = 0
-    last_add_ns: int = 0                # last same-side inventory add (pyramid gap throttle)
     pending_ns: int = 0                 # last order submit ts (rule 3: wait for the fill)
     pending_kind: str = ""              # tag of the in-flight open (for RT logging)
     rt_events: list[tuple[int, float]] = field(default_factory=list)
@@ -154,23 +138,22 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
         self.kappa_min_rebate_rate = -KAPPA_MIN_REBATE_BPS / 1e4
-        self.pyramid_min_gap_ns = int(PYRAMID_MIN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
-        self.pyramid_min_rebate_rate = -PYRAMID_MIN_REBATE_BPS / 1e4
-        self.max_inventory_base = MAX_INVENTORY_LOTS * LOT   # refreshed in _sync_order_size
 
         self.positions: dict[str, dict[int, _Position]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
         self._sim_id: dict[str, str] = {}
         self._rt_log: dict[tuple[str, int], _RtLogCtx] = {}
         self._step_ts_ns: int = 0
-        self._agent_start_ns: int = 0     # activity clock before the first RT (per sim)
+        self._agent_start_ns: dict[str, int] = {}   # per-VALIDATOR activity clock before the first RT.
+        #   Each validator runs its OWN simulation with its OWN clock (sim-times differ by hours). A single
+        #   global field gets frozen to whichever validator was processed last at boot, so on validators
+        #   whose clock is behind it, (now - start) goes negative => permanent grace => the force never fires.
         self._active_validator: str | None = None
 
         bt.logging.info(
             f"[TakerScalper uid={self.uid}] PURE-TAKER lot={LOT} exch_min={self.exch_min} "
             f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={MAX_GROSS_SL_BPS}bps "
             f"reopen_gap={MIN_REOPEN_GAP_S}s rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
-            f"inv_cap={MAX_INVENTORY_LOTS}lot pyramid(gap={PYRAMID_MIN_GAP_S}s,rebate>={PYRAMID_MIN_REBATE_BPS}bps) "
             f"activity_deadline={activity_s:.0f}s "
             f"kappa_gate(est>={KAPPA_EST_PNL_FLOOR},rebate>={KAPPA_MIN_REBATE_BPS}bps) "
             f"rt_log={MAIN_VALIDATOR[:8]}"
@@ -181,8 +164,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._active_validator = state.dendrite.hotkey
         # Reset before super().update() so the new sim's first fills don't hit stale state.
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
-        if self._agent_start_ns == 0 and self._step_ts_ns > 0:
-            self._agent_start_ns = self._step_ts_ns
+        if self._agent_start_ns.get(self._active_validator, 0) == 0 and self._step_ts_ns > 0:
+            self._agent_start_ns[self._active_validator] = self._step_ts_ns
         super().update(state)
 
     def _ensure_simulation(self, validator: str, simulation_id: str | None) -> None:
@@ -192,7 +175,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._book_positions(validator).clear()
         self.books_state.pop(validator, None)
         self._rt_log = {k: v for k, v in self._rt_log.items() if k[0] != validator}
-        self._agent_start_ns = 0
+        self._agent_start_ns.pop(validator, None)   # reset only THIS validator's activity clock
         if simulation_id is not None:
             self._sim_id[validator] = simulation_id
         else:
@@ -233,8 +216,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._reconcile_position(account, pos, vol_dp)
 
         st = self._bstate(validator, book_id)
-        if self._agent_start_ns == 0 and now > 0:
-            self._agent_start_ns = now
+        if self._agent_start_ns.get(validator, 0) == 0 and now > 0:
+            self._agent_start_ns[validator] = now
         if self._prune_rt_events(st, now):
             self._refresh_book_kappa(validator, book_id, now)
 
@@ -244,10 +227,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         st.pending_ns = 0   # presumed filled / lost; re-derive from the position
 
         if abs(pos.qty) >= self._flat_eps:
-            # Held: flatten on TP/SL/time; if not exiting, consider a bounded same-side add
-            # (only ever ONE order per book per step, so the add waits for the next tick).
-            if not self._close(response, validator, book_id, book, account, pos, vol_dp, now):
-                self._maybe_add(response, validator, book_id, book, account, pos, volume_cap, now)
+            self._close(response, validator, book_id, book, account, pos, vol_dp, now)
         else:
             self._open(response, validator, book_id, book, account, volume_cap, now)
 
@@ -282,7 +262,6 @@ class TakerScalperAgent(FinanceSimulationAgent):
         lot = round(max(LOT, 10 ** (-volume_decimals)), volume_decimals)
         self.min_order_size = lot
         self._min_qty = lot / 2
-        self.max_inventory_base = MAX_INVENTORY_LOTS * lot
         self.exch_min = max(EXCHANGE_MIN_ORDER_SIZE, 10 ** (-volume_decimals))
         # Half a volume tick: below this a holding is rounding noise, treat as flat.
         self._flat_eps = 0.5 * 10 ** (-volume_decimals)
@@ -306,19 +285,21 @@ class TakerScalperAgent(FinanceSimulationAgent):
     def _side_label(direction: OrderDirection) -> str:
         return "long" if direction == OrderDirection.BUY else "short"
 
-    def _activity_force_due(self, st: _BookState, now: int) -> bool:
+    def _activity_force_due(self, validator: str, st: _BookState, now: int) -> bool:
         """True when a forced RT is needed to stay inside the activity window.
 
-        Before the first RT on a book, agent/sim start time is the reference clock.
+        Before the first RT on a book, THIS validator's start time is the reference
+        clock (per-validator — each validator runs its own sim with its own clock).
         The first full RT_WINDOW after start is grace — kappa can trade without a
         backstop. After that, force once ACTIVITY_DEADLINE has passed since the
         last RT (or since start if still none).
         """
-        if self._agent_start_ns <= 0:
+        start = self._agent_start_ns.get(validator, 0)
+        if start <= 0:
             return False
-        if st.last_rt_ns == 0 and (now - self._agent_start_ns) < self.rt_window_ns:
+        if st.last_rt_ns == 0 and (now - start) < self.rt_window_ns:
             return False
-        ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns
+        ref = st.last_rt_ns if st.last_rt_ns > 0 else start
         return (now - ref) >= self.activity_deadline_ns
 
     def _record_trade_volume(
@@ -652,34 +633,51 @@ class TakerScalperAgent(FinanceSimulationAgent):
             return
 
         # Activity backstop: guarantee >=1 RT per book per window.
-        if self._activity_force_due(st, now):
+        if self._activity_force_due(validator, st, now):
             tag = "taker_force" if paid else "activity"
-            self._try_open(response, validator, book_id, book, account, direction, now, tag)
+            opened = self._try_open(response, validator, book_id, book, account, direction, now, tag)
+            if self._rt_log_enabled(validator):   # DIAGNOSTIC: trace why activity can fall < 1.0
+                ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns.get(validator, 0)
+                gap_s = (now - ref) / _NS
+                if opened:
+                    bt.logging.info(
+                        f"[TakerScalper uid={self.uid}] ACT-FORCE-OPEN book={book_id} "
+                        f"gap={gap_s:.0f}s dir={'BUY' if direction == OrderDirection.BUY else 'SELL'}")
+                else:
+                    if direction == OrderDirection.BUY:
+                        ask_px = book.asks[0].price if book.asks else 0.0
+                        free_q = account.quote_balance.free if account.quote_balance else 0.0
+                        why = (f"BUY need={self.min_order_size * ask_px:.2f} free_quote={free_q:.2f}"
+                               if ask_px > 0 else "BUY no_ask")
+                    else:
+                        why = "SELL no_bid"
+                    bt.logging.warning(
+                        f"[TakerScalper uid={self.uid}] ACT-FORCE-SKIP book={book_id} gap={gap_s:.0f}s {why}")
 
     def _try_open(
         self, response, validator: str, book_id: int, book, account,
         direction: OrderDirection, now: int, tag: str, *, prune_vol: bool = False,
-    ) -> None:
-        """Submit one taker lot and stash RT context on success."""
+    ) -> bool:
+        """Submit one taker lot and stash RT context on success. Returns whether it opened."""
         if not self._taker_open(response, validator, book_id, account, book, direction, tag):
-            return
+            return False
         st = self._bstate(validator, book_id)
         if prune_vol:
             self._prune_vol_log(st, now)
         self._stash_rt_open(validator, book_id, book, account, direction, now, tag)
+        return True
 
     def _close(
         self, response, validator: str, book_id: int, book, account, pos: _Position,
         vol_dp: int, now: int,
-    ) -> bool:
-        """Held position: taker flatten on TP / SL / max-hold, after the min hold.
-        Returns True iff a flatten was submitted (so the caller skips adding inventory)."""
+    ) -> None:
+        """Held position: taker flatten on TP / SL / max-hold, after the min hold."""
         mid = self._mid(book)
         if mid is None or mid <= 0 or pos.avg <= 0:
-            return False
+            return
         hold_ns = (now - pos.entry_ts) if pos.entry_ts else 0
         if hold_ns < self.min_hold_ns:
-            return False
+            return
 
         bid = book.bids[0].price if book.bids else None
         ask = book.asks[0].price if book.asks else None
@@ -691,58 +689,13 @@ class TakerScalperAgent(FinanceSimulationAgent):
         elif hold_ns >= self.max_hold_ns:
             reason = "time"
         else:
-            return False
+            return
 
         if self._rt_log_enabled(validator):
             ctx = self._rt_log.get((validator, book_id))
             if ctx is not None:
                 ctx.close_reason = reason
         self._close_position(response, validator, book_id, account, pos, vol_dp)
-        return True
-
-    def _maybe_add(
-        self, response, validator: str, book_id: int, book, account, pos: _Position,
-        volume_cap: float, now: int,
-    ) -> None:
-        """Bounded inventory build: stack ONE more same-side clip onto a held position, mirroring
-        the top takers who average into a rebate-paid edge instead of strictly one-in-one-out.
-
-        Strict guards keep this safe under the cubic Kappa downside:
-          * Only PRESS the side we already hold AND that the live microprice bias agrees with —
-            never average against ourselves.
-          * Hard inventory cap (MAX_INVENTORY_LOTS) so a stacked stop-loss stays small.
-          * Require a DEEP rebate (PYRAMID_MIN_REBATE_BPS, stricter than a single open) so the
-            larger position is always richly cushioned; when rebates thin we fall back to plain
-            one-clip scalping. This directly avoids the failure mode where a thinning rebate flips
-            stops net-negative — now amplified by size.
-          * Respect the per-book RT budget and the 24h turnover cap.
-        Opening fees blend into pos via _apply_fill; entry_ts is preserved (first clip), so the
-        max-hold clock still bounds how long the built position can live."""
-        if MAX_INVENTORY_LOTS <= 1:
-            return
-        rate = self._taker_fee_rate(account)
-        direction, mid = self._book_bias(book)
-        if mid is None or rate is None:
-            return
-        pos_dir = OrderDirection.BUY if pos.qty > 0 else OrderDirection.SELL
-        if direction != pos_dir:                       # only press our own side
-            return
-        if abs(pos.qty) + self.min_order_size > self.max_inventory_base + self._flat_eps:
-            return                                     # hard inventory cap
-        st = self._bstate(validator, book_id)
-        if st.last_add_ns and (now - st.last_add_ns) < self.pyramid_min_gap_ns:
-            return
-        est_pnl = self._estimate_rt_pnl(rate, book, self.min_order_size)
-        if not (
-            rate <= self.pyramid_min_rebate_rate       # deep rebate only
-            and est_pnl > 0.0
-            and est_pnl >= KAPPA_EST_PNL_FLOOR
-            and self._rt_count(st, now) < RT_MAX
-            and self._rolled_quote_volume(validator, book_id, now) < volume_cap
-        ):
-            return
-        if self._taker_open(response, validator, book_id, account, book, direction, "pyramid"):
-            st.last_add_ns = now
 
     # ------------------------------------------------------------------ market helpers
     @staticmethod

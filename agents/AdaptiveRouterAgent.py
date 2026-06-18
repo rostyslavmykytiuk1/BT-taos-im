@@ -276,7 +276,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         self.books_state: dict[str, dict[int, _BookState]] = {}
         self._rt_log: dict[tuple[str, int], _RtLogCtx] = {}
         self._sim_id: dict[str, str] = {}
-        self._step_ts_ns: int = 0
+        self._step_ts_ns: dict[str, int] = {}
         self._active_validator: str | None = None
 
         bt.logging.info(
@@ -292,7 +292,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
 
     # --------------------------------------------------------------- lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        self._step_ts_ns = int(state.timestamp)
+        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._active_validator = state.dendrite.hotkey
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
@@ -474,7 +474,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             fee = event.makerFee
         else:
             return
-        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns
+        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns.get(validator, 0)
         self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
         self._apply_fill(validator, event.bookId, is_buy, event.quantity, event.price, fee, ts_ns)
 
@@ -856,12 +856,12 @@ class _Mode:
                                 settlement=agent._loan_settlement(account))
         else:
             q = lot
-            if direction == OrderDirection.SELL:
-                if base_avail < q:
-                    return False
+            if direction == OrderDirection.SELL and base_avail >= q:
+                # preferred: directional short seed when we hold base
                 agent._submit_limit(response, book_id, OrderDirection.SELL, q,
                                     round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
             else:
+                # fallback (or direction==BUY): seed a long — only needs quote balance
                 if quote_avail < q * best_ask * (1.0 + slip):
                     return False
                 agent._submit_limit(response, book_id, OrderDirection.BUY, q,

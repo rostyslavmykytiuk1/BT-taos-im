@@ -82,18 +82,20 @@ MAX_INVENTORY_LOTS = 2.0           # tighter than DualEdge: maker runs smaller b
 MAX_INVENTORY_EQUITY_FRAC = 0.10
 RISK_TRIM_SLIPPAGE_BPS = 6.0
 
-# ---- breakeven gate: make on any book where the spread covers both maker-fee legs ----
-# Condition is spread >= 2*maker_fee*mid (computed live per book), NOT a fixed fee ceiling: a fixed
-# ceiling wrongly idled profitable wide-spread high-fee books (UID 165 makes at +11.5bps) and quoted
-# unprofitable thin-spread low-fee ones. The tight stop + reduce floor keep high-fee books kappa-safe.
+# ---- breakeven gate + fee ceiling ----
+# Primary: spread >= 2*maker_fee*mid (computed live per book).
+# Secondary: maker_fee_bps < MAKER_FEE_GATE_BPS — hard cap on very high-fee books. High-fee books
+# have slower liquidity; in downtrend they tend to need bigger price moves to exit, causing more
+# slow trades and giveup cuts. 12bps matches v1's proven ceiling.
+MAKER_FEE_GATE_BPS = 12.0
 
 # ---- profit target ----
-# Target >= stop on purpose. Kappa-3 CUBES the downside, so the realized win must be at least as
-# big as the realized loss (non-negative skew) — the opposite of the old PnL-tuned 8bps target,
-# which sat BELOW the 15bps stop and guaranteed losses bigger than wins (negative skew that drags
-# kappa even at a high win rate). Now matches the symmetric 10/10 economics proven on the router.
+# Target below stop on purpose: 8bps TP vs 10bps stop = positive skew. Kappa-3 cubes the downside
+# so a smaller realized loss than realized win is better than symmetric. 8bps exits faster → more
+# quick trades (<5s, ~97% win rate in 14h analysis) vs 10bps which waited for bigger bounces that
+# didn't come in downtrend (23% slow trades, 45% win rate).
 # Adaptive floor: max(TP_BPS_BASE, TP_FEE_MULT × maker_fee_bps) ensures two-leg cost coverage.
-TP_BPS_BASE = 10.0
+TP_BPS_BASE = 8.0
 TP_FEE_MULT = 2.0                  # floor = 2× maker_fee (covers both legs + small buffer)
 QUOTE_EXPIRY_S = 12.0
 
@@ -106,8 +108,8 @@ EXIT_WALK_START_S = 30.0           # start walking reduce toward touch after 30s
 EXIT_GIVEUP_S = 90.0              # IOC-cut at 1.5min if still not reverted (was 120)
 EXIT_STOP_LOSS_BPS = 10.0          # immediate IOC-cut: price moved 10bps against oldest lot (was 15)
 EXIT_CUT_SLIPPAGE_BPS = 4.0        # tighter cut concession (was 5)
-REENTRY_COOLDOWN_S = 30.0         # after a managed cut, re-quote fast (was 120): kappa rewards
-                                   # FREQUENCY (coverage^2/3); long pauses starve a book's RT count.
+REENTRY_COOLDOWN_S = 120.0        # after a managed cut, wait before re-quoting: prevents
+                                   # re-entering a trending book and taking another stop immediately.
 
 # ---- per-book loss-streak cooldown ----
 # If the last STREAK_LIMIT round-trips are ALL losses on a book: halt new entries for
@@ -202,12 +204,12 @@ class PureMakerAgent(FinanceSimulationAgent):
         self.inv: dict[str, dict[int, _Inv]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
         self._sim_id: dict[str, str] = {}
-        self._step_ts_ns: int = 0
+        self._step_ts_ns: dict[str, int] = {}
         self._active_validator: str | None = None
 
         bt.logging.info(
             f"[PureMaker uid={self.uid}] PURE-MAKER lot={QUOTE_LOT} exch_min={self.exch_min} "
-            f"gate=breakeven(spread>=2*fee) "
+            f"gate=breakeven(spread>=2*fee)+fee_cap={MAKER_FEE_GATE_BPS}bps "
             f"tp_base={self.tp_bps_base:.1f}bps tp_floor={TP_FEE_MULT}×fee "
             f"exit_walk={EXIT_WALK_START_S:.0f}-{giveup_s:.1f}s stop={EXIT_STOP_LOSS_BPS}bps "
             f"reentry={REENTRY_COOLDOWN_S}s "
@@ -218,7 +220,7 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        self._step_ts_ns = int(state.timestamp)
+        self._step_ts_ns[self._active_validator] = int(state.timestamp)
         self._active_validator = state.dendrite.hotkey
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
@@ -326,15 +328,15 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ breakeven gate
     def _is_active_book(self, maker_fee: float | None, spread: float, mid: float) -> bool:
-        """BREAKEVEN gate: quote only when capturing the spread covers both maker-fee legs,
-        i.e. spread >= 2*maker_fee*mid. A wide-spread book is +EV even at a HIGH fee (UID 165
-        makes profitably at +11.5bps); a thin-spread book loses even at a LOW fee. This replaces a
-        fixed fee ceiling, which wrongly idled profitable wide-spread high-fee books and quoted
-        unprofitable thin-spread low-fee ones. The tight stop + reduce floor bound the per-trade
-        loss, so high-fee (potentially adverse) books stay kappa-safe."""
+        """BREAKEVEN gate + fee ceiling: quote only when spread covers both maker-fee legs AND
+        the maker fee is below MAKER_FEE_GATE_BPS. High-fee books pass the breakeven gate when
+        the spread is momentarily wide, but in downtrend they hold longer before reverting → slow
+        trades → giveup cuts. The fee ceiling blocks them before they bleed."""
         if maker_fee is None:
             return True   # unknown fee → optimistic; other entry gates still apply
         if mid <= 0:
+            return False
+        if maker_fee * 1e4 >= MAKER_FEE_GATE_BPS:
             return False
         return spread >= 2.0 * maker_fee * mid
 
@@ -446,12 +448,9 @@ class PureMakerAgent(FinanceSimulationAgent):
             self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True, post_only=False,
                                settlement=self._loan_settlement(account))
         else:
-            # Flat: seed a tiny long so the next step can close it for round-trip volume.
-            q = lot
-            if quote_avail < q * best_ask * (1.0 + slip):
-                return False
-            px = round(best_ask * (1.0 + slip), self._price_decimals)
-            self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True, post_only=False)
+            # Flat: don't force a trade. Seeding a long in a downtrend locks in a stop-loss cut.
+            # Let passive quotes get hit naturally instead.
+            return False
         bt.logging.info(f"[PureMaker uid={self.uid}] ACTIVITY-CLOSE book={book_id} net={net:+.4f}")
         return True
 
@@ -600,7 +599,7 @@ class PureMakerAgent(FinanceSimulationAgent):
             fee = event.makerFee
         else:
             return
-        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns
+        ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns.get(validator, 0)
         self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
         self._apply_fill(validator, event.bookId, is_buy, event.quantity, event.price, fee, ts_ns)
 
@@ -650,8 +649,8 @@ class PureMakerAgent(FinanceSimulationAgent):
     def _book_equity(self, account, mid: float) -> float:
         q = account.quote_balance
         b = account.base_balance
-        quote = (q.free + (q.reserved or 0.0)) if q else 0.0
-        base = (b.free + (b.reserved or 0.0)) if b else 0.0
+        quote = ((q.free or 0.0) + (q.reserved or 0.0)) if q else 0.0
+        base = ((b.free or 0.0) + (b.reserved or 0.0)) if b else 0.0
         return quote + base * mid
 
     def _record_trade_volume(self, validator, book_id, qty, price, ts_ns) -> None:
