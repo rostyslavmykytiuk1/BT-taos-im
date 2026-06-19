@@ -159,17 +159,17 @@ TK_PYRAMID_MIN_REBATE_BPS = 3.0    # only stack while rebate is comfortably abov
 MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
-MK_EXIT_WALK_START_S = 25.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 50.0            # ... walk to the touch by here, then IOC-cut. Shorter than 75s:
-                                   # a position that has not reverted in ~50s is trending, and the
-                                   # longer it is held the bigger the eventual cut (downside cube).
+MK_EXIT_WALK_START_S = 30.0        # rest reduce at full target below this lot age ...
+MK_EXIT_GIVEUP_S = 90.0            # ... walk to the touch by here, then IOC-cut. Matches PureMaker:
+                                   # most maker books mean-revert within 60-90s; cutting at 50s was
+                                   # too eager, triggering cuts on positions that would have filled.
 MK_STOP_LOSS_BPS = 10.0            # TRIGGER: IOC-cut a held lot underwater beyond this. Kept at 10
                                    # (not tighter) because normal oscillation hits 5-8bps on low-fee
                                    # maker books and a 6bps stop churns; the tighter lever is size.
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
-MK_REENTRY_COOLDOWN_S = 20.0       # after a forced cut, brief pause then re-quote. Top makers run
-                                   # ~25 round-trips/book/10min — long cooldowns starve kappa coverage.
+MK_REENTRY_COOLDOWN_S = 120.0      # after a forced cut, pause before re-quoting. Matches PureMaker:
+                                   # 20s was too short — a trending book gets re-entered and cut again.
 MK_LOSS_STREAK_LIMIT = 5           # consecutive losing cuts on a book before a pause (toxic book)
 MK_STREAK_COOLDOWN_S = 240.0       # length of that pause; shorter so a book rejoins coverage sooner
 MK_MAX_INVENTORY_LOTS = 2.0        # hard per-book lot cap (was 3). Smaller max position => smaller
@@ -1043,7 +1043,7 @@ class _MakerMode(_Mode):
             if st.mk_loss_streak >= MK_LOSS_STREAK_LIMIT:
                 st.mk_streak_cooldown_until_ns = now + agent.mk_streak_cooldown_ns
             return
-        if agent._activity_due(st, now):
+        if agent._activity_due(st, now) and abs(net) >= agent.exch_min:
             agent._stash_open(validator, book_id, st, self.name, "activity",
                               "long" if net >= 0 else "short")
             if self._activity_close(agent, response, book_id, account, inv, net,
@@ -1097,7 +1097,7 @@ class _MakerMode(_Mode):
             underwater = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
             if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
                 return False
-            q = round(min(agent.clip, agent._long_qty(inv), agent._avail(account.base_balance)), vol_dp)
+            q = round(min(agent._long_qty(inv), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
                 return False
             self._tag_close(agent, validator, book_id, "cut")
@@ -1111,7 +1111,7 @@ class _MakerMode(_Mode):
                 return False
             buy_px = best_ask * (1.0 + slip)
             q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else agent._short_qty(inv)
-            q = round(min(agent.clip, agent._short_qty(inv), q_max), vol_dp)
+            q = round(min(agent._short_qty(inv), q_max), vol_dp)
             if q < agent.exch_min:
                 return False
             self._tag_close(agent, validator, book_id, "cut")

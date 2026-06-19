@@ -400,6 +400,12 @@ class TakerScalperAgent(FinanceSimulationAgent):
 
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
         cutoff = now - self.kappa_rt_history_ns
+        # rt_events is appended in non-decreasing ts order (closes are monotonic per
+        # validator sim; reset on new sim), so if the oldest entry is still inside the
+        # window nothing can be pruned — skip the O(n) rebuild. Behaviour-identical:
+        # the list and the returned flag are exactly what the comprehension produced.
+        if not st.rt_events or st.rt_events[0][0] >= cutoff:
+            return False
         before = len(st.rt_events)
         st.rt_events = [(t, p) for t, p in st.rt_events if t >= cutoff]
         return len(st.rt_events) != before
