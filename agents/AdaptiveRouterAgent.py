@@ -119,6 +119,8 @@ MAX_IDLE_BOOKS = 40                # allow up to 40 idle books before promoting 
                                    # maker via fallback; 40 is comfortably below the 48-book
                                    # validator budget (37.5% × 128) where kappa=None is free
 ROUTE_MIN_DWELL_S = 180.0          # min time in a mode before switching (only switches when flat)
+EMERGENCY_TAKER_EXIT_BPS = -1.0    # bypass dwell guard when taker rebate goes clearly negative
+EMERGENCY_MAKER_EXIT_BPS = -3.0    # bypass dwell guard when maker edge goes deeply negative
 
 # ---- per-book reactive PnL backoff ----
 # If a book's net realized PnL over the last PNL_BACKOFF_WINDOW_S is negative (and at least
@@ -168,6 +170,10 @@ MK_STOP_LOSS_BPS = 10.0            # TRIGGER: IOC-cut a held lot underwater beyo
                                    # maker books and a 6bps stop churns; the tighter lever is size.
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
+MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
+MK_IOC_CROSS_BPS = 18.0            # wide-limit cross after 4+ misses (not a market order —
+                                   # uncapped market orders risk gap fills; 18bps crosses almost
+                                   # any normal spread while still bounding catastrophic fills)
 MK_REENTRY_COOLDOWN_S = 120.0      # after a forced cut, pause before re-quoting. Matches PureMaker:
                                    # 20s was too short — a trending book gets re-entered and cut again.
 MK_LOSS_STREAK_LIMIT = 5           # consecutive losing cuts on a book before a pause (toxic book)
@@ -217,6 +223,9 @@ class _BookState:
     last_add_ns: int = 0               # last same-side taker add (pyramid throttle)
     # per-book PnL backoff
     pnl_backoff_until_ns: int = 0      # if > now: book is in PnL-backoff, held at IDLE
+    # managed-exit IOC escalation
+    mk_ioc_miss_count: int = 0         # consecutive exit IOCs with no position reduction
+    mk_ioc_prev_net: float = 0.0       # abs(net) when the last exit IOC was submitted
 
 
 @dataclass
@@ -397,18 +406,34 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                 else:
                     want = self._route(st, account, best_bid, best_ask, mid,
                                        fallback_maker=fallback_maker)
-                if want != st.mode and (now - st.mode_since_ns) >= self.route_min_dwell_ns:
-                    if account.orders:
-                        self._cancel_all(response, account, book_id)
-                        return
-                    bt.logging.info(
-                        f"[AdaptiveRouter uid={self.uid}] ROUTE {st.mode}->{want} book={book_id} "
-                        f"taker_fee={self._taker_fee_rate(account)} maker_fee={self._maker_fee_rate(account)} "
-                        f"spread_bps={(best_ask - best_bid) / mid * 1e4:.1f}"
-                        + (" [adverse-sel]" if pnl_bad else "")
-                        + (" [fallback-maker]" if fallback_maker else "")
+                if want != st.mode:
+                    # Emergency flip: bypass the 180s dwell guard when the current mode has
+                    # turned clearly net-negative (not just borderline — only on obviously-wrong-
+                    # side regimes). Only reachable when flat, so no active position is disrupted.
+                    taker_fee_em = self._taker_fee_rate(account)
+                    rebate_em = (-taker_fee_em * 1e4) if taker_fee_em is not None else -1e9
+                    maker_fee_em = self._maker_fee_rate(account)
+                    mk_edge_em = (
+                        (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 0.0
+                    ) - ((maker_fee_em * 1e4) if maker_fee_em is not None else 1e9)
+                    emergency = (
+                        (st.mode == MODE_TAKER and rebate_em < EMERGENCY_TAKER_EXIT_BPS) or
+                        (st.mode == MODE_MAKER and mk_edge_em < EMERGENCY_MAKER_EXIT_BPS)
                     )
-                    st.mode, st.mode_since_ns = want, now
+                    if emergency or (now - st.mode_since_ns) >= self.route_min_dwell_ns:
+                        if account.orders:
+                            self._cancel_all(response, account, book_id)
+                            return
+                        bt.logging.info(
+                            f"[AdaptiveRouter uid={self.uid}] "
+                            f"{'EMERGENCY-FLIP' if emergency else 'ROUTE'} "
+                            f"{st.mode}->{want} book={book_id} "
+                            f"taker_fee={self._taker_fee_rate(account)} maker_fee={self._maker_fee_rate(account)} "
+                            f"spread_bps={(best_ask - best_bid) / mid * 1e4:.1f}"
+                            + (" [adverse-sel]" if pnl_bad else "")
+                            + (" [fallback-maker]" if fallback_maker else "")
+                        )
+                        st.mode, st.mode_since_ns = want, now
 
         mode = self._modes.get(st.mode) or self._modes[self.default_mode]
         mode.step(self, response, validator, book_id, book, account, st, inv, net,
@@ -647,6 +672,13 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         if not self._kappa_history_ready(validator, now):
             st.kappa3 = None
+            ts_list = self._global_rt_timestamps(validator, now)
+            if ts_list:
+                bt.logging.debug(
+                    f"[AdaptiveRouter uid={self.uid}] kappa_not_ready book={book_id} "
+                    f"ts_count={len(ts_list)} span_s={(ts_list[-1]-ts_list[0])/1e9:.0f} "
+                    f"need_span_s={self.kappa_min_lookback_ns/1e9:.0f}"
+                )
             return
         st.kappa3 = self._kappa3_raw(self._book_pnl_series(validator, book_id, now))
 
@@ -1031,7 +1063,8 @@ class _MakerMode(_Mode):
 
     def step(self, agent, response, validator, book_id, book, account, st, inv, net,
              best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
-        if (self._risk_trim(agent, response, book_id, account, inv, net, mid, vol_dp)
+        if (self._risk_trim(agent, response, book_id, account, inv, net, mid,
+                            vol_dp, best_bid, best_ask)
                 or self._managed_exit(agent, response, validator, book_id, account, inv, net,
                                       best_bid, best_ask, vol_dp, now)):
             # Count forced IOC cuts (risk-trim or managed-exit) as losses until proven otherwise;
@@ -1053,7 +1086,8 @@ class _MakerMode(_Mode):
                                        best_bid, best_ask, mid, volume_cap, now, vol_dp, st)
         self._reconcile(agent, response, account, book_id, desired)
 
-    def _risk_trim(self, agent, response, book_id, account, inv, net, mid, vol_dp) -> bool:
+    def _risk_trim(self, agent, response, book_id, account, inv, net, mid,
+                   vol_dp, best_bid: float = 0.0, best_ask: float = 0.0) -> bool:
         qty = abs(net)
         if qty < agent._flat_eps:
             return False
@@ -1068,10 +1102,12 @@ class _MakerMode(_Mode):
             return False
         slip = MK_IOC_SLIPPAGE_BPS / 1e4
         pdp = agent._price_decimals
+        ref_bid = best_bid if best_bid > 0 else mid
+        ref_ask = best_ask if best_ask > 0 else mid
         if net > 0:
             trim = round(min(trim, agent._avail(account.base_balance)), vol_dp)
         else:
-            buy_px = mid * (1.0 + slip)
+            buy_px = ref_ask * (1.0 + slip)
             q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else trim
             trim = round(min(trim, q_max), vol_dp)
         if trim < agent.exch_min:
@@ -1079,27 +1115,57 @@ class _MakerMode(_Mode):
         agent._cancel_all(response, account, book_id)
         if net > 0:
             agent._submit_limit(response, book_id, OrderDirection.SELL, trim,
-                                round(mid * (1.0 - slip), pdp), ioc=True, post_only=False)
+                                round(ref_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
         else:
             agent._submit_limit(response, book_id, OrderDirection.BUY, trim,
-                                round(mid * (1.0 + slip), pdp), ioc=True, post_only=False,
+                                round(ref_ask * (1.0 + slip), pdp), ioc=True, post_only=False,
                                 settlement=agent._loan_settlement(account))
         return True
 
     def _managed_exit(self, agent, response, validator, book_id, account, inv, net,
                       best_bid, best_ask, vol_dp, now) -> bool:
         if abs(net) < agent.exch_min:
+            # Clear escalation state so a new position doesn't inherit a stale miss count.
+            st = agent._bstate(validator, book_id)
+            st.mk_ioc_miss_count = 0
+            st.mk_ioc_prev_net = 0.0
             return False
-        slip = MK_IOC_SLIPPAGE_BPS / 1e4
+        st = agent._bstate(validator, book_id)
+        # Escalate slippage on consecutive IOC misses: a fixed-price IOC that doesn't cross on a
+        # fast/wide book re-fires every step while the position bleeds. Escalating 4→8→18bps caps
+        # the loss window. Final stage is a wide limit (not market) to bound catastrophic gap fills.
+        if st.mk_ioc_prev_net > 0:
+            if abs(net) >= st.mk_ioc_prev_net - agent._flat_eps:
+                st.mk_ioc_miss_count += 1
+            else:
+                st.mk_ioc_miss_count = 0
+                st.mk_ioc_prev_net = 0.0
+        if st.mk_ioc_miss_count >= 4:
+            slip = MK_IOC_CROSS_BPS / 1e4
+        elif st.mk_ioc_miss_count >= 2:
+            slip = MK_IOC_ESCALATE_BPS / 1e4
+        else:
+            slip = MK_IOC_SLIPPAGE_BPS / 1e4
         pdp = agent._price_decimals
         if net > 0:
             ts, _, px0, _ = inv.longs[0]
             underwater = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
             if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
+                st.mk_ioc_miss_count = 0
+                st.mk_ioc_prev_net = 0.0
                 return False
             q = round(min(agent._long_qty(inv), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
+                st.mk_ioc_miss_count = 0
+                st.mk_ioc_prev_net = 0.0
                 return False
+            st.mk_ioc_prev_net = abs(net)
+            if st.mk_ioc_miss_count >= 2:
+                label = "IOC-CROSS" if st.mk_ioc_miss_count >= 4 else "IOC-ESCALATE"
+                bt.logging.info(
+                    f"[AdaptiveRouter uid={agent.uid}] {label} book={book_id} "
+                    f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
+                )
             self._tag_close(agent, validator, book_id, "cut")
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.SELL, q,
@@ -1108,12 +1174,23 @@ class _MakerMode(_Mode):
             ts, _, px0, _ = inv.shorts[0]
             underwater = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
             if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
+                st.mk_ioc_miss_count = 0
+                st.mk_ioc_prev_net = 0.0
                 return False
             buy_px = best_ask * (1.0 + slip)
             q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else agent._short_qty(inv)
             q = round(min(agent._short_qty(inv), q_max), vol_dp)
             if q < agent.exch_min:
+                st.mk_ioc_miss_count = 0
+                st.mk_ioc_prev_net = 0.0
                 return False
+            st.mk_ioc_prev_net = abs(net)
+            if st.mk_ioc_miss_count >= 2:
+                label = "IOC-CROSS" if st.mk_ioc_miss_count >= 4 else "IOC-ESCALATE"
+                bt.logging.info(
+                    f"[AdaptiveRouter uid={agent.uid}] {label} book={book_id} "
+                    f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
+                )
             self._tag_close(agent, validator, book_id, "cut")
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.BUY, q,

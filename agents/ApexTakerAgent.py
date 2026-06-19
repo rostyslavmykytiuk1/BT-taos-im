@@ -113,6 +113,11 @@ ABS_STOP_BPS = 20.0              # ABSOLUTE per-position circuit breaker (advers
                                  # tail. Tighter now that the regime gate keeps us OFF sustained trends, so a
                                  # ranging revert rarely needs more room; bounds gap-driven outliers. Clip caps $.
 EXIT_SLIPPAGE_BPS = 4.0          # max concession on a normal forced IOC exit (bounds slippage)
+EXIT_SLIPPAGE_ESCALATE_BPS = 8.0 # escalated concession after 2+ consecutive IOC-exit misses: a fixed-price
+                                 # IOC that doesn't cross on a fast/wide book re-fires every step while the
+                                 # position bleeds. Escalating caps the loss window (abs-stop already wide).
+EXIT_SLIPPAGE_CROSS_BPS = 18.0   # wide-limit cross after 4+ misses — NOT a market order (uncapped market
+                                 # fills risk catastrophic gaps); crosses almost any normal spread.
 EXIT_SLIPPAGE_ABS_BPS = 20.0     # WIDER concession on the absolute-stop cut so it clears in ONE step on
                                  # a gap (guaranteed same-step exit; a few extra bps beats staying exposed)
 
@@ -174,6 +179,9 @@ class _BookState:
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
     backoff_until_ns: int = 0
+    # forced-exit IOC escalation (anti-bleed)
+    exit_miss_count: int = 0          # consecutive IOC-exit misses on the current position
+    exit_prev_net: float = 0.0        # |net| at the last IOC-exit submit; detects a non-fill
 
 
 class ApexTakerAgent(FinanceSimulationAgent):
@@ -428,8 +436,12 @@ class ApexTakerAgent(FinanceSimulationAgent):
 
         reason = self._exit_reason(st, move_bps, held, net, taker_fee)
         if reason is None:
+            # No exit this step — the IOC-miss streak (if any) is broken; reset so the next exit
+            # starts fresh escalation instead of inheriting a stale (premature) count.
+            st.exit_miss_count = 0
+            st.exit_prev_net = 0.0
             return False
-        self._close_all(response, book_id, account, inv, net, best_bid, best_ask, vol_dp, reason)
+        self._close_all(response, book_id, account, st, inv, net, best_bid, best_ask, vol_dp, reason)
         return True
 
     def _exit_reason(self, st, move_bps, held, net, taker_fee):
@@ -461,23 +473,51 @@ class ApexTakerAgent(FinanceSimulationAgent):
             return "ch_time"
         return None
 
-    def _close_all(self, response, book_id, account, inv, net, best_bid, best_ask, vol_dp, reason) -> None:
-        slip = (EXIT_SLIPPAGE_ABS_BPS if reason == "abs" else EXIT_SLIPPAGE_BPS) / 1e4
+    def _close_all(self, response, book_id, account, st, inv, net, best_bid, best_ask, vol_dp, reason) -> None:
+        # Escalate the concession on consecutive IOC-exit misses: a fixed-price IOC that doesn't cross
+        # on a fast/wide book re-fires every step while the position bleeds. Escalating 4→8→18bps caps
+        # the loss window; the final stage is a wide LIMIT (not a market order) to bound gap fills. The
+        # "abs" circuit breaker already uses the wide concession, so escalation only lifts normal exits.
+        if st.exit_prev_net > 0:
+            if abs(net) >= st.exit_prev_net - self._flat_eps:
+                st.exit_miss_count += 1          # |net| didn't shrink => the last IOC missed
+            else:
+                st.exit_miss_count = 0           # partial/full fill => streak broken
+                st.exit_prev_net = 0.0
+        if reason == "abs":
+            slip = EXIT_SLIPPAGE_ABS_BPS / 1e4
+        elif st.exit_miss_count >= 4:
+            slip = EXIT_SLIPPAGE_CROSS_BPS / 1e4
+        elif st.exit_miss_count >= 2:
+            slip = EXIT_SLIPPAGE_ESCALATE_BPS / 1e4
+        else:
+            slip = EXIT_SLIPPAGE_BPS / 1e4
         if net > 0:
             q = round(min(self._long_qty(inv), self._avail(account.base_balance)), vol_dp)
             if q < self.exch_min:
+                # Non-submit step — break the miss streak so repeated sub-lot/low-balance steps
+                # don't inflate the count and make the next real exit cross wider than warranted.
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return
+            st.exit_prev_net = abs(net)
             px = round(best_bid * (1.0 - slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.SELL, q, px, ioc=True)
         else:
             q = round(self._short_qty(inv), vol_dp)
             if q < self.exch_min:
+                # Non-submit step — break the miss streak (see long branch).
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return
+            st.exit_prev_net = abs(net)
             px = round(best_ask * (1.0 + slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True,
                                settlement=self._loan_settlement(account))
         if self._rt_log_enabled(self._active_validator or ""):
-            bt.logging.info(f"[ApexTaker uid={self.uid}] CLOSE book={book_id} reason={reason} net={net:+.4f} q={q}")
+            esc = f" miss={st.exit_miss_count} slip={slip*1e4:.0f}bps" if st.exit_miss_count >= 2 else ""
+            bt.logging.info(
+                f"[ApexTaker uid={self.uid}] CLOSE book={book_id} reason={reason} net={net:+.4f} q={q}{esc}")
 
     # --------------------------------------------------------------- risk / activity
     def _risk_trim(self, response, book_id, account, inv, net, best_bid, best_ask, mid, vol_dp) -> bool:
@@ -581,6 +621,8 @@ class ApexTakerAgent(FinanceSimulationAgent):
                 st.lane = ""
                 st.entry_mid = 0.0
                 st.peak_move_bps = 0.0
+                st.exit_miss_count = 0                     # fresh IOC-escalation streak next position
+                st.exit_prev_net = 0.0
             self._log_rt(validator, book_id, ts,
                          hold_s=(ts - matched_ts) / _NS if matched_ts else None,
                          side=("buy" if is_buy else "sell"), exit_px=price, rtv=rtv,

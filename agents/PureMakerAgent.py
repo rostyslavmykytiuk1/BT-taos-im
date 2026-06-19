@@ -108,6 +108,12 @@ EXIT_WALK_START_S = 30.0           # start walking reduce toward touch after 30s
 EXIT_GIVEUP_S = 90.0              # IOC-cut at 1.5min if still not reverted (was 120)
 EXIT_STOP_LOSS_BPS = 10.0          # immediate IOC-cut: price moved 10bps against oldest lot (was 15)
 EXIT_CUT_SLIPPAGE_BPS = 4.0        # tighter cut concession (was 5)
+EXIT_CUT_ESCALATE_BPS = 8.0        # escalated concession after 2+ consecutive IOC-cut misses: a
+                                   # fixed-price IOC that doesn't cross on a fast/wide book re-fires
+                                   # at the same price every step while the position bleeds.
+EXIT_CUT_CROSS_BPS = 18.0          # wide-limit cross after 4+ misses — NOT a market order (uncapped
+                                   # market fills risk catastrophic gaps); 18bps crosses almost any
+                                   # normal spread while still bounding the realized slippage.
 REENTRY_COOLDOWN_S = 120.0        # after a managed cut, wait before re-quoting: prevents
                                    # re-entering a trending book and taking another stop immediately.
 
@@ -169,6 +175,9 @@ class _BookState:
     # per-book loss-streak cooldown
     loss_streak: int = 0                   # consecutive losing RT count
     no_entry_until_ns: int = 0             # no new entries before this timestamp
+    # managed-exit IOC escalation (anti-bleed)
+    exit_miss_count: int = 0               # consecutive IOC-cut misses on the current position
+    exit_prev_net: float = 0.0             # |net| at the last IOC-cut submit; detects a non-fill
 
 
 class PureMakerAgent(FinanceSimulationAgent):
@@ -290,7 +299,7 @@ class PureMakerAgent(FinanceSimulationAgent):
         #    _managed_exit on any over-cap book, leaving underwater positions with no stop-loss
         #    protection until the trim IOC finally fills (which can take hundreds of steps on
         #    illiquid books, letting losses grow to hundreds of bps).
-        if self._managed_exit(response, book_id, account, inv, net, best_bid, best_ask, vol_dp, now):
+        if self._managed_exit(response, book_id, account, inv, net, best_bid, best_ask, vol_dp, now, st):
             st.last_cut_ns = now
             return
 
@@ -386,23 +395,50 @@ class PureMakerAgent(FinanceSimulationAgent):
     # ------------------------------------------------------------------ managed exit
     def _managed_exit(
         self, response, book_id: int, account, inv: _Inv, net: float,
-        best_bid: float, best_ask: float, vol_dp: int, now: int,
+        best_bid: float, best_ask: float, vol_dp: int, now: int, st: _BookState,
     ) -> bool:
         """IOC-cut the whole reducible side when the oldest lot is too old (EXIT_GIVEUP_S, the
         mean-reversion window) or too underwater (EXIT_STOP_LOSS_BPS). Either path bounds the loss."""
         if abs(net) < self.exch_min:
+            # Flat — clear escalation state so the NEXT position starts a fresh miss streak.
+            st.exit_miss_count = 0
+            st.exit_prev_net = 0.0
             return False
-        slip = EXIT_CUT_SLIPPAGE_BPS / 1e4
+        # Escalate the concession on consecutive IOC-cut misses: a fixed-price IOC that doesn't cross
+        # on a fast/wide book re-fires every step while the position bleeds. Escalating 4→8→18bps caps
+        # the loss window; the final stage is a wide LIMIT (not a market order) to bound gap fills.
+        if st.exit_prev_net > 0:
+            if abs(net) >= st.exit_prev_net - self._flat_eps:
+                st.exit_miss_count += 1          # |net| didn't shrink => the last IOC missed
+            else:
+                st.exit_miss_count = 0           # partial/full fill => streak broken
+                st.exit_prev_net = 0.0
+        if st.exit_miss_count >= 4:
+            slip = EXIT_CUT_CROSS_BPS / 1e4
+        elif st.exit_miss_count >= 2:
+            slip = EXIT_CUT_ESCALATE_BPS / 1e4
+        else:
+            slip = EXIT_CUT_SLIPPAGE_BPS / 1e4
         if net > 0:
             ts, _, px0, _ = inv.longs[0]
             uw = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
             aged = now - ts >= self.exit_giveup_ns
             stopped = uw >= EXIT_STOP_LOSS_BPS
             if not (aged or stopped):
+                # Position recovered without a fill — break the miss streak so a later stop event
+                # starts fresh escalation instead of inheriting a stale (premature) count.
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return False
             q = round(min(self._long_qty(inv), self._avail(account.base_balance)), vol_dp)
             if q < self.exch_min:
+                # Non-submit step — break the miss streak. A step that sends no order must not be
+                # counted as an IOC miss, or repeated sub-lot/low-balance steps inflate the count
+                # and the next real cut crosses wider than warranted (and slip can't fix a qty gap).
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return False
+            st.exit_prev_net = abs(net)
             self._cancel_all(response, account, book_id)
             px = round(best_bid * (1.0 - slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.SELL, q, px, ioc=True, post_only=False)
@@ -412,17 +448,29 @@ class PureMakerAgent(FinanceSimulationAgent):
             aged = now - ts >= self.exit_giveup_ns
             stopped = uw >= EXIT_STOP_LOSS_BPS
             if not (aged or stopped):
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return False
             buy_px = best_ask * (1.0 + slip)
             q_max = self._avail(account.quote_balance) / buy_px if buy_px > 0 else self._short_qty(inv)
             q = round(min(self._short_qty(inv), q_max), vol_dp)
             if q < self.exch_min:
+                # Non-submit step — break the miss streak (see long branch).
+                st.exit_miss_count = 0
+                st.exit_prev_net = 0.0
                 return False
+            st.exit_prev_net = abs(net)
             self._cancel_all(response, account, book_id)
             px = round(best_ask * (1.0 + slip), self._price_decimals)
             self._submit_limit(response, book_id, OrderDirection.BUY, q, px, ioc=True, post_only=False,
                                settlement=self._loan_settlement(account))
         reason = "age+stop" if (aged and stopped) else ("age" if aged else "stop")
+        if st.exit_miss_count >= 2:
+            stage = "IOC-CROSS" if st.exit_miss_count >= 4 else "IOC-ESCALATE"
+            bt.logging.info(
+                f"[PureMaker uid={self.uid}] {stage} book={book_id} "
+                f"miss={st.exit_miss_count} slip={slip*1e4:.0f}bps"
+            )
         bt.logging.info(
             f"[PureMaker uid={self.uid}] MANAGED-EXIT book={book_id} reason={reason} "
             f"net={net:+.4f} q={q} @~{px} uw={uw:.1f}bps"
