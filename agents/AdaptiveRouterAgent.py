@@ -119,6 +119,16 @@ MAKER_FALLBACK_EDGE_BPS = 0.5      # when the idle guard fires, promote books wi
 MAX_IDLE_BOOKS = 40                # allow up to 40 idle books before promoting borderline ones to
                                    # maker via fallback; 40 is comfortably below the 48-book
                                    # validator budget (37.5% × 128) where kappa=None is free
+HARD_IDLE_BOOKS = 45               # HARD ceiling. The validator (reward.py) drops up to
+                                   # int(0.375*128)=48 idle (kappa=None) books for FREE; every idle
+                                   # book BEYOND that scores a literal 0.0 that both drags the kappa
+                                   # median AND feeds the left-tail outlier penalty. A traded book —
+                                   # even a small loser — normalizes well above 0.0 (norm range
+                                   # ±2.5, so 0.5≈neutral; only kappa≤-2.5 hits 0.0), so above this
+                                   # cap we FORCE the least-bad excess idle books back into trading.
+                                   # 45 (not 48) leaves a 3-book buffer for same-step idle overshoot
+                                   # and the lag between an internal mode flip and the book actually
+                                   # accumulating the ≥3 round-trips the validator needs to un-None it.
 ROUTE_MIN_DWELL_S = 180.0          # min time in a mode before switching (only switches when flat)
 EMERGENCY_TAKER_EXIT_BPS = -1.0    # bypass dwell guard when taker rebate goes clearly negative
 EMERGENCY_MAKER_EXIT_BPS = -3.0    # bypass dwell guard when maker edge goes deeply negative
@@ -277,6 +287,14 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             MODE_TAKER if MODE_TAKER in ALLOWED_MODES
             else MODE_MAKER if MODE_MAKER in ALLOWED_MODES else MODE_IDLE
         )
+        # Hard idle-cap overflow target: the active mode used to force least-bad excess idle books
+        # back into trading. Maker is preferred (least lossy on no-edge books — it earns spread when
+        # quotes fill and only crosses via the bounded activity backstop); falls back to taker, and
+        # is None when only idle is allowed (then the hard cap is a no-op).
+        self._overflow_mode = (
+            MODE_MAKER if MODE_MAKER in ALLOWED_MODES
+            else MODE_TAKER if MODE_TAKER in ALLOWED_MODES else None
+        )
         self._modes = {
             MODE_TAKER: _TakerMode(),
             MODE_MAKER: _MakerMode(),
@@ -340,6 +358,10 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             if bst.mode == MODE_IDLE
         )
         fallback_maker = idle_count > MAX_IDLE_BOOKS
+        # Hard idle cap: above HARD_IDLE_BOOKS idle, force the least-bad excess idle books back into
+        # trading (see _select_idle_overflow) so they score ~normalized(small loss) instead of the
+        # 0.0 the validator assigns to idle books beyond its 48-book free allowance.
+        force_trade = self._select_idle_overflow(validator, idle_count)
 
         for book_id in sorted(self.accounts.keys()):
             book = state.books.get(book_id)
@@ -348,16 +370,39 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                 continue
             try:
                 self._step_book(response, validator, book_id, book, account,
-                                vol_dp, volume_cap, now, fallback_maker)
+                                vol_dp, volume_cap, now, fallback_maker,
+                                book_id in force_trade)
             except Exception as ex:
                 bt.logging.warning(f"[AdaptiveRouter uid={self.uid}] step {book_id}: {ex}")
 
         return response
 
+    def _select_idle_overflow(self, validator: str, idle_count: int) -> frozenset:
+        """Hard idle cap. The validator drops up to 48 idle (kappa=None) books for FREE; beyond that
+        each idle book scores a literal 0.0 that BOTH drags the kappa median and feeds the left-tail
+        outlier penalty. A traded book — even a small loser — normalizes well above 0.0, so when more
+        than HARD_IDLE_BOOKS are idle we force the LEAST-BAD excess books back into trading and leave
+        the WORST (most-negative) ones idle, since those are exactly the books the validator drops
+        for free. Returns the (idle_count - HARD_IDLE_BOOKS) least-bad idle book_ids; empty when
+        under the cap or when no active overflow mode is allowed."""
+        if self._overflow_mode is None or idle_count <= HARD_IDLE_BOOKS:
+            return frozenset()
+        bstates = self.books_state.get(validator) or {}
+        # Rank idle books LEAST-BAD first by recent realized-PnL sum. A book with no recent history
+        # scores 0.0 here (near-breakeven) and is thus preferred for forcing over a proven bleeder.
+        idle_books = [
+            (sum(p for _, p in st.rt_events) if st.rt_events else 0.0, bid)
+            for bid, st in bstates.items() if st.mode == MODE_IDLE
+        ]
+        idle_books.sort(reverse=True)                       # highest (least-bad) recent PnL first
+        n_force = idle_count - HARD_IDLE_BOOKS
+        return frozenset(bid for _, bid in idle_books[:n_force])
+
     # ------------------------------------------------------------------ per-book dispatch
     def _step_book(
         self, response, validator: str, book_id: int, book, account,
         vol_dp: int, volume_cap: float, now: int, fallback_maker: bool = False,
+        force_trade: bool = False,
     ) -> None:
         if not book.bids or not book.asks:
             return
@@ -386,9 +431,25 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         # Route only when FLAT and the dwell has elapsed, so no position straddles two modes and
         # books cannot flip-flop. A pending switch first cancels resting orders, then commits.
         if flat:
+            # Hard idle-cap override: this book is one of the least-bad books over HARD_IDLE_BOOKS
+            # idle for this validator. Force it into the overflow trading mode so it scores
+            # ~normalized(small loss) instead of the 0.0 the validator assigns to idle books beyond
+            # its 48-book free allowance. Only fires when FLAT (no open position is disrupted) and
+            # bypasses the edge gate AND PnL-backoff for the overflow set ONLY; all other books and
+            # the dwell/hysteresis logic are unchanged.
+            if force_trade and st.mode == MODE_IDLE and self._overflow_mode is not None:
+                if account.orders:
+                    self._cancel_all(response, account, book_id)
+                    return
+                st.pnl_backoff_until_ns = 0          # release any backoff hold so it can re-engage
+                bt.logging.info(
+                    f"[AdaptiveRouter uid={self.uid}] IDLE-CAP idle->{self._overflow_mode} "
+                    f"book={book_id} (idle>{HARD_IDLE_BOOKS}; least-bad overflow)"
+                )
+                st.mode, st.mode_since_ns = self._overflow_mode, now
             # PnL backoff: checked BEFORE _route() so a bleeding book bypasses the fallback_maker
             # promotion. No dwell guard here — backoff is a safety trigger, not a fee-regime flip.
-            if self._pnl_backoff_check(st, now):
+            elif self._pnl_backoff_check(st, now):
                 if st.mode != MODE_IDLE:
                     if account.orders:
                         self._cancel_all(response, account, book_id)
