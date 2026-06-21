@@ -57,6 +57,7 @@ Per book each step:
 """
 
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -215,7 +216,8 @@ class _BookState:
     mk_loss_streak: int = 0            # consecutive losing maker cuts (reset on a positive close)
     mk_streak_cooldown_until_ns: int = 0  # pause maker entries on a persistently toxic book
     seen_ns: int = 0                   # first-seen ts; activity clock before the first RT
-    rt_events: list[tuple[int, float]] = field(default_factory=list)  # (ts, realized_pnl)
+    rt_events: list[tuple[int, float]] = field(default_factory=list)   # (sim_ts, realized_pnl)
+    kappa_events: list[tuple[int, float]] = field(default_factory=list) # (wall_ts, realized_pnl)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, traded quote vol)
     # taker bookkeeping
@@ -376,7 +378,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             st.mode = self.default_mode
             st.mode_since_ns = now - self.route_min_dwell_ns - 1
         if self._prune_rt_events(st, now):
-            self._refresh_book_kappa(validator, book_id, now)
+            self._refresh_book_kappa(validator, book_id, time.time_ns())
 
         net = self._net_qty(inv)
         flat = abs(net) < self.exch_min
@@ -617,13 +619,17 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         self._prune_rt_events(st, ts)
         st.rt_events.append((ts, net_pnl))
-        self._refresh_book_kappa(validator, book_id, ts)
+        wall_ns = time.time_ns()
+        cutoff = wall_ns - self.kappa_rt_history_ns
+        st.kappa_events = [(t, p) for t, p in st.kappa_events if t >= cutoff]
+        st.kappa_events.append((wall_ns, net_pnl))
+        self._refresh_book_kappa(validator, book_id, wall_ns)
 
     def _global_rt_timestamps(self, validator: str, now: int) -> list[int]:
         cutoff = now - self.kappa_rt_history_ns
         ts_set: set[int] = set()
         for st in self.books_state.get(validator, {}).values():
-            for ts, _ in st.rt_events:
+            for ts, _ in st.kappa_events:
                 if ts >= cutoff:
                     ts_set.add(ts)
         return sorted(ts_set)
@@ -633,7 +639,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         if not timestamps:
             return []
         cutoff = now - self.kappa_rt_history_ns
-        by_ts = {t: p for t, p in self._bstate(validator, book_id).rt_events if t >= cutoff}
+        by_ts = {t: p for t, p in self._bstate(validator, book_id).kappa_events if t >= cutoff}
         return [by_ts.get(ts, 0.0) for ts in timestamps]
 
     @staticmethod
@@ -674,13 +680,24 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             st.kappa3 = None
             ts_list = self._global_rt_timestamps(validator, now)
             if ts_list:
-                bt.logging.debug(
+                bt.logging.info(
                     f"[AdaptiveRouter uid={self.uid}] kappa_not_ready book={book_id} "
                     f"ts_count={len(ts_list)} span_s={(ts_list[-1]-ts_list[0])/1e9:.0f} "
                     f"need_span_s={self.kappa_min_lookback_ns/1e9:.0f}"
                 )
+            else:
+                bt.logging.info(
+                    f"[AdaptiveRouter uid={self.uid}] kappa_no_events book={book_id}"
+                )
             return
-        st.kappa3 = self._kappa3_raw(self._book_pnl_series(validator, book_id, now))
+        pnl = self._book_pnl_series(validator, book_id, now)
+        result = self._kappa3_raw(pnl)
+        if result is None:
+            bt.logging.info(
+                f"[AdaptiveRouter uid={self.uid}] kappa_raw_none book={book_id} "
+                f"series_len={len(pnl)} nonzero={sum(1 for x in pnl if x != 0.0)}"
+            )
+        st.kappa3 = result
 
     def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
         cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
