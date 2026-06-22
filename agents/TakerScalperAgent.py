@@ -11,11 +11,15 @@ Rules:
   2. One position per book: a book is FLAT xor HELD; the open path runs only when flat.
   3. Wait for full fill: after any submit, st.pending_ns blocks the book until a fill
      resolves it (timeout-recovered).
-  4. Kappa-3 + PnL: open a directional scalp only when the kappa gate clears; close on
-     TP / SL / max-hold.
+  4. Two open modes, selected by the book's taker rebate:
+       churn (rebate >= CHURN_REBATE_BPS): direction-independent fee extraction; maximise
+         round-trip frequency — the rebate alone is +EV.
+       kappa  (rebate < CHURN_REBATE_BPS): directional scalp gated on kappa projection;
+         open only when the estimated edge clears the floor and improves kappa.
+     Both close on TP / SL / max-hold (hold windows differ by mode).
 
 Per book each tick:
-  reconcile -> pending? wait : held? close(TP/SL/time) : open(kappa | activity | idle)
+  reconcile -> pending? wait : held? close(TP/SL/time) : open(churn | kappa | activity | idle)
 
 RT logging -> main validator only.
 """
@@ -63,22 +67,16 @@ MIN_REOPEN_GAP_S = 3.0
 # After submitting, wait this long for the fill before assuming the order was lost.
 PENDING_TIMEOUT_S = 5.0
 
-# ---- deep-rebate CHURN sub-mode (regime-gated; mirrors uid 120, the #1 agent at kappa ~0.53) ----
-# On a deeply-rebated book the EDGE IS THE REBATE: it is locked in at fill and direction-independent,
-# so a tight, positive net distribution (=high kappa) comes from MAXIMISING round-trip frequency, not
-# from waiting for a gross move. uid 120 concentrates 83% of its trades on >=5bps-rebate books and
-# churns 60-108 RTs/book. This sub-mode activates ONLY when rebate_bps >= CHURN_REBATE_BPS; below that
-# the agent runs its PROVEN directional-scalp path byte-for-byte unchanged. Still one lot at a time
-# (closes fully before reopening) so inventory stays <=1 lot — bounded and safe. To fully disable and
-# revert to the proven engine, set CHURN_REBATE_BPS to a very high value.
+# ---- deep-rebate CHURN sub-mode (regime-gated) ----
+# On a deeply-rebated book the EDGE IS THE REBATE: direction-independent, locked in at fill.
+# High kappa comes from maximising round-trip frequency, not waiting for a gross move.
+# Activates ONLY when rebate_bps >= CHURN_REBATE_BPS; below that the proven scalp path is unchanged.
+# One lot at a time — inventory stays <=1 lot. To revert entirely, set CHURN_REBATE_BPS very high.
 CHURN_REBATE_BPS = 5.0             # gate: engage churn only on books at least this rebated
-CHURN_RT_MAX = 100                 # higher per-book RT cap on churn books (vs RT_MAX=28)
-CHURN_REOPEN_GAP_S = 0.5           # near-immediate reopen on churn books (vs MIN_REOPEN_GAP_S=3.0)
-CHURN_MIN_HOLD_S = 0.8             # churn-only floor (proven path keeps MIN_HOLD_S=1.5)
-CHURN_MAX_HOLD_S = 1.2             # churn-only time-exit — THIS governs the hold (most churn RTs close
-                                   # on time, not TP/SL). 1.2 (with min 0.8) targets uid120's ~1s churn
-                                   # vs MAX_HOLD_S=4.0. TP+2.5/SL-4 still apply. (Effective hold also
-                                   # depends on validator update cadence — calibrate from the A/B.)
+CHURN_RT_MAX = 100                 # higher per-book RT cap (vs RT_MAX=28)
+CHURN_REOPEN_GAP_S = 0.5           # near-immediate reopen (vs MIN_REOPEN_GAP_S=3.0)
+CHURN_MIN_HOLD_S = 0.8             # churn-only min hold (proven path keeps MIN_HOLD_S=1.5)
+CHURN_MAX_HOLD_S = 1.2             # churn-only max hold; targets ~1s median (vs MAX_HOLD_S=4.0)
 
 # Kappa-3 (3h history for score projection).
 KAPPA_TAU = 0.0
@@ -701,9 +699,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self, validator: str, book_id: int, st: _BookState, account, book,
         direction: OrderDirection, now: int, opened: bool,
     ) -> None:
-        """Diagnostic (main validator only): trace whether the forced-activity RT opened, and why it
-        skipped if not. Added while chasing the activity-clock bug; SAFE TO REMOVE once the fix is
-        confirmed live (the validator's activity_factor is the authoritative signal)."""
+        """Diagnostic (main validator only): trace whether the forced-activity RT opened, and why not."""
         if not self._rt_log_enabled(validator):
             return
         ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns.get(validator, 0)
