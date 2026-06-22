@@ -11,8 +11,10 @@ reactive safety net (_regime_backoff) that idles a book only once making there i
 Design derived from analysis of UID 165 (top maker) trade history vs validator scoring:
 
 BREAKEVEN GATE — the primary book selector:
-  Quote on any book where capturing the spread covers both maker-fee legs: spread >= 2*maker_fee*mid
-  (evaluated live per book). A wide-spread book is +EV even at a high fee — the top makers (109/165)
+  Quote on any book where the spread covers both maker-fee legs plus an adverse-selection cushion:
+  spread >= BREAKEVEN_FEE_MULT*maker_fee*mid (2.5×, evaluated live per book — realized capture is
+  ~half the quoted spread, so a bare 2× gate net-loses; fleet data forced the >2× cushion).
+  A wide-spread book is +EV even at a high fee — the top makers (109/165)
   make on ALL 128 books, 165 even at +11.5bps — and a thin-spread book loses even at a low fee. This
   replaces the old fixed 12bps fee ceiling, which idled profitable wide-spread high-fee books and
   quoted unprofitable thin-spread ones. Sub-breakeven books idle and fall inside the 37.5%
@@ -25,22 +27,34 @@ PROFIT MECHANISM on active books:
 
 KEY FAILURE MODE OF UID 165 (and what we fix):
   165 ran no stop-loss. Books 116 (−106 PnL) and 106 (−48 PnL) held positions 500-660s as
-  the price trended without reverting. We add a stop (EXIT_STOP_LOSS_BPS) plus a reduce-price
-  floor, a per-book loss-streak cooldown, and the reactive regime backoff below.
+  the price trended without reverting. We add a vol-scaled stop band plus a reduce-price floor, a
+  per-book loss-streak cooldown, and the reactive regime backoff below.
+
+WHAT THE uid-60 STUDY CHANGED (top maker, kappa 0.077 — the current best on the subnet):
+  uid 60 wins on KAPPA (consistency), not PnL: 82% per-RT win rate, +17bps median capture, and he
+  NEVER taker-cuts a loser (0/306) — he holds for a passive reversion (losers held ~146s median).
+  Our old engine did the opposite: it cut on TIME (90s) and walked the reduce to the touch, both of
+  which REALIZE losses on positions that would have reverted. The redesign makes our maker behave
+  like uid 60 in any regime (the levers below are regime-robust, not a mean-reversion bet):
+    * Reduce walks to BREAKEVEN, never the touch — a late fill nets ~0, never gives away the spread.
+    * Stop is a VOL-SCALED BAND (clamp(MULT×per-book noise, FLOOR, CAP)) — hold through normal
+      oscillation, cut only on a genuine adverse move. Cutting inside the noise band loses in EVERY
+      regime; this stops manufacturing those losses while still protecting against real trends.
+    * Patient giveup (150s ≈ uid-60 median) + smaller size keep the (cube-amplified) loss tail bounded.
 
 MECHANICS (per book, each step):
-  prune/kappa → managed exit → risk guard → breakeven gate → activity backstop → quote → reconcile.
+  prune/kappa/noise → managed exit → risk guard → breakeven gate → activity backstop → quote → reconcile.
   Managed exit runs FIRST so a stop is never blocked by the risk guard's early return.
 
-  * Managed exit → IOC-cut the held side if underwater >= EXIT_STOP_LOSS_BPS OR lot age >=
-            EXIT_GIVEUP_S. Slippage capped. Bounds each realized loss.
-  * Breakeven gate → take new inventory only where spread >= 2*maker_fee*mid. Held inventory on a
+  * Managed exit → IOC-cut the held side if underwater >= _stop_bps (vol-scaled band) OR lot age >=
+            EXIT_GIVEUP_S (patient backstop). Slippage capped. Bounds each realized loss.
+  * Breakeven gate → take new inventory only where spread >= BREAKEVEN_FEE_MULT*maker_fee*mid. Held inventory on a
             book that drops sub-breakeven is still managed DOWN (never force-dumped), so a volatile
             spread can't churn the book active/idle.
   * Flat  → quote both sides inside the touch, gated by breakeven + cooldowns + RT/volume budget.
   * Hold  → ONLY the reducing side (never average into the bag). Reduce price walks from the profit
-            target toward the touch with lot age, FLOORED at the stop so a reduce fill never loses
-            more than the IOC cut would.
+            target toward BREAKEVEN with lot age, FLOORED at the vol-scaled stop so a reduce fill
+            never loses more than the IOC cut would; unfilled positions are held for reversion.
   * Loss streak → STREAK_LIMIT consecutive losing RTs → pause new entries for STREAK_COOLDOWN_S.
   * Regime backoff → window net realized PnL < -(BACKOFF_NET_WINS × avg win) → idle the book for
             BACKOFF_COOLDOWN_S, then re-test. The maker specialist's safety net; free in good regimes.
@@ -78,12 +92,23 @@ QUOTE_LOT = 0.26                    # just ABOVE the 0.25 exchange min on purpos
                                    # >= 0.25 after the shave => always closeable in one order.
 
 # ---- inventory bounds ----
-MAX_INVENTORY_LOTS = 2.0           # tighter than DualEdge: maker runs smaller book
+MAX_INVENTORY_LOTS = 1.5           # trimmed (was 2.0): we now hold reverting positions LONGER and
+                                   # the stop band is wider, so size is the lever that keeps the
+                                   # (cube-amplified) loss tail bounded — per the uid-60 study.
 MAX_INVENTORY_EQUITY_FRAC = 0.10
 RISK_TRIM_SLIPPAGE_BPS = 6.0
 
 # ---- breakeven gate + fee ceiling ----
-# Primary: spread >= 2*maker_fee*mid (computed live per book).
+# Primary: spread >= BREAKEVEN_FEE_MULT * maker_fee * mid (computed live per book).
+# BREAKEVEN_FEE_MULT raised 2.0 -> 2.5 from fleet process data: a round trip pays 2 fee legs, so
+# 2.0×fee is bare breakeven — but realized capture is only ~HALF the quoted spread (adverse
+# selection), so books passing a 2.0×fee gate still net-lose (fleet data: median capture 6.5bps <
+# median fee cost 12bps; 61% of RTs net-negative). The extra 0.5×fee is an adverse-selection cushion
+# that scales with fee (high-fee books, which are slower to revert, get more cushion). NOTE: a fully
+# profitable gate would need ~4×fee, but that idles too many books and breaches the 37.5% activity
+# budget — so this is a MODEST step; the exit redesign (breakeven-walk) is the primary loss fix.
+# WATCH in A/B: if idle books exceed ~48 (37.5%), dial back toward 2.25/2.0.
+BREAKEVEN_FEE_MULT = 2.5
 # Secondary: maker_fee_bps < MAKER_FEE_GATE_BPS — hard cap on very high-fee books. High-fee books
 # have slower liquidity; in downtrend they tend to need bigger price moves to exit, causing more
 # slow trades and giveup cuts. 12bps matches v1's proven ceiling.
@@ -99,14 +124,28 @@ TP_BPS_BASE = 8.0
 TP_FEE_MULT = 2.0                  # floor = 2× maker_fee (covers both legs + small buffer)
 QUOTE_EXPIRY_S = 12.0
 
-# ---- managed exit: cut fast and small ----
-# mean-reverting books bounce within ~1-1.5 min; if they haven't by EXIT_GIVEUP_S, they're trending.
-# Stop tightened 15->10bps: the dominant kappa lever is keeping every realized loss small (the cube),
-# and the reduce-price FLOOR (=stop) plus this stop cap the loss tail. Smaller stop also = positive
-# skew vs the ~10bps target. Size (clip + inventory cap), not a wide stop, absorbs noise.
-EXIT_WALK_START_S = 30.0           # start walking reduce toward touch after 30s
-EXIT_GIVEUP_S = 90.0              # IOC-cut at 1.5min if still not reverted (was 120)
-EXIT_STOP_LOSS_BPS = 10.0          # immediate IOC-cut: price moved 10bps against oldest lot (was 15)
+# ---- managed exit: hold through noise, cut on trend ----
+# Redesigned from the uid-60 (top maker, kappa 0.077) study: the top maker NEVER taker-cuts losers
+# (0/306) — he holds for a passive reversion (losers held ~146s median) and his per-RT win rate is
+# 82%. Our old engine manufactured losses by (a) cutting on TIME at 90s and (b) walking the reduce
+# all the way to the touch (giving away the spread). Both are removed:
+#   * giveup set to 150s  (≈ uid-60's 146s median hold; long enough to capture most reversions,
+#     short enough to bound trend exposure and keep the activity margin comfortable)
+#   * the reduce walks only to BREAKEVEN, never to the touch (see _reduce_price) — a late passive
+#     fill nets ~0, not a loss, so the kappa downside (cubed) stays sparse.
+# The stop is now a VOL-SCALED BAND (regime-robust): hold through normal oscillation, cut only on a
+# genuine adverse move. FLOOR keeps calm-book behaviour ≈ the old fixed 10bps stop; CAP bounds the
+# cube-amplified tail on volatile books; size (inventory cap) absorbs the rest.
+# DIAL-BACK (live A/B on uid 168): the first cut (giveup 240 / cap 18) won kappa (best of cohort)
+# but its wider/longer cuts ran to ~16bps mean in a TRENDING regime, denting the pnl component. So
+# giveup 240->150 and cap 18->14 reduce trend-loss exposure while keeping the noise-robustness.
+EXIT_WALK_START_S = 30.0           # start walking reduce from target toward breakeven after 30s
+EXIT_GIVEUP_S = 150.0             # patient IOC-cut at ~2.5min if still not reverted (was 240; ≈uid-60 median)
+EXIT_STOP_LOSS_BPS = 10.0          # FLOOR of the vol-scaled stop band (calm-book default; was the
+                                   # fixed stop). Effective stop = clamp(MULT×noise, FLOOR, CAP).
+EXIT_STOP_CAP_BPS = 14.0           # CAP of the band — bounds the (cube-amplified) single-loss tail (was 18)
+EXIT_STOP_NOISE_MULT = 6.0         # stop ≈ MULT × per-book per-step mid-noise(bps), clamped to band
+NOISE_EWMA_ALPHA = 0.05            # EWMA weight for the per-book mid-noise estimate (~20-step memory)
 EXIT_CUT_SLIPPAGE_BPS = 4.0        # tighter cut concession (was 5)
 EXIT_CUT_ESCALATE_BPS = 8.0        # escalated concession after 2+ consecutive IOC-cut misses: a
                                    # fixed-price IOC that doesn't cross on a fast/wide book re-fires
@@ -172,6 +211,9 @@ class _BookState:
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
+    # per-book mid-noise estimate (EWMA of |Δmid| in bps) — scales the stop band
+    last_mid: float = 0.0
+    noise_bps: float = 0.0
     # per-book loss-streak cooldown
     loss_streak: int = 0                   # consecutive losing RT count
     no_entry_until_ns: int = 0             # no new entries before this timestamp
@@ -218,9 +260,10 @@ class PureMakerAgent(FinanceSimulationAgent):
 
         bt.logging.info(
             f"[PureMaker uid={self.uid}] PURE-MAKER lot={QUOTE_LOT} exch_min={self.exch_min} "
-            f"gate=breakeven(spread>=2*fee)+fee_cap={MAKER_FEE_GATE_BPS}bps "
+            f"gate=breakeven(spread>={BREAKEVEN_FEE_MULT}*fee)+fee_cap={MAKER_FEE_GATE_BPS}bps "
             f"tp_base={self.tp_bps_base:.1f}bps tp_floor={TP_FEE_MULT}×fee "
-            f"exit_walk={EXIT_WALK_START_S:.0f}-{giveup_s:.1f}s stop={EXIT_STOP_LOSS_BPS}bps "
+            f"exit_walk={EXIT_WALK_START_S:.0f}-{giveup_s:.1f}s(->breakeven) "
+            f"stop_band=[{EXIT_STOP_LOSS_BPS:.0f},{EXIT_STOP_CAP_BPS:.0f}]bps×{EXIT_STOP_NOISE_MULT:.0f}noise "
             f"reentry={REENTRY_COOLDOWN_S}s "
             f"streak(limit={STREAK_LIMIT} cooldown={STREAK_COOLDOWN_S}s) "
             f"inv_cap={MAX_INVENTORY_LOTS}lot/{MAX_INVENTORY_EQUITY_FRAC:.0%}eq "
@@ -286,6 +329,14 @@ class PureMakerAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         if st.seen_ns == 0:
             st.seen_ns = now
+        # Per-book mid-noise EWMA (bps/step) — the scale for the vol-adaptive stop band. Regime-robust:
+        # small on calm books (stop stays at the floor), large on volatile ones (stop widens so we
+        # don't cut positions that are merely oscillating, not trending).
+        if st.last_mid > 0.0:
+            inst = abs(mid - st.last_mid) / st.last_mid * 1e4
+            st.noise_bps = (((1.0 - NOISE_EWMA_ALPHA) * st.noise_bps + NOISE_EWMA_ALPHA * inst)
+                            if st.noise_bps > 0.0 else inst)
+        st.last_mid = mid
         if self._prune_rt_events(st, now):
             self._refresh_book_kappa(validator, book_id, now)
 
@@ -338,17 +389,18 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ breakeven gate
     def _is_active_book(self, maker_fee: float | None, spread: float, mid: float) -> bool:
-        """BREAKEVEN gate + fee ceiling: quote only when spread covers both maker-fee legs AND
-        the maker fee is below MAKER_FEE_GATE_BPS. High-fee books pass the breakeven gate when
-        the spread is momentarily wide, but in downtrend they hold longer before reverting → slow
-        trades → giveup cuts. The fee ceiling blocks them before they bleed."""
+        """BREAKEVEN gate + fee ceiling: quote only when the spread covers both maker-fee legs PLUS an
+        adverse-selection cushion (BREAKEVEN_FEE_MULT × fee), AND the maker fee is below
+        MAKER_FEE_GATE_BPS. Realized capture is ~half the quoted spread, so a bare 2×fee gate net-loses
+        (fleet data); the >2× multiplier requires the spread to comfortably clear the fee. High-fee
+        books also hit the hard fee ceiling, which blocks them before they bleed."""
         if maker_fee is None:
             return True   # unknown fee → optimistic; other entry gates still apply
         if mid <= 0:
             return False
         if maker_fee * 1e4 >= MAKER_FEE_GATE_BPS:
             return False
-        return spread >= 2.0 * maker_fee * mid
+        return spread >= BREAKEVEN_FEE_MULT * maker_fee * mid
 
     # ------------------------------------------------------------------ risk guard
     def _risk_trim(
@@ -392,18 +444,28 @@ class PureMakerAgent(FinanceSimulationAgent):
         )
         return True
 
+    # ------------------------------------------------------------------ vol-scaled stop band
+    def _stop_bps(self, st: _BookState) -> float:
+        """Vol-scaled stop: hold through normal noise, cut only on a genuine adverse move. FLOOR keeps
+        calm-book behaviour ≈ the legacy fixed stop; CAP bounds the cube-amplified loss tail on
+        volatile books. Regime-robust — it adapts to each book's own oscillation, not the regime."""
+        scaled = EXIT_STOP_NOISE_MULT * st.noise_bps
+        return min(EXIT_STOP_CAP_BPS, max(EXIT_STOP_LOSS_BPS, scaled))
+
     # ------------------------------------------------------------------ managed exit
     def _managed_exit(
         self, response, book_id: int, account, inv: _Inv, net: float,
         best_bid: float, best_ask: float, vol_dp: int, now: int, st: _BookState,
     ) -> bool:
-        """IOC-cut the whole reducible side when the oldest lot is too old (EXIT_GIVEUP_S, the
-        mean-reversion window) or too underwater (EXIT_STOP_LOSS_BPS). Either path bounds the loss."""
+        """IOC-cut the whole reducible side when the oldest lot is too old (EXIT_GIVEUP_S, the patient
+        reversion backstop) or too underwater (past the vol-scaled stop band). Either path bounds the
+        loss; positions inside the band are held for a passive reversion (see _reduce_price)."""
         if abs(net) < self.exch_min:
             # Flat — clear escalation state so the NEXT position starts a fresh miss streak.
             st.exit_miss_count = 0
             st.exit_prev_net = 0.0
             return False
+        stop_bps = self._stop_bps(st)            # vol-scaled: hold through noise, cut on trend
         # Escalate the concession on consecutive IOC-cut misses: a fixed-price IOC that doesn't cross
         # on a fast/wide book re-fires every step while the position bleeds. Escalating 4→8→18bps caps
         # the loss window; the final stage is a wide LIMIT (not a market order) to bound gap fills.
@@ -423,7 +485,7 @@ class PureMakerAgent(FinanceSimulationAgent):
             ts, _, px0, _ = inv.longs[0]
             uw = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
             aged = now - ts >= self.exit_giveup_ns
-            stopped = uw >= EXIT_STOP_LOSS_BPS
+            stopped = uw >= stop_bps
             if not (aged or stopped):
                 # Position recovered without a fill — break the miss streak so a later stop event
                 # starts fresh escalation instead of inheriting a stale (premature) count.
@@ -446,7 +508,7 @@ class PureMakerAgent(FinanceSimulationAgent):
             ts, _, px0, _ = inv.shorts[0]
             uw = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
             aged = now - ts >= self.exit_giveup_ns
-            stopped = uw >= EXIT_STOP_LOSS_BPS
+            stopped = uw >= stop_bps
             if not (aged or stopped):
                 st.exit_miss_count = 0
                 st.exit_prev_net = 0.0
@@ -473,7 +535,8 @@ class PureMakerAgent(FinanceSimulationAgent):
             )
         bt.logging.info(
             f"[PureMaker uid={self.uid}] MANAGED-EXIT book={book_id} reason={reason} "
-            f"net={net:+.4f} q={q} @~{px} uw={uw:.1f}bps"
+            f"net={net:+.4f} q={q} @~{px} uw={uw:.1f}bps stop={stop_bps:.0f}bps "
+            f"noise={st.noise_bps:.1f}bps"
         )
         return True
 
@@ -525,6 +588,7 @@ class PureMakerAgent(FinanceSimulationAgent):
         fee_bps = (maker_fee * 1e4) if maker_fee is not None else 0.0
         tp_floor_bps = TP_FEE_MULT * fee_bps + (tick / mid) * 1e4
         base_target = max(self.tp_bps_base, tp_floor_bps) / 1e4
+        stop_bps = self._stop_bps(st)            # vol-scaled stop floor for the resting reduce
 
         free_base = account.base_balance.free if account.base_balance else 0.0
         free_quote = account.quote_balance.free if account.quote_balance else 0.0
@@ -542,7 +606,8 @@ class PureMakerAgent(FinanceSimulationAgent):
             # Holding long → passive SELL reduce, priced off FIFO-next (oldest) lot.
             age = now - inv.longs[0][0]
             fifo_px = inv.longs[0][2]
-            px = self._reduce_price(True, fifo_px, age, ask_inside, base_target, pdp)
+            px = self._reduce_price(True, fifo_px, age, ask_inside, base_target,
+                                    tp_floor_bps, stop_bps, pdp)
             q = round(min(self._long_qty(inv), base_avail), vdp)
             if q >= self.exch_min and px > 0:
                 desired[OrderDirection.SELL] = (px, q)
@@ -550,7 +615,8 @@ class PureMakerAgent(FinanceSimulationAgent):
             # Holding short → passive BUY reduce, priced off FIFO-next (oldest) lot.
             age = now - inv.shorts[0][0]
             fifo_px = inv.shorts[0][2]
-            px = self._reduce_price(False, fifo_px, age, bid_inside, base_target, pdp)
+            px = self._reduce_price(False, fifo_px, age, bid_inside, base_target,
+                                    tp_floor_bps, stop_bps, pdp)
             q_max = quote_avail / px if px > 0 else self._short_qty(inv)
             q = round(min(self._short_qty(inv), q_max), vdp)
             if q >= self.exch_min and px > 0:
@@ -570,21 +636,25 @@ class PureMakerAgent(FinanceSimulationAgent):
 
     def _reduce_price(
         self, is_long: bool, px0: float, age_ns: int, touch_inside: float,
-        base_target: float, pdp: int,
+        base_target: float, walk_floor_bps: float, stop_bps: float, pdp: int,
     ) -> float:
-        """Walk the passive-reduce limit price from the profit target toward the touch with lot age.
-        FLOOR the realized loss at the stop: a resting reduce quote must never fill worse than the
-        managed-exit IOC would. Otherwise an aged underwater lot's reduce walks all the way to the
-        touch and fills there on a gap, locking a loss many times the stop (kappa-3 cubes that tail).
-        Anything below the floor is left to _managed_exit's bounded IOC instead."""
+        """Walk the passive-reduce limit from the profit target toward BREAKEVEN with lot age — never
+        to the touch. The uid-60 study showed walking to the touch gives away the spread: late fills
+        realize a loss and tank both win-rate and the kappa mean. Walking only to breakeven means a
+        late fill nets ~0 (covers fees), keeping the kappa downside sparse; positions that can't fill
+        at breakeven are HELD for reversion and exit via _managed_exit only on a genuine stop/giveup.
+        The hard stop floor remains as a backstop so a resting reduce never fills worse than the IOC."""
         w = self._exit_walk(age_ns)
-        stop = EXIT_STOP_LOSS_BPS / 1e4
+        stop = stop_bps / 1e4
+        floor_t = walk_floor_bps / 1e4
         if is_long:
             target_px = max(touch_inside, px0 * (1.0 + base_target))
-            px = target_px + (touch_inside - target_px) * w
+            walk_to = min(target_px, px0 * (1.0 + floor_t))   # breakeven sell, never below it
+            px = target_px + (walk_to - target_px) * w
             return round(max(px, px0 * (1.0 - stop)), pdp)
         target_px = min(touch_inside, px0 * (1.0 - base_target))
-        px = target_px + (touch_inside - target_px) * w
+        walk_to = max(target_px, px0 * (1.0 - floor_t))       # breakeven buy, never above it
+        px = target_px + (walk_to - target_px) * w
         return round(min(px, px0 * (1.0 + stop)), pdp)
 
     def _exit_walk(self, age_ns: int) -> float:
