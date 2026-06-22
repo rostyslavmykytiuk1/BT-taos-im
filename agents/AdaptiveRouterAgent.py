@@ -152,8 +152,7 @@ RT_LOSS_CAP_BPS = 4.0              # hard cap on a single forced-exit adverse mo
                                    # Tighter than before: kappa-3 cubes the downside, so a small,
                                    # consistent loss tail beats an occasional large cut.
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 50                        # max profit RTs per book per window. Raised 30->50: uid120's
-                                   # deepest-rebate books run 32-45 RTs/window and 30 capped them.
+RT_MAX = 30                        # max profit RTs per book per window.
                                    # Maker is fill-limited (peaks ~18/win) so unaffected; fee-churn's
                                    # downside is bounded by PnL-backoff (not RT_MAX); the volume cap
                                    # (_rolled_quote_volume < volume_cap) is the real hard ceiling.
