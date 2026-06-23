@@ -1,39 +1,59 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 """
-AdaptiveRouterAgent — per-book regime router for subnet 79.
+AdaptiveRouterAgent — per-book maker/taker router for subnet 79.
 
-Routes each of the 128 books to the playbook that is +EV for its LIVE conditions, with thresholds
-derived from the top agents' own trade histories (dashboard_data/*.csv, reconstructed per-book).
+Goal: stay near the top in ANY market by routing each book to the playbook that is +EV given the
+book's LIVE fee regime, mirroring the proven top miners:
+  * TAKER mode  (mirrors UID 126): on deep-rebate books, cross the spread for tiny clips and
+    recycle in seconds. The rebate (both legs) cushions a fast stop into a net win. Small bounded
+    same-side inventory building is allowed while the rebate stays deep.
+  * MAKER mode  (mirrors UID 109/149): on spread-rich books, post two-sided passive quotes and
+    capture spread WIDER than the maker fee + an adverse-selection margin. When holding, work only
+    the reducing side priced off the FIFO worst lot (no bagging), and cap every forced exit.
+  * IDLE mode: for books where active trading would hurt more than idling. Two triggers: (1) fee
+    regime — spread < maker_fee + adverse-selection cushion and no taker rebate; (2) PnL backoff —
+    a book's net realized PnL over the last 10 min is negative (≥3 RTs in window), indicating live
+    adverse selection or trending. Stay flat → the book gets Kappa=None and is DROPPED from the
+    median (up to ~37.5% are free), which beats bleeding small losses into the median.
 
-Two signals decide everything:
-  * REBATE (taker fee rebate, per book) — direction-independent, so it works in ANY regime.
-    Reference taker-winners earn on rebate books: rebate 2-9bps books are 55-79% profitable; below
-    0 (fee-paying) is ~6% (loses).
-  * VOLATILITY (30s mid-price range) — reference MAKER-winners ran at ~0.9bps 30s-vol (their 96%-win
-    calm books); TAKER-winners at ~20bps. Vol separates the maker/taker regimes ~22x.
+Calibrated from the top agents' own trade histories (other agents data/*.csv):
+  * They ALL trade 128/128 books — none idle. We raise the maker entry bar above breakeven
+    (MAKER_EDGE_ENTER = 1.5bps) to absorb ~0.8bps adverse-selection drag and idle the rest.
+  * They route by FEE REGIME: UID 126 (#1, Kappa 0.263) is 100% taker on rebate books; UID 66
+    (Kappa 0.104) is mixed and takes only where the taker side is rebated; UID 109/165 are pure
+    makers — 165 makes profitably even at +11.5bps fee. We do the same: take where rebated, make
+    everywhere else, no maker fee ceiling.
+  * Kappa rises with FREQUENCY (149 at 1.7 RT/book/10min → Kappa 0.040; 66/109 at ~26 → 0.10),
+    because per-book Kappa ≈ (share of step-timestamps closed positive)^(2/3). So we quote
+    continuously with short cooldowns, NOT sparse high-target round-trips.
 
-Routing (REBATE decides taker; VOL only routes the books with no rebate):
-  * rebate >= 2bps                         -> TAKER    two-sided rebate churn, ~1s flat clips (uid120)
-  * no rebate, vol < 3bps (calm) + edge    -> MAKER    passive spread capture, the 96%-win calm regime
-  * no rebate, vol high enough to pay cost -> FEECHURN cross-the-fee volatility churn (uid136)
-  * otherwise (no mode wins)               -> IDLE     stay flat; book gets Kappa=None, dropped free
+Why this wins (from taos/im/validator/reward.py + utils/kappa.py + _match_trade_fifo):
+  * Score = 0.79·kappa + 0.21·pnl, BOTH per-book then median across books. The leaderboard tracks
+    KAPPA (UID 126 is #1 with negative mark-to-market PnL). We optimize the per-book Kappa-3 median
+    and keep activity = 1.0 on as many books as possible.
+  * Kappa-3 CUBES the downside: one big loss dwarfs many tiny gains. So the dominant risk lever is
+    POSITION SIZE — small clips + a tight inventory cap keep every forced cut small. We never bag.
+  * Round-trip volume (the activity signal) is produced ONLY by a CLOSING fill, sampled every
+    ~600s. Each book MUST close ≥1 round-trip per window or its activity factor decays.
 
-Scoring (taos/im/validator/reward.py + utils/kappa.py): score = 0.79·kappa + 0.21·pnl, both the
-per-book MEDIAN across the 128 books. The leaderboard tracks KAPPA (the field's realized PnL is
-floored). Kappa-3 CUBES the downside, so the dominant risk lever is POSITION SIZE — small clips and
-a tight inventory cap keep every forced cut small; we never bag. Up to int(0.375·128)=48 idle
-(Kappa=None) books are dropped for free; a HARD idle cap (HARD_IDLE_BOOKS) force-promotes the
-least-bad excess idle books to maker so we never cross that cliff and score them 0.0.
+Design notes addressing the known failure modes:
+  * Routing has DWELL + HYSTERESIS and only switches when FLAT, so books do not flip-flop modes
+    (the old DualEdge made ~2000 switches in an hour) and no position ever straddles two modes.
+  * PnL SCALE MATCHING: both modes target a shared clip notional and cap a single round-trip loss
+    to the same bound, so a book's realized-RT series keeps a consistent scale across mode changes
+    (mixing scales would distort the per-book MAD and the cubic downside).
+  * Single shared FIFO inventory per book (validator-faithful), so kappa/activity accounting is
+    identical regardless of which mode opened a position.
 
-Mechanics:
-  * One stateless class per mode (_TakerMode / _FeeChurnMode / _MakerMode / _IdleMode) over a shared
-    per-(validator, book) FIFO inventory and _BookState. ALLOWED_MODES gates which modes may run.
-  * Mode switches only when FLAT, with DWELL + HYSTERESIS so books don't flip-flop; a regime-shift
-    EMERGENCY-FLIP bypasses the dwell when a maker book turns volatile (adverse selection).
-  * Per book/step: reconcile FIFO -> refresh kappa -> if flat: idle-cap override / PnL-backoff /
-    re-route (hysteresis) -> dispatch to mode.step(): risk/managed-exit -> activity backstop ->
-    profit engine. A bounded activity backstop guarantees >=1 round-trip/book/window (activity=1.0).
+Scalability: one class per mode (_TakerMode/_MakerMode/_IdleMode) over shared agent infrastructure
+and a Router. ALLOWED_MODES gates which modes may run — set it to {"taker"} and the agent behaves
+exactly like a pure taker scalper; {"maker"} for a pure maker; the full set for the router.
+
+Per book each step:
+  reconcile FIFO -> prune/refresh kappa -> if flat: PnL-backoff check (force idle if net-negative
+    over 10min) -> (dwell elapsed?) re-route w/ hysteresis -> dispatch to the book's mode.step():
+         risk/managed-exit (bounded) -> activity backstop (bounded) -> mode's profit engine.
 """
 
 import math
@@ -61,7 +81,7 @@ _NS = 1_000_000_000
 # ======================================================================== config
 # Which modes the router may use. {"taker"} => pure taker (== TakerScalper); {"maker"} => pure
 # maker; full set => adaptive per-book routing (the default).
-ALLOWED_MODES = {"taker", "feechurn", "maker", "idle"}
+ALLOWED_MODES = {"taker", "maker", "idle"}
 
 # ---- shared sizing / precision ----
 EXCHANGE_MIN_ORDER_SIZE = 0.25     # sim minOrderSize floor for any BASE order
@@ -87,12 +107,9 @@ TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.
 # * IDLE: any book that is neither rebate-eligible for taker nor adequately edgy for maker. The
 #   validator allows up to 37.5% (48/128) idle books before kappa=None starts contributing 0.0
 #   to the median; staying below that limit makes idling strictly dominant over losing trades.
-TAKER_REBATE_ENTER_BPS = 2.0       # SINGLE taker gate (vol-INDEPENDENT): a book enters taker when its
-                                   # rebate >= 2bps. Reference-winner FIFO data: rebate 2-9bps books
-                                   # are 55-79% profitable as taker; <2 marginal; fee-paying (<0) is
-                                   # 6% (loses). Rebate is direction-independent -> works in ANY
-                                   # regime. _open()/spread_viable still require rebate>half_spread.
-TAKER_REBATE_EXIT_BPS = 1.0        # stay in taker until rebate < 1bps (1bps hysteresis band)
+TAKER_REBATE_ENTER_BPS = 1.5       # route to taker when rebate ≥ 1.5bps; execution gate in
+                                   # _TakerMode._open() independently checks 2×rebate > 2×half_spread
+TAKER_REBATE_EXIT_BPS = 0.75       # leave taker when rebate falls below 0.75bps (0.75bps hysteresis)
 MAKER_EDGE_ENTER_BPS = 1.5         # require half_spread − maker_fee ≥ 1.5bps to enter maker;
                                    # empirically the minimum to survive adverse selection
 MAKER_EDGE_EXIT_BPS = -0.5         # exit maker when edge falls below −0.5bps (2bps hysteresis band)
@@ -102,16 +119,6 @@ MAKER_FALLBACK_EDGE_BPS = 0.5      # when the idle guard fires, promote books wi
 MAX_IDLE_BOOKS = 40                # allow up to 40 idle books before promoting borderline ones to
                                    # maker via fallback; 40 is comfortably below the 48-book
                                    # validator budget (37.5% × 128) where kappa=None is free
-HARD_IDLE_BOOKS = 45               # HARD ceiling. The validator (reward.py) drops up to
-                                   # int(0.375*128)=48 idle (kappa=None) books for FREE; every idle
-                                   # book BEYOND that scores a literal 0.0 that both drags the kappa
-                                   # median AND feeds the left-tail outlier penalty. A traded book —
-                                   # even a small loser — normalizes well above 0.0 (norm range
-                                   # ±2.5, so 0.5≈neutral; only kappa≤-2.5 hits 0.0), so above this
-                                   # cap we FORCE the least-bad excess idle books back into trading.
-                                   # 45 (not 48) leaves a 3-book buffer for same-step idle overshoot
-                                   # and the lag between an internal mode flip and the book actually
-                                   # accumulating the ≥3 round-trips the validator needs to un-None it.
 ROUTE_MIN_DWELL_S = 180.0          # min time in a mode before switching (only switches when flat)
 EMERGENCY_TAKER_EXIT_BPS = -1.0    # bypass dwell guard when taker rebate goes clearly negative
 EMERGENCY_MAKER_EXIT_BPS = -3.0    # bypass dwell guard when maker edge goes deeply negative
@@ -132,10 +139,7 @@ RT_LOSS_CAP_BPS = 4.0              # hard cap on a single forced-exit adverse mo
                                    # Tighter than before: kappa-3 cubes the downside, so a small,
                                    # consistent loss tail beats an occasional large cut.
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 30                        # max profit RTs per book per window (throttle alongside the
-                                   # volume cap). Maker is fill-limited (peaks ~18/win) so this only
-                                   # really binds the churn modes; fee-churn's downside is bounded by
-                                   # the PnL-backoff, and the volume cap is the real hard ceiling.
+RT_MAX = 30                        # max profit RTs per book per window
 CAPITAL_TURNOVER_CAP = 10.0        # volume cap = this * miner_wealth (24h) — avoid the ceiling
 VOLUME_SAFETY = 0.8
 VOLUME_ASSESSMENT_NS = 86_400_000_000_000
@@ -143,14 +147,16 @@ VOLUME_ASSESSMENT_NS = 86_400_000_000_000
 # ---- activity backstop: guarantee >=1 RT per book per window, bounded to one lot ----
 ACTIVITY_DEADLINE_S = 480.0        # force a close this long since the last counted RT
 
-# ---- TAKER mode = REBATE-CHURN (mirrors uid120): deep-rebate, two-sided, near-flat, fast ----
-TK_MIN_HOLD_S = 0.8                # uid120 churns ~1s; turn over fast to harvest the rebate both legs
-TK_MAX_HOLD_S = 1.2               # time-close is the primary exit (rebate is the edge, not price)
+# ---- TAKER mode (mirrors UID 126) ----
+TK_MIN_HOLD_S = 1.5
+TK_MAX_HOLD_S = 4.0
 TK_TP_BPS = 2.5
 TK_SL_BPS = 4.0                    # rebate-cushioned; <= RT_LOSS_CAP_BPS in net terms
-TK_REOPEN_GAP_S = 0.5             # reopen fast to maximise round-trip frequency. The taker holds one
-                                   # clip and never builds same-side, so it stays flat & two-sided
-                                   # like uid120 (no pyramiding).
+TK_REOPEN_GAP_S = 1.5              # throttle between a close and the next open
+TK_MAX_INVENTORY_LOTS = 3          # bounded same-side build (126 averages in ~2-3 clips)
+TK_PYRAMID_GAP_S = 1.0
+TK_PYRAMID_MIN_REBATE_BPS = 3.0    # only stack while rebate is comfortably above entry threshold
+                                   # (entry bar is now 1.5bps; 3bps = books with meaningful cushion)
 
 # ---- MAKER mode (mirrors UID 109/149) ----
 MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
@@ -186,26 +192,9 @@ KAPPA_RT_HISTORY_S = 10_800.0      # 3h
 MAIN_VALIDATOR = "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"
 
 # Mode name constants.
-MODE_TAKER = "taker"               # = REBATE-CHURN (deep-rebate two-sided churn, mirrors uid120)
-MODE_FEECHURN = "feechurn"         # = FEE-paying volatility churn (mirrors uid136): no rebate, but the
-                                   # book is volatile enough that the move covers the crossing cost
+MODE_TAKER = "taker"
 MODE_MAKER = "maker"
 MODE_IDLE = "idle"
-
-# ---- FEE-CHURN mode (mirrors uid136): churn fee-paying books only when volatility pays the cost ----
-VOL_WINDOW_S = 30.0                # rolling window for per-book volatility (mid-price range, bps)
-VOL_CHURN_ENTER_MULT = 1.8         # route to fee-churn when window range >= this * round-trip cost
-VOL_CHURN_EXIT_MULT = 1.2          # leave when it falls below this * cost (hysteresis)
-VOL_CHURN_MIN_BPS = 12.0           # absolute floor: never fee-churn a quiet book regardless of cost
-
-# ---- regime gate: maker only on genuinely CALM no-rebate books; else taker/feechurn/idle ----
-CALM_VOL_ENTER_BPS = 3.0           # a no-rebate book is "calm" (maker-eligible) only when its 30s mid
-                                   # range is below this. Reference MAKER-winners ran at ~0.9bps 30s-
-                                   # vol (96%-win calm books) vs TAKER-winners at ~20bps — vol
-                                   # separates the regimes ~22x. The old 9bps was far too loose: it
-                                   # fed vol-2-9 books to maker where they got adversely selected.
-CALM_VOL_EXIT_BPS = 5.0            # hysteresis: a book ALREADY in maker stays "calm" until vol
-                                   # exceeds this, so it doesn't flip-flop at the boundary.
 
 @dataclass
 class _Inv:
@@ -231,9 +220,9 @@ class _BookState:
     kappa_events: list[tuple[int, float]] = field(default_factory=list) # (wall_ts, realized_pnl)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, traded quote vol)
-    mid_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, mid) — for volatility est
     # taker bookkeeping
     last_close_ns: int = 0             # last taker close (reopen throttle)
+    last_add_ns: int = 0               # last same-side taker add (pyramid throttle)
     # per-book PnL backoff
     pnl_backoff_until_ns: int = 0      # if > now: book is in PnL-backoff, held at IDLE
     # managed-exit IOC escalation
@@ -271,6 +260,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         self.tk_max_hold_ns = int(TK_MAX_HOLD_S * (0.92 + 0.16 * jitter) * _NS)
         self.tk_min_hold_ns = int(TK_MIN_HOLD_S * _NS)
         self.tk_reopen_gap_ns = int(TK_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
+        self.tk_pyramid_gap_ns = int(TK_PYRAMID_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.mk_quote_expiry_ns = int(MK_QUOTE_EXPIRY_S * _NS)
         self.mk_walk_start_ns = int(MK_EXIT_WALK_START_S * _NS)
         self.mk_giveup_ns = int(MK_EXIT_GIVEUP_S * (0.9 + 0.2 * jitter) * _NS)
@@ -280,7 +270,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
         self.pnl_backoff_window_ns = int(PNL_BACKOFF_WINDOW_S * _NS)
         self.pnl_backoff_cooldown_ns = int(PNL_BACKOFF_COOLDOWN_S * _NS)
-        self.vol_window_ns = int(VOL_WINDOW_S * _NS)
 
         # Default mode = the most permissive allowed playbook (so a {"taker"}-only config always
         # runs taker and behaves like a pure scalper; idle is only a fallback when allowed).
@@ -288,17 +277,8 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             MODE_TAKER if MODE_TAKER in ALLOWED_MODES
             else MODE_MAKER if MODE_MAKER in ALLOWED_MODES else MODE_IDLE
         )
-        # Hard idle-cap overflow target: the active mode used to force least-bad excess idle books
-        # back into trading. Maker is preferred (least lossy on no-edge books — it earns spread when
-        # quotes fill and only crosses via the bounded activity backstop); falls back to taker, and
-        # is None when only idle is allowed (then the hard cap is a no-op).
-        self._overflow_mode = (
-            MODE_MAKER if MODE_MAKER in ALLOWED_MODES
-            else MODE_TAKER if MODE_TAKER in ALLOWED_MODES else None
-        )
         self._modes = {
             MODE_TAKER: _TakerMode(),
-            MODE_FEECHURN: _FeeChurnMode(),
             MODE_MAKER: _MakerMode(),
             MODE_IDLE: _IdleMode(),
         }
@@ -360,10 +340,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             if bst.mode == MODE_IDLE
         )
         fallback_maker = idle_count > MAX_IDLE_BOOKS
-        # Hard idle cap: above HARD_IDLE_BOOKS idle, force the least-bad excess idle books back into
-        # trading (see _select_idle_overflow) so they score ~normalized(small loss) instead of the
-        # 0.0 the validator assigns to idle books beyond its 48-book free allowance.
-        force_trade = self._select_idle_overflow(validator, idle_count)
 
         for book_id in sorted(self.accounts.keys()):
             book = state.books.get(book_id)
@@ -372,39 +348,16 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                 continue
             try:
                 self._step_book(response, validator, book_id, book, account,
-                                vol_dp, volume_cap, now, fallback_maker,
-                                book_id in force_trade)
+                                vol_dp, volume_cap, now, fallback_maker)
             except Exception as ex:
                 bt.logging.warning(f"[AdaptiveRouter uid={self.uid}] step {book_id}: {ex}")
 
         return response
 
-    def _select_idle_overflow(self, validator: str, idle_count: int) -> frozenset:
-        """Hard idle cap. The validator drops up to 48 idle (kappa=None) books for FREE; beyond that
-        each idle book scores a literal 0.0 that BOTH drags the kappa median and feeds the left-tail
-        outlier penalty. A traded book — even a small loser — normalizes well above 0.0, so when more
-        than HARD_IDLE_BOOKS are idle we force the LEAST-BAD excess books back into trading and leave
-        the WORST (most-negative) ones idle, since those are exactly the books the validator drops
-        for free. Returns the (idle_count - HARD_IDLE_BOOKS) least-bad idle book_ids; empty when
-        under the cap or when no active overflow mode is allowed."""
-        if self._overflow_mode is None or idle_count <= HARD_IDLE_BOOKS:
-            return frozenset()
-        bstates = self.books_state.get(validator) or {}
-        # Rank idle books LEAST-BAD first by recent realized-PnL sum. A book with no recent history
-        # scores 0.0 here (near-breakeven) and is thus preferred for forcing over a proven bleeder.
-        idle_books = [
-            (sum(p for _, p in st.rt_events) if st.rt_events else 0.0, bid)
-            for bid, st in bstates.items() if st.mode == MODE_IDLE
-        ]
-        idle_books.sort(reverse=True)                       # highest (least-bad) recent PnL first
-        n_force = idle_count - HARD_IDLE_BOOKS
-        return frozenset(bid for _, bid in idle_books[:n_force])
-
     # ------------------------------------------------------------------ per-book dispatch
     def _step_book(
         self, response, validator: str, book_id: int, book, account,
         vol_dp: int, volume_cap: float, now: int, fallback_maker: bool = False,
-        force_trade: bool = False,
     ) -> None:
         if not book.bids or not book.asks:
             return
@@ -416,7 +369,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
 
         inv = self._inv(validator, book_id)
         st = self._bstate(validator, book_id)
-        self._record_mid(st, mid, now)
         if st.seen_ns == 0:
             st.seen_ns = now
         if st.mode_since_ns == 0:
@@ -434,25 +386,9 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         # Route only when FLAT and the dwell has elapsed, so no position straddles two modes and
         # books cannot flip-flop. A pending switch first cancels resting orders, then commits.
         if flat:
-            # Hard idle-cap override: this book is one of the least-bad books over HARD_IDLE_BOOKS
-            # idle for this validator. Force it into the overflow trading mode so it scores
-            # ~normalized(small loss) instead of the 0.0 the validator assigns to idle books beyond
-            # its 48-book free allowance. Only fires when FLAT (no open position is disrupted) and
-            # bypasses the edge gate AND PnL-backoff for the overflow set ONLY; all other books and
-            # the dwell/hysteresis logic are unchanged.
-            if force_trade and st.mode == MODE_IDLE and self._overflow_mode is not None:
-                if account.orders:
-                    self._cancel_all(response, account, book_id)
-                    return
-                st.pnl_backoff_until_ns = 0          # release any backoff hold so it can re-engage
-                bt.logging.info(
-                    f"[AdaptiveRouter uid={self.uid}] IDLE-CAP idle->{self._overflow_mode} "
-                    f"book={book_id} (idle>{HARD_IDLE_BOOKS}; least-bad overflow)"
-                )
-                st.mode, st.mode_since_ns = self._overflow_mode, now
             # PnL backoff: checked BEFORE _route() so a bleeding book bypasses the fallback_maker
             # promotion. No dwell guard here — backoff is a safety trigger, not a fee-regime flip.
-            elif self._pnl_backoff_check(st, now):
+            if self._pnl_backoff_check(st, now):
                 if st.mode != MODE_IDLE:
                     if account.orders:
                         self._cancel_all(response, account, book_id)
@@ -484,14 +420,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                     ) - ((maker_fee_em * 1e4) if maker_fee_em is not None else 1e9)
                     emergency = (
                         (st.mode == MODE_TAKER and rebate_em < EMERGENCY_TAKER_EXIT_BPS) or
-                        (st.mode == MODE_MAKER and mk_edge_em < EMERGENCY_MAKER_EXIT_BPS) or
-                        # Regime shift: a maker book that just turned volatile is bleeding via adverse
-                        # selection — exit NOW to a WINNING mode (taker/feechurn) instead of waiting
-                        # the dwell. Guard want!=IDLE: flipping to idle would just thrash against the
-                        # idle-cap (which force-promotes excess idle back to maker), and for an excess
-                        # book a small maker bleed (~0.45) still beats the 0.0 idle gets — so stay put.
-                        (st.mode == MODE_MAKER and want != MODE_IDLE
-                         and self._book_vol_bps(st) > CALM_VOL_EXIT_BPS)
+                        (st.mode == MODE_MAKER and mk_edge_em < EMERGENCY_MAKER_EXIT_BPS)
                     )
                     if emergency or (now - st.mode_since_ns) >= self.route_min_dwell_ns:
                         if account.orders:
@@ -526,39 +455,25 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         maker_fee_bps = (maker_fee * 1e4) if maker_fee is not None else 1e9
         maker_edge_bps = half_spread_bps - maker_fee_bps   # capture half-spread, pay the maker fee
 
-        # Per-book volatility (30s mid range) drives the REGIME GATE. CALM = the book isn't moving
-        # much, so maker can actually capture its spread; otherwise a wide spread is adverse
-        # selection (quotes get run over), so maker is OFF and the book rebate-scalps or idles.
-        vol_bps = self._book_vol_bps(st)
-        calm_thresh = CALM_VOL_EXIT_BPS if cur == MODE_MAKER else CALM_VOL_ENTER_BPS
-        calm = vol_bps < calm_thresh
-
-        # Taker fires on rebate ALONE (vol-independent — rebate is direction-independent, robust in
-        # any regime). Single gate: enter >=2bps, stay until <1bps. Vol only routes the NO-rebate
-        # books below (maker if genuinely calm, feechurn/idle if volatile).
         taker_min_rebate = TAKER_REBATE_EXIT_BPS if cur == MODE_TAKER else TAKER_REBATE_ENTER_BPS
-        # For books ALREADY in taker, skip the spread check — transient spread spikes must not eject
-        # a taker book before the rebate drops below exit; _open()'s est_bps gate handles execution.
-        spread_viable = (cur == MODE_TAKER) or (rebate_bps > half_spread_bps)
-        taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_min_rebate and spread_viable
-
-        # Maker is +EV ONLY on CALM books (else adverse selection), AND needs a net spread edge with
-        # the fee below the ceiling. The idle-guard relaxes the edge bar but NOT the calm gate.
+        # When the idle-book guard fires, borderline books get a relaxed enter threshold so they
+        # prefer marginal maker over idle. The fee ceiling is kept strict: a high fee signals
+        # adverse selection regardless of spread, and that does not change in fallback.
         maker_enter_edge = MAKER_FALLBACK_EDGE_BPS if fallback_maker else MAKER_EDGE_ENTER_BPS
         maker_min_edge = MAKER_EDGE_EXIT_BPS if cur == MODE_MAKER else maker_enter_edge
-        maker_ok = ((MODE_MAKER in ALLOWED_MODES) and calm
+        # Taker is only viable when the rebate covers the crossing cost (rebate > half_spread so
+        # est_bps = 2×rebate − 2×half_spread > 0 and _TakerMode._open() will actually execute).
+        # For books ALREADY in taker mode, skip the spread check — transient spread spikes must not
+        # eject a taker book before the rebate itself drops below the exit threshold; the execution
+        # gate in _open() already suppresses trading when the spread is temporarily too wide.
+        spread_viable = (cur == MODE_TAKER) or (rebate_bps > half_spread_bps)
+        taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_min_rebate and spread_viable
+        # Maker requires BOTH a net spread edge AND an absolute fee below the ceiling: a wide spread
+        # on a high-fee book is adverse selection, not opportunity.
+        maker_ok = ((MODE_MAKER in ALLOWED_MODES)
                     and maker_fee_bps < MAKER_MAX_FEE_BPS
                     and maker_edge_bps >= maker_min_edge)
 
-        # FEE-CHURN: no rebate, but the book is volatile enough that the move pays the round-trip
-        # crossing cost (mirrors uid136). Only when rebate-churn is unavailable.
-        fee_paid_bps = max(-rebate_bps, 0.0)
-        churn_cost = 2.0 * half_spread_bps + 2.0 * fee_paid_bps
-        vol_mult = VOL_CHURN_EXIT_MULT if cur == MODE_FEECHURN else VOL_CHURN_ENTER_MULT
-        feechurn_ok = ((MODE_FEECHURN in ALLOWED_MODES) and not taker_ok
-                       and vol_bps >= VOL_CHURN_MIN_BPS and vol_bps >= vol_mult * churn_cost)
-
-        # Priority: rebate-churn (dominant edge) > fee-churn (volatile) > maker (calm) > idle.
         if taker_ok and maker_ok:
             # Both edges available -> prefer the one with more margin above its (dynamic) enter bar.
             # Using maker_enter_edge (not the hardcoded constant) so that fallback-mode promotion of
@@ -567,8 +482,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
                     >= (maker_edge_bps - maker_enter_edge) else MODE_MAKER)
         if taker_ok:
             return MODE_TAKER
-        if feechurn_ok:
-            return MODE_FEECHURN
         if maker_ok:
             return MODE_MAKER
         if MODE_IDLE in ALLOWED_MODES:
@@ -677,24 +590,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         return realized, rtv, matched_ts, gross
 
     # ------------------------------------------------------------------ kappa-3
-    def _record_mid(self, st: _BookState, mid: float, now: int) -> None:
-        """Track recent mids per book for the volatility estimate (FEE-CHURN gate)."""
-        st.mid_log.append((now, mid))
-        cutoff = now - self.vol_window_ns
-        if st.mid_log and st.mid_log[0][0] < cutoff:
-            st.mid_log = [(t, m) for t, m in st.mid_log if t >= cutoff]
-
-    def _book_vol_bps(self, st: _BookState) -> float:
-        """Per-book volatility proxy: peak-to-trough mid range over VOL_WINDOW_S, in bps. Cheap and
-        robust; used only as a routing/entry GATE for FEE-CHURN (does the book move enough to pay the
-        crossing cost?), not a precise EV calc — the PnL-backoff is the safety net if it's wrong."""
-        if len(st.mid_log) < 4:
-            return 0.0
-        mids = [m for _, m in st.mid_log]
-        lo, hi = min(mids), max(mids)
-        mean = sum(mids) / len(mids)
-        return ((hi - lo) / mean * 1e4) if mean > 0 else 0.0
-
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
         cutoff = now - self.kappa_rt_history_ns
         before = len(st.rt_events)
@@ -1055,8 +950,10 @@ class _TakerMode(_Mode):
     def step(self, agent, response, validator, book_id, book, account, st, inv, net,
              best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
         if abs(net) >= agent.exch_min:
-            self._exit(agent, response, validator, book_id, account, inv, net,
-                       best_bid, best_ask, vol_dp, now, st)
+            if not self._exit(agent, response, validator, book_id, account, inv, net,
+                              best_bid, best_ask, vol_dp, now, st):
+                self._maybe_add(agent, response, validator, book_id, book, account, st, inv, net,
+                                best_bid, best_ask, mid, volume_cap, now, vol_dp)
             return
         throttled = st.last_close_ns and (now - st.last_close_ns) < agent.tk_reopen_gap_ns
         if not throttled and self._open(agent, response, validator, book_id, book, account, st,
@@ -1098,32 +995,27 @@ class _TakerMode(_Mode):
         if net > 0:
             q = round(min(abs(net), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
-                return True   # orders cancelled; lot too small to exit this step
+                return True   # orders cancelled; lot too small to exit this step — return True
+                              # so the caller does NOT call _maybe_add() on a SL/TP position
             agent._submit_market(response, book_id, OrderDirection.SELL, q)
         else:
             q = round(min(abs(net), agent._avail(account.quote_balance) / best_ask if best_ask > 0 else abs(net)), vol_dp)
             if q < agent.exch_min:
-                return True   # orders cancelled; lot too small to exit this step
+                return True   # same: prevent _maybe_add() from accumulating past the SL/TP
             agent._submit_market(response, book_id, OrderDirection.BUY, q,
                                  settlement=agent._loan_settlement(account))
         st.last_close_ns = now
         return True
-
-    def _open_viable(self, agent, st, account, best_bid, best_ask, mid) -> bool:
-        """REBATE-CHURN viability: rebate on both legs must exceed the cost of both crossings."""
-        taker_fee = agent._taker_fee_rate(account)
-        if taker_fee is None:
-            return False
-        rebate_bps = -taker_fee * 1e4
-        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 1e9
-        return (2.0 * rebate_bps - 2.0 * half_spread_bps) > 0.0   # rebate both legs minus 2 crossings
 
     def _open(self, agent, response, validator, book_id, book, account, st,
               best_bid, best_ask, mid, volume_cap, now, vol_dp) -> bool:
         taker_fee = agent._taker_fee_rate(account)
         if taker_fee is None or not agent._budget_ok(validator, book_id, st, now, volume_cap):
             return False
-        if not self._open_viable(agent, st, account, best_bid, best_ask, mid):
+        rebate_bps = -taker_fee * 1e4
+        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 1e9
+        est_bps = 2.0 * rebate_bps - 2.0 * half_spread_bps   # rebate both legs minus 2 crossings
+        if est_bps <= 0.0:
             return False
         direction = agent._bias(book, mid)
         q = round(agent.clip, vol_dp)
@@ -1142,25 +1034,40 @@ class _TakerMode(_Mode):
                           "long" if direction == OrderDirection.BUY else "short")
         return True
 
-
-class _FeeChurnMode(_TakerMode):
-    """FEE-paying volatility churn (mirrors uid136). Same fast two-sided churn machinery as
-    REBATE-CHURN, but for books with NO rebate: only cross when the book's recent volatility
-    comfortably exceeds the round-trip crossing cost, so the move pays for the spread + fee. The
-    PnL-backoff idles the book if this turns out net-negative, so the gate can be approximate."""
-
-    name = MODE_FEECHURN
-
-    def _open_viable(self, agent, st, account, best_bid, best_ask, mid) -> bool:
-        vol_bps = agent._book_vol_bps(st)
-        if vol_bps < VOL_CHURN_MIN_BPS:
-            return False
-        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 1e9
+    def _maybe_add(self, agent, response, validator, book_id, book, account, st, inv, net,
+                   best_bid, best_ask, mid, volume_cap, now, vol_dp) -> None:
+        """Bounded same-side build while the rebate is DEEP (so a stacked stop stays net-positive),
+        mirroring 126 averaging into a paid edge. Hard inventory cap keeps the unwind small."""
+        if TK_MAX_INVENTORY_LOTS <= 1:
+            return
         taker_fee = agent._taker_fee_rate(account)
-        fee_bps = max((taker_fee or 0.0) * 1e4, 0.0)
-        cost = 2.0 * half_spread_bps + 2.0 * fee_bps           # round-trip crossing cost
-        return vol_bps >= VOL_CHURN_ENTER_MULT * cost
-
+        if taker_fee is None:
+            return
+        if -taker_fee * 1e4 < TK_PYRAMID_MIN_REBATE_BPS:
+            return
+        if abs(net) + agent.clip > TK_MAX_INVENTORY_LOTS * agent.clip + agent._flat_eps:
+            return
+        if st.last_add_ns and (now - st.last_add_ns) < agent.tk_pyramid_gap_ns:
+            return
+        if not agent._budget_ok(validator, book_id, st, now, volume_cap):
+            return
+        direction = agent._bias(book, mid)
+        pos_dir = OrderDirection.BUY if net > 0 else OrderDirection.SELL
+        if direction != pos_dir:                          # only press our own side
+            return
+        q = round(agent.clip, vol_dp)
+        if q < agent.exch_min:
+            return
+        if direction == OrderDirection.BUY:
+            if agent._avail(account.quote_balance) < q * best_ask:
+                return
+            agent._submit_market(response, book_id, OrderDirection.BUY, q,
+                                 settlement=agent._loan_settlement(account))
+        else:
+            if agent._avail(account.base_balance) < q:
+                return
+            agent._submit_market(response, book_id, OrderDirection.SELL, q)
+        st.last_add_ns = now
 
 class _MakerMode(_Mode):
     """Two-sided spread capture (mirrors UID 109/149). Flat -> quote both sides inside the touch.

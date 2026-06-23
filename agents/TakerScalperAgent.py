@@ -11,15 +11,11 @@ Rules:
   2. One position per book: a book is FLAT xor HELD; the open path runs only when flat.
   3. Wait for full fill: after any submit, st.pending_ns blocks the book until a fill
      resolves it (timeout-recovered).
-  4. Two open modes, selected by the book's taker rebate:
-       churn (rebate >= CHURN_REBATE_BPS): direction-independent fee extraction; maximise
-         round-trip frequency — the rebate alone is +EV.
-       kappa  (rebate < CHURN_REBATE_BPS): directional scalp gated on kappa projection;
-         open only when the estimated edge clears the floor and improves kappa.
-     Both close on TP / SL / max-hold (hold windows differ by mode).
+  4. Kappa-3 + PnL: open a directional scalp only when the kappa gate clears; close on
+     TP / SL / max-hold.
 
 Per book each tick:
-  reconcile -> pending? wait : held? close(TP/SL/time) : open(churn | kappa | activity | idle)
+  reconcile -> pending? wait : held? close(TP/SL/time) : open(kappa | activity | idle)
 
 RT logging -> main validator only.
 """
@@ -66,17 +62,6 @@ ACTIVITY_DEADLINE_S = 500.0
 MIN_REOPEN_GAP_S = 3.0
 # After submitting, wait this long for the fill before assuming the order was lost.
 PENDING_TIMEOUT_S = 5.0
-
-# ---- deep-rebate CHURN sub-mode (regime-gated) ----
-# On a deeply-rebated book the EDGE IS THE REBATE: direction-independent, locked in at fill.
-# High kappa comes from maximising round-trip frequency, not waiting for a gross move.
-# Activates ONLY when rebate_bps >= CHURN_REBATE_BPS; below that the proven scalp path is unchanged.
-# One lot at a time — inventory stays <=1 lot. To revert entirely, set CHURN_REBATE_BPS very high.
-CHURN_REBATE_BPS = 5.0             # gate: engage churn only on books at least this rebated
-CHURN_RT_MAX = 100                 # higher per-book RT cap (vs RT_MAX=28)
-CHURN_REOPEN_GAP_S = 0.5           # near-immediate reopen (vs MIN_REOPEN_GAP_S=3.0)
-CHURN_MIN_HOLD_S = 0.8             # churn-only min hold (proven path keeps MIN_HOLD_S=1.5)
-CHURN_MAX_HOLD_S = 1.2             # churn-only max hold; targets ~1s median (vs MAX_HOLD_S=4.0)
 
 # Kappa-3 (3h history for score projection).
 KAPPA_TAU = 0.0
@@ -144,13 +129,9 @@ class TakerScalperAgent(FinanceSimulationAgent):
         max_hold_s = MAX_HOLD_S * (0.92 + 0.16 * jitter)
         activity_s = ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter)   # ~460-500s
 
-        churn_max_hold_s = CHURN_MAX_HOLD_S * (0.92 + 0.16 * jitter)
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
-        self.churn_min_hold_ns = int(CHURN_MIN_HOLD_S * _NS)   # unjittered, like min_hold_ns
-        self.churn_max_hold_ns = int(churn_max_hold_s * _NS)
         self.min_reopen_gap_ns = int(MIN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
-        self.churn_reopen_gap_ns = int(CHURN_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
         self.activity_deadline_ns = int(activity_s * _NS)
         self.pending_timeout_ns = int(PENDING_TIMEOUT_S * _NS)
@@ -175,8 +156,6 @@ class TakerScalperAgent(FinanceSimulationAgent):
             f"reopen_gap={MIN_REOPEN_GAP_S}s rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"activity_deadline={activity_s:.0f}s "
             f"kappa_gate(est>={KAPPA_EST_PNL_FLOOR},rebate>={KAPPA_MIN_REBATE_BPS}bps) "
-            f"churn(rebate>={CHURN_REBATE_BPS}bps hold={CHURN_MIN_HOLD_S}-{churn_max_hold_s:.1f}s "
-            f"reopen={CHURN_REOPEN_GAP_S}s max={CHURN_RT_MAX}) "
             f"rt_log={MAIN_VALIDATOR[:8]}"
         )
 
@@ -644,37 +623,20 @@ class TakerScalperAgent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         est_pnl = self._estimate_rt_pnl(rate, book, self.min_order_size)
         paid = rate <= 0.0 and est_pnl > 0.0   # genuinely paid to take, +EV round-trip
-        rebate_bps = -rate * 1e4               # rate < 0 => paid to take
+        reopen_ok = st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
 
-        if rebate_bps >= CHURN_REBATE_BPS:
-            # DEEP-REBATE CHURN (regime-gated; mirrors uid 120). The rebate alone is +EV and
-            # direction-independent, so we MAXIMISE round-trip frequency: skip the est_pnl floor and
-            # the kappa-projection gate (those throttle the proven scalp), use a near-zero reopen gap
-            # and a higher RT cap. The volume cap is kept as the over-churn safety. One lot at a time,
-            # so inventory stays <=1 lot.
-            reopen_ok = st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.churn_reopen_gap_ns
-            if (
-                paid
-                and reopen_ok
-                and self._rt_count(st, now) < CHURN_RT_MAX
-                and self._rolled_quote_volume(validator, book_id, now) < volume_cap
-            ):
-                self._try_open(response, validator, book_id, book, account, direction, now, "churn", prune_vol=True)
-                return
-        else:
-            # PROVEN directional scalp — unchanged: throttled per book, gated on kappa.
-            reopen_ok = st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
-            if (
-                paid
-                and reopen_ok
-                and self._rt_count(st, now) < RT_MAX
-                and est_pnl >= KAPPA_EST_PNL_FLOOR
-                and rate <= self.kappa_min_rebate_rate
-                and self._rolled_quote_volume(validator, book_id, now) < volume_cap
-                and self._kappa_open_ok(st, validator, book_id, est_pnl, now)
-            ):
-                self._try_open(response, validator, book_id, book, account, direction, now, "kappa", prune_vol=True)
-                return
+        # Profit engine: scalp the directional edge, throttled per book, gated on kappa.
+        if (
+            paid
+            and reopen_ok
+            and self._rt_count(st, now) < RT_MAX
+            and est_pnl >= KAPPA_EST_PNL_FLOOR
+            and rate <= self.kappa_min_rebate_rate
+            and self._rolled_quote_volume(validator, book_id, now) < volume_cap
+            and self._kappa_open_ok(st, validator, book_id, est_pnl, now)
+        ):
+            self._try_open(response, validator, book_id, book, account, direction, now, "kappa", prune_vol=True)
+            return
 
         # Activity backstop: guarantee >=1 RT per book per window.
         if self._activity_force_due(validator, st, now):
@@ -699,7 +661,9 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self, validator: str, book_id: int, st: _BookState, account, book,
         direction: OrderDirection, now: int, opened: bool,
     ) -> None:
-        """Diagnostic (main validator only): trace whether the forced-activity RT opened, and why not."""
+        """Diagnostic (main validator only): trace whether the forced-activity RT opened, and why it
+        skipped if not. Added while chasing the activity-clock bug; SAFE TO REMOVE once the fix is
+        confirmed live (the validator's activity_factor is the authoritative signal)."""
         if not self._rt_log_enabled(validator):
             return
         ref = st.last_rt_ns if st.last_rt_ns > 0 else self._agent_start_ns.get(validator, 0)
@@ -727,14 +691,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         mid = self._mid(book)
         if mid is None or mid <= 0 or pos.avg <= 0:
             return
-        # On a deep-rebate (churn) book, recycle faster — shorter MIN and MAX hold — to harvest the
-        # rebate over more round-trips; TP/SL are unchanged. Below the churn gate, the proven holds apply.
-        rate = self._taker_fee_rate(account)
-        churn = rate is not None and (-rate * 1e4) >= CHURN_REBATE_BPS
-        min_hold_ns = self.churn_min_hold_ns if churn else self.min_hold_ns
-        max_hold_ns = self.churn_max_hold_ns if churn else self.max_hold_ns
         hold_ns = (now - pos.entry_ts) if pos.entry_ts else 0
-        if hold_ns < min_hold_ns:
+        if hold_ns < self.min_hold_ns:
             return
 
         bid = book.bids[0].price if book.bids else None
@@ -744,7 +702,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
             reason = "tp"
         elif gross_bps <= -MAX_GROSS_SL_BPS:
             reason = "sl"
-        elif hold_ns >= max_hold_ns:
+        elif hold_ns >= self.max_hold_ns:
             reason = "time"
         else:
             return
