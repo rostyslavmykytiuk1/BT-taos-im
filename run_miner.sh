@@ -22,7 +22,7 @@ export BT_NO_PARSE_CLI_ARGS=false
 #   First setup:    ./run_miner.sh -G -w mywallet -h myhotkey
 #   Update/restart: ./run_miner.sh
 #   Override steps: ./run_miner.sh -t "gtx_train_steps=100 gtx_train_batch_size=8"
-#   Fleet miner:    ./run_miner.sh -P miner-1 -w sn79 -h sn79-1 -a 8091
+#   Fleet miner:    ./run_miner.sh -P miner-1 -w matt -h matt-1 -a 8091
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
