@@ -59,7 +59,7 @@ If you prefer to manage each step individually, the five steps below describe th
 - Bittensor wallet, registered on the subnet.
 - GPU recommended.
 - One bucket from **R2**, **Storj**, or **Hippius**. The on-chain commitment is fixed at 128 bytes (account_id + access_key + secret); these are the providers that fit.
-- Project Python venv (e.g. `venv/sn79/`) with deps installed (`pip install -e .`).
+- Project Python venv (e.g. `venv/matt/`) with deps installed (`pip install -e .`).
 
 ---
 
