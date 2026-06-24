@@ -234,7 +234,7 @@ def add_validator_args(cls, parser):
         "--neuron.burn_ratio",
         type=float,
         help="Ratio of miner emissions to burn.",
-        default=0.79,
+        default=0.0,
     )
 
 
