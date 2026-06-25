@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 from dataclasses import dataclass
 import os
+import json
 import msgpack
 import traceback
 import time
@@ -112,6 +113,13 @@ class FinanceSimulationAgent(SimulationAgent):
         self.history_len = int(getattr(config, "history_len", 10))
         self.accounts = {}
         self.event_history : dict[str, AgentEventHistory | None] = {}
+        # Optional market-snapshot emitter (OFF unless `market_snapshot_dir` param is set).
+        # Dumps a compact per-book mid/spread/fee snapshot for ALL books each tick (throttled),
+        # read by tools/market_monitor.py to decide the taker/maker regime from live
+        # microstructure (leading) rather than validator scores (which lag ~20h).
+        self._snapshot_dir = getattr(config, "market_snapshot_dir", None)
+        self._snapshot_interval = float(getattr(config, "market_snapshot_interval_s", 5.0))
+        self._snapshot_last : dict[str, float] = {}
         if not hasattr(config, "lazy_load"):
             config.lazy_load = False
         else:
@@ -483,6 +491,67 @@ class FinanceSimulationAgent(SimulationAgent):
         bt.logging.debug("." + debug_text)
         if bt.logging.current_state_value == 'Info':
             bt.logging.info("." + update_text)
+        try:
+            self._emit_market_snapshot(state)
+        except Exception as _snap_ex:
+            bt.logging.debug(f"market snapshot emit skipped: {_snap_ex}")
+
+    def _emit_market_snapshot(self, state: MarketSimulationStateUpdate) -> None:
+        """Write a compact per-book snapshot (mid / spread_bps / taker_fee_bps / maker_fee_bps)
+        for ALL books to `market_snapshot_dir`, throttled to `market_snapshot_interval_s`.
+
+        No-op unless `market_snapshot_dir` was passed in --agent.params, so every agent that does
+        not opt in pays only a single getattr per tick. One atomically-written file per validator
+        (`market_snapshot.<hotkey8>.json`); the latest from each validator's own sim. Consumed by
+        tools/market_monitor.py for a LEADING taker/maker regime call (live fees+spread) instead of
+        lagging ~20h validator scores.
+        """
+        out_dir = getattr(self, "_snapshot_dir", None)
+        if not out_dir:
+            return
+        validator = state.dendrite.hotkey
+        now_wall = time.time()
+        if now_wall - self._snapshot_last.get(validator, 0.0) < self._snapshot_interval:
+            return
+        self._snapshot_last[validator] = now_wall
+
+        books_out = []
+        for book_id, book in state.books.items():
+            try:
+                if not book.bids or not book.asks:
+                    continue
+                bid = book.bids[0].price
+                ask = book.asks[0].price
+                if bid <= 0 or ask <= 0:
+                    continue
+                mid = 0.5 * (bid + ask)
+                spread_bps = (ask - bid) / mid * 1e4 if mid > 0 else 0.0
+                acct = self.accounts.get(book_id)
+                fees = getattr(acct, "fees", None) if acct is not None else None
+                tf = getattr(fees, "taker_fee_rate", None) if fees is not None else None
+                mf = getattr(fees, "maker_fee_rate", None) if fees is not None else None
+                books_out.append([
+                    book_id, round(mid, 6), round(spread_bps, 3),
+                    round(tf * 1e4, 4) if tf is not None else None,
+                    round(mf * 1e4, 4) if mf is not None else None,
+                ])
+            except Exception:
+                continue
+
+        payload = {
+            "ts_ns": int(state.timestamp),
+            "wall": now_wall,
+            "validator": validator,
+            "book_count": getattr(self.simulation_config, "book_count", len(state.books)),
+            "cols": ["book", "mid", "spread_bps", "taker_fee_bps", "maker_fee_bps"],
+            "books": books_out,
+        }
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"market_snapshot.{validator[:8]}.json")
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
 
     # Handler functions for various simulation events, to be overridden in agent implementations.
     def onStart(self, event : SimulationStartEvent) -> None:

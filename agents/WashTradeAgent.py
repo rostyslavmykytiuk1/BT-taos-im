@@ -50,7 +50,6 @@ Params (QUOTE the whole AGENT_PARAMS string in .env so spaces survive sourcing):
   wash_activity_s    float (default 480)
   wash_giveup_s      float (default 420)      (force-flatten a stuck position; < 600 window)
   wash_entry_slip_bps float (default 12)      (slippage cap on the marketable entry)
-  wash_sink_flatten_lots float (default 2.0)
   wash_summary_s     float (default 30)
   wash_debug         0 | 1
 """
@@ -82,7 +81,6 @@ DEF_MARGIN_BPS = 3.0
 DEF_ACTIVITY_S = 480.0
 DEF_GIVEUP_S = 420.0
 DEF_ENTRY_SLIP_BPS = 12.0
-DEF_SINK_FLATTEN_LOTS = 2.0
 DEF_MAX_BOOKS = 80
 DEF_SUMMARY_S = 30.0
 PENDING_TIMEOUT_S = 5.0
@@ -155,7 +153,6 @@ class WashTradeAgent(FinanceSimulationAgent):
         self.activity_ns = int(float(getattr(cfg, "wash_activity_s", DEF_ACTIVITY_S)) * _NS)
         self.giveup_ns = int(float(getattr(cfg, "wash_giveup_s", DEF_GIVEUP_S)) * _NS)
         self.entry_slip = float(getattr(cfg, "wash_entry_slip_bps", DEF_ENTRY_SLIP_BPS)) / 1e4
-        self.sink_flatten_lots = float(getattr(cfg, "wash_sink_flatten_lots", DEF_SINK_FLATTEN_LOTS))
         self.summary_ns = int(float(getattr(cfg, "wash_summary_s", DEF_SUMMARY_S)) * _NS)
         self.debug = bool(int(float(getattr(cfg, "wash_debug", 0))))
         self.pending_timeout_ns = int(PENDING_TIMEOUT_S * _NS)
@@ -222,8 +219,13 @@ class WashTradeAgent(FinanceSimulationAgent):
         self._book_count = getattr(cfg, "book_count", self._book_count)
         now = state.timestamp
         accounts = state.accounts.get(self.uid, {})   # per-request → no shared-field race
-        targets = self._target_books(state, accounts)
-        chan = self._read_channel(validator, sim_id) if self.role == "sink" else {}
+        if self.role == "sink":
+            chan = self._read_channel(validator, sim_id)
+            held = [b for b, v in self.inv.get(validator, {}).items() if abs(self._net_qty(v)) >= self.exch_min]
+            targets = [b for b in (set(int(k) for k in chan.keys()) | set(held)) if b in state.books and b in accounts]
+        else:
+            chan = {}
+            targets = self._target_books(state, accounts)
         for book_id in targets:
             book = state.books.get(book_id)
             account = accounts.get(book_id) if book else None
@@ -330,33 +332,32 @@ class WashTradeAgent(FinanceSimulationAgent):
         net = self._net_qty(inv)
         best_bid, best_ask = book.bids[0], book.asks[0]
 
-        cap = self.sink_flatten_lots * max(self.lot_max, self.exch_min)   # flatten residual
-        if abs(net) > cap:
-            self._flatten(response, validator, account, book_id, net, best_bid.price, best_ask.price, "rebalance")
-            return
-
-        if not exit_entry:                                  # winner not holding here → nothing to fill
+        if not exit_entry:                                  # winner not holding here → flatten our residual
+            if abs(net) >= self.exch_min:
+                self._flatten(response, validator, account, book_id, net, best_bid.price, best_ask.price, "residual")
             return
         side = exit_entry.get("s")
         price = exit_entry.get("p")
         wqty = exit_entry.get("q")
         if price is None or wqty is None or price <= 0:
             return
-        # DYNAMIC, NO CAP: sweep the ENTIRE book depth up to (and incl) the winner's exit price, so the
-        # marketable IOC is guaranteed to reach the winner's resting order. Bounded ONLY by owned balance
-        # (never a loan). Over-sizing is safe — the IOC limit at `price` never fills past the winner's
-        # exit, so excess cancels. The `_waiting` guard above stops duplicate in-flight orders; while the
-        # winner is still holding it keeps re-publishing its remaining qty, so we retry until it's filled.
+        # FILL UNTIL WE REACH THE WINNER. Sweep the ENTIRE depth up to the winner's exit price + its qty,
+        # so the marketable IOC always reaches the winner's resting order (it is the last order <= price).
+        # NO cap, NO skip — bounded only by owned balance (no loan). Winner win-rate = 100%; the sink's
+        # loss/inventory is irrelevant by design (the sink is the sacrifice). The `_waiting` guard stops
+        # duplicate in-flight orders; the winner keeps publishing its remaining qty until actually filled.
         if side == int(OrderDirection.SELL):               # winner SELL exit → sink BUYS up through it
             depth = sum((a.quantity or 0.0) for a in book.asks if a.price <= price + self._tick / 2)
-            q = min(depth + wqty, self._free(account.quote_balance) / max(price, 1e-9))   # +wqty buffer
+            q = min(depth + wqty, self._free(account.quote_balance) / max(price, 1e-9))
             q = round(q, self._vd_or(4))
+            self._dbg(validator, f"SINK book={book_id} BUY exitp={price} ask={best_ask.price} bid={best_bid.price} depth={depth:.3f} q={q:.3f}")
             if q >= self.exch_min:
                 self._submit(response, validator, book_id, OrderDirection.BUY, q, round(price, self._pd), ioc=True)
-        else:                                              # winner BUY exit → sink SELLS owned base down through it
+        else:                                              # winner BUY exit → sink SELLS down through it
             depth = sum((bd.quantity or 0.0) for bd in book.bids if bd.price >= price - self._tick / 2)
-            q = min(depth + wqty, self._free(account.base_balance))   # owned base only, no loan
+            q = min(depth + wqty, self._free(account.base_balance))
             q = round(q, self._vd_or(4))
+            self._dbg(validator, f"SINK book={book_id} SELL exitp={price} bid={best_bid.price} ask={best_ask.price} depth={depth:.3f} q={q:.3f}")
             if q >= self.exch_min:
                 self._submit(response, validator, book_id, OrderDirection.SELL, q, round(price, self._pd), ioc=True)
 
@@ -435,14 +436,17 @@ class WashTradeAgent(FinanceSimulationAgent):
         if qty < self.exch_min or price <= 0:
             return
         if direction == OrderDirection.SELL and self._free(account.base_balance) < qty - self._flat_eps:
+            self._dbg(validator, f"WIN NO-REST book={book_id} SELL {qty} > free_base={self._free(account.base_balance):.3f}")
             return                                          # never rest a sell beyond owned base
         vtick = 0.5 * 10 ** (-self._vd_or(4))
         for o in (account.orders or []):
             side = OrderDirection.BUY if o.side == 0 else OrderDirection.SELL
             if side == direction and o.price is not None and abs(o.price - price) < self._tick / 2 \
                     and abs((o.quantity or 0.0) - qty) < vtick:
+                self._dbg(validator, f"WIN exit-already-rest book={book_id} {qty}@{price}")
                 return
         self._cancel_all(response, account, book_id)
+        self._dbg(validator, f"WIN REST book={book_id} {'SELL' if direction == OrderDirection.SELL else 'BUY'} {qty}@{price}")
         response.limit_order(book_id=book_id, direction=direction, quantity=qty, price=price,
                              postOnly=True, timeInForce=TimeInForce.GTT, expiryPeriod=self.quote_expiry_ns,
                              stp=STP.CANCEL_OLDEST)
@@ -689,9 +693,8 @@ class WashTradeAgent(FinanceSimulationAgent):
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _rt_log_enabled(validator):
-        return validator == MAIN_VALIDATOR
+    def _rt_log_enabled(self, validator):
+        return self.debug or validator == MAIN_VALIDATOR   # debug → log on EVERY validator
 
 
 if __name__ == "__main__":
