@@ -260,11 +260,10 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         self.volume_assessment_ns = VOLUME_ASSESSMENT_NS
 
         # --- config toggles (baked into AGENT_PARAMS at launch; default = the V2/final behavior) ---
-        # Taker FORCE-ACTIVITY (= TakerScalper's activity backstop): keep a ROUTED taker book dense/scored with a
-        # rebate-funded RT when natural profit-opens go quiet. DISTINCT from idle (which is "no edge ->
-        # don't trade"). ON by default (breadth wins for rebate-funded takers); A/B-able. Maker has NO
-        # flat force-activity (maker RTs pay the fee) — the rebate-vs-fee asymmetry, plan §5.4.
-        self.tk_force_activity = self._cfg_float("tk_force_activity", 1.0) > 0
+        # NB: taker FORCE-ACTIVITY (= TakerScalper's activity backstop) is ALWAYS ON now (toggle removed):
+        # a ROUTED taker book always gets a rebate-funded RT when natural profit-opens go quiet, to stay
+        # dense/scored. DISTINCT from idle ("no edge -> don't trade"). Maker has NO flat force-activity
+        # (maker RTs pay the fee) — the rebate-vs-fee asymmetry, plan §5.4.
         # Hard idle cap: never let >MAX_IDLE_BOOKS books idle at once (a NEW idle is redirected to the
         # least-bad trade axis; an already-idle book is never evicted — slots free only on edge
         # recovery). Protects the kappa median from the >48-idle 0.0-crater. Toggle (default ON).
@@ -334,7 +333,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             f"route(taker_rebate>={TAKER_REBATE_ENTER_BPS}/{TAKER_REBATE_EXIT_BPS}bps cover={TAKER_SPREAD_COVER}, "
             f"maker_edge>={MAKER_EDGE_ENTER_BPS}/{MAKER_EDGE_EXIT_BPS}bps) "
             f"taker(tp={TK_TP_BPS} sl={TK_SL_BPS}bps hold={TK_MIN_HOLD_S}-{TK_MAX_HOLD_S}s "
-            f"rebate_floor={TK_REBATE_FLOOR_BPS} single-open force_activity={'on' if self.tk_force_activity else 'off'}) "
+            f"rebate_floor={TK_REBATE_FLOOR_BPS} single-open force_activity=on) "
             f"maker(giveup={MK_EXIT_GIVEUP_S:.0f}s stop=[{MK_STOP_FLOOR_BPS:.0f},{MK_STOP_CAP_BPS:.0f}]bps "
             f"walk->breakeven cap={MK_MAX_INVENTORY_LOTS}lot reprice={REPRICE_KEEP_TICKS}t) "
             f"idle({'ON' if self.allow_idle else 'OFF(trade-all)'} hard_cap={MAX_IDLE_BOOKS}"
@@ -1102,11 +1101,10 @@ class _IdleMode(_Mode):
 
 class _TakerMode(_Mode):
     """Deep-rebate scalper = TakerScalper. SINGLE small clip in the microprice-bias direction; exit
-    on TP / SL / max-hold within seconds. No pyramiding, no internal sleep. KEEPS TakerScalper's flat
-    force-activity backstop (toggle tk_force_activity, default ON): a routed taker book has a real
-    rebate, so a forced RT is rebate-funded (~breakeven) and keeps the book dense/scored — DISTINCT
-    from idle (the router's decision to NOT trade a no-edge book). Open gate = rebate>=2bps AND
-    est_pnl>0 on the raw spread."""
+    on TP / SL / max-hold within seconds. No pyramiding, no internal sleep. ALWAYS KEEPS TakerScalper's
+    flat force-activity backstop: a routed taker book has a real rebate, so a forced RT is rebate-funded
+    (~breakeven) and keeps the book dense/scored — DISTINCT from idle (the router's decision to NOT trade
+    a no-edge book). Open gate = rebate>=2bps AND est_pnl>0 on the raw spread."""
 
     name = MODE_TAKER
 
@@ -1131,7 +1129,7 @@ class _TakerMode(_Mode):
         # forced RT is rebate-funded (~breakeven) and keeps the book dense/scored (clears the >=3-RT
         # kappa gate). This is TakerScalper's activity backstop; idle is the router's decision to NOT
         # trade a no-edge book. (Maker has NO flat force-activity — maker RTs PAY the fee.)
-        if agent.tk_force_activity and agent._activity_due(st, now):
+        if agent._activity_due(st, now):
             self._force_open(agent, response, validator, book_id, book, account, st,
                              best_bid, best_ask, mid, now, vol_dp)
 

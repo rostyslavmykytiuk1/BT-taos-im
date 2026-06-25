@@ -1,6 +1,6 @@
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-[SN-79 REGIME CHANGE] MIXED -> MAKER @ 2026-06-25 13:59:35
-  recommend: PureMakerAgent (post liquidity; favor books with taker flow / per-book MTR < 0.4 for rebate+spread)
-  elite kappa: maker_med=0.1138 (6) taker_med=0.0715 (14) | market MTR=0.462 fees maker=+1.6bps taker=+0.7bps
+[SN-79 REGIME CHANGE] MAKER -> MIXED @ 2026-06-25 14:49:43
+  recommend: no clear edge — hold current mix; AdaptiveRouter (routes per book) is the safe default
+  elite kappa: maker_med=0.0720 (8) taker_med=0.0798 (12) | market MTR=0.468 fees maker=+1.9bps taker=+0.4bps
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

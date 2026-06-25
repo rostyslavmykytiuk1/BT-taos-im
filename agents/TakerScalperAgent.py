@@ -53,9 +53,9 @@ EXCHANGE_MIN_ORDER_SIZE = 0.25
 # Entry lot, comfortably above the floor so a fill is always a sellable holding.
 LOT = 0.3
 
-# Hold / exit (TIGHTER than v1 → lower downside → higher kappa; matches our edge over uid184's 30s holds).
+# Hold / exit: tight holds → lower downside → higher kappa; our edge over uid184's ~30s holds.
 MIN_HOLD_S = 1.5
-MAX_HOLD_S = 3.0                   # v1: 4.0
+MAX_HOLD_S = 3.0
 MIN_GROSS_TP_BPS = 2.5            # gross TP. Net win (~TP + 2×rebate) beats the rebate-cushioned SL -> per-RT skew is net-positive (kappa cubes downside).
 MAX_GROSS_SL_BPS = 4.0            # DEFAULT calm-regime cut (proven). Rebate-cushioned -> nets ~breakeven, NOT the old 2bps negative scratch-stream; and 2bps false-triggers on our own market-open impact (the open lifts the touch ~half a spread). Toggle max_gross_sl_bps=12 for adverse/no-cut, =2 to A/B the ultra-tight cut.
 
@@ -65,22 +65,21 @@ MAX_GROSS_SL_BPS = 4.0            # DEFAULT calm-regime cut (proven). Rebate-cus
 # (fee < -2bps); in the (-2bps, 0] band it KEEPS its current state (hysteresis). NOTE: spread is NOT
 # ignored for OPENS — the open gate uses est_pnl>0 (spread-aware), only the sleep SET ignores spread.
 SLEEP_WAKE_FEE_BPS = -2.0         # sleep -> wake only when fee drops below this (rebate > 2bps); enter = fee > 0
-# Hard cap on simultaneously-sleeping books — LOAD-BEARING: >48 inactive books makes the validator inject
-# hard 0.0 entries into the kappa median (reward.py) and CRATERS the score. When more books want to sleep
-# than free slots, the WORST (highest-fee) ones sleep and the rest stay awake; once full, NO more sleep.
+# Hard cap on simultaneously-sleeping books — LOAD-BEARING: the validator's reward.py injects hard 0.0
+# entries into the kappa median once ~48 books are inactive, which CRATERS the score. 40 keeps a
+# deliberate ~8-book margin below that cliff (40 sleep => >=88 of 128 active). When more books want to
+# sleep than free slots, the WORST (highest-fee) ones sleep and the rest stay awake; once full, NO more.
 MAX_SLEEP = 40
-# Reference breadth floor (= book_count - MAX_SLEEP for 128 books); not used for selection.
-TARGET_ACTIVE_BOOKS = 88
 
 # Margin leverage for a SELL open when free base is insufficient.
 SHORT_LEVERAGE = 1.0
 
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 40                        # max profit RTs per book per window (v1: 28 — V2 denser)
+RT_MAX = 40                        # max profit RTs per book per window
 
 # Force a taker RT once this long since the last RT (kept under RT_WINDOW_S).
 ACTIVITY_DEADLINE_S = 500.0
-# Min gap between RT closes and the next profit open (per book; throttles churn). V2 denser (v1: 3.0).
+# Min gap between RT closes and the next profit open (per book; throttles churn).
 MIN_REOPEN_GAP_S = 2.0
 # After submitting, wait this long for the fill before assuming the order was lost.
 PENDING_TIMEOUT_S = 5.0
@@ -142,7 +141,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self.min_order_size = LOT
         self._min_qty = LOT / 2             # RT-log gate (meaningful close)
         self.exch_min = EXCHANGE_MIN_ORDER_SIZE
-        self._flat_eps = 0.5 * 10 ** (-4)  # overwritten by _sync_order_size on first respond
+        self._flat_eps = 0.5 / 1e4  # overwritten by _sync_order_size on first respond
         self._volume_decimals: int | None = None
         self.volume_assessment_ns = VOLUME_ASSESSMENT_NS
 
@@ -301,8 +300,6 @@ class TakerScalperAgent(FinanceSimulationAgent):
         """One sequential action per book: wait while an order is in flight, else close the
         held position or, when flat, decide whether to open."""
         pos = self._book_positions(validator).setdefault(book_id, _Position())
-        self._reconcile_position(account, pos, vol_dp)
-
         st = self._bstate(validator, book_id)
         if self._agent_start_ns.get(validator, 0) == 0 and now > 0:
             self._agent_start_ns[validator] = now
@@ -313,6 +310,11 @@ class TakerScalperAgent(FinanceSimulationAgent):
         if st.pending_ns and (now - st.pending_ns) < self.pending_timeout_ns:
             return
         st.pending_ns = 0   # presumed filled / lost; re-derive from the position
+
+        # Reconcile tracked size to the real held base AFTER the in-flight guard: while a close is in
+        # flight the exchange hasn't debited the base yet, so reconciling then could clamp against a
+        # stale mid-settlement balance. Only reconcile once no order is pending.
+        self._reconcile_position(account, pos, vol_dp)
 
         # Hold vs flat by the EXCHANGE-MIN threshold (the AR's robust rule), NOT flat_eps: a sub-exch-min
         # remnant is UN-CLOSEABLE (below the 0.25 order minimum), so treat it as FLAT and open over it —
@@ -341,9 +343,12 @@ class TakerScalperAgent(FinanceSimulationAgent):
         if validator is None:
             return
         ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns
+        # Normalize the raw int side (0=buy/1=sell) to OrderDirection at the boundary so the value
+        # matches the `direction: OrderDirection` hints downstream (was relying on IntEnum equality).
+        direction = OrderDirection.BUY if event.side == 0 else OrderDirection.SELL
         self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
         self._apply_fill(
-            validator, event.bookId, event.side, event.quantity, event.price, event.takerFee, ts_ns,
+            validator, event.bookId, direction, event.quantity, event.price, event.takerFee, ts_ns,
         )
 
     # ------------------------------------------------------------------ state
@@ -419,6 +424,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         pos = self._book_positions(validator).setdefault(book_id, _Position())
         st = self._bstate(validator, book_id)
         st.pending_ns = 0   # a fill resolved the in-flight order
+        st.pending_kind = ""   # clear the in-flight open tag symmetrically with the lock
 
         signed = qty if direction == OrderDirection.BUY else -qty
         prev = pos.qty
@@ -478,8 +484,16 @@ class TakerScalperAgent(FinanceSimulationAgent):
         if abs(pos.qty) < self._flat_eps:
             self._clear_position(pos)
         elif (prev > 0) != (pos.qty > 0):
+            # FLIP: this fill over-closed the prior side, leaving a residual on the OPPOSITE side. Under
+            # single-open this is the dust-absorption path (open over a sub-exch-min opposite remnant),
+            # so re-anchor the new leg AND give it a fresh RT open context so its eventual close logs a
+            # real open_reason/side instead of a stale one (gated: only stashes if none exists).
             pos.avg, pos.entry_ts = price, ts
             pos.entry_fee = trade_fee * (abs(pos.qty) / qty) if qty > 0 else 0.0
+            self._ensure_rt_open_ctx(
+                validator, book_id,
+                OrderDirection.BUY if pos.qty > 0 else OrderDirection.SELL, ts,
+            )
 
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
         cutoff = now - self.kappa_rt_history_ns
@@ -515,7 +529,11 @@ class TakerScalperAgent(FinanceSimulationAgent):
             return []
 
         cutoff = now - self.kappa_rt_history_ns
-        by_ts = {t: p for t, p in self._bstate(validator, book_id).rt_events if t >= cutoff}
+        # SUM same-timestamp RTs on this book (matches the validator's per-bucket += ), don't overwrite.
+        by_ts: dict[int, float] = {}
+        for t, p in self._bstate(validator, book_id).rt_events:
+            if t >= cutoff:
+                by_ts[t] = by_ts.get(t, 0.0) + p
         if extra is not None:
             by_ts[extra[0]] = extra[1]
         return [by_ts.get(ts, 0.0) for ts in timestamps]
@@ -529,7 +547,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         return s[mid] if len(s) % 2 else 0.5 * (s[mid - 1] + s[mid])
 
     @classmethod
-    def _kappa3_raw(cls, pnl_series: list[float], tau: float = KAPPA_TAU) -> float | None:
+    def _kappa3_raw(cls, pnl_series: list[float]) -> float | None:
+        tau = KAPPA_TAU
         if not pnl_series or sum(1 for x in pnl_series if x != 0.0) < KAPPA_MIN_OBS:
             return None
 
@@ -667,8 +686,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
         )
 
     # ------------------------------------------------------------------ open / close
-    def _rt_count(self, st: _BookState, now: int, window_ns: int | None = None) -> int:
-        cutoff = now - (self.rt_window_ns if window_ns is None else window_ns)
+    def _rt_count(self, st: _BookState, now: int) -> int:
+        cutoff = now - self.rt_window_ns
         return sum(1 for ts, _ in st.rt_events if ts >= cutoff)
 
     def _open(
@@ -853,8 +872,12 @@ class TakerScalperAgent(FinanceSimulationAgent):
         """Flatten the whole position with one market order."""
         qty = round(abs(pos.qty), vol_dp)
         if pos.qty > 0:
-            free = account.base_balance.free if account.base_balance else 0.0
-            qty = round(min(qty, free), vol_dp)
+            # Size from held = free + reserved (the SAME view _reconcile_position uses to keep the
+            # position alive). Clamping to free alone could under-size the flatten and strand a real
+            # long whenever any base is momentarily reserved -> orphan + RT-log/pending leak.
+            bal = account.base_balance
+            held = (bal.free + (bal.reserved or 0.0)) if bal else 0.0
+            qty = round(min(qty, held), vol_dp)
             direction, settlement = OrderDirection.SELL, LoanSettlementOption.NONE
         else:
             direction, settlement = OrderDirection.BUY, self._loan_settlement(account)
