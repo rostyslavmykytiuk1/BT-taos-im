@@ -19,6 +19,12 @@ Signal (per reading, main validator only):
 Alert on a CONFIRMED change (CONFIRM consecutive readings agreeing on the new regime):
   1) prints a banner, 2) appends tools/regime_history.log, 3) writes tools/REGIME_ALERT.txt,
   4) if env WASH_REGIME_WEBHOOK is set, POSTs JSON {text: ...} to it (Telegram/Discord/Slack/etc).
+
+ALSO alert when the MAIN validator's simulation REFRESHES — its sim_id (stamped on every
+metric line) changes, i.e. a NEW simulation started (kappa history, positions and agent state
+all reset on changeover). The refresh alert BUNDLES the current market status (verdict + MTR +
+fees + elite kappa) so you see the regime at the moment of the reset. NOTE: the leaderboard
+kappa is cold for ~60-90 min after a refresh, so the bundled verdict is provisional.
 """
 import argparse, json, os, re, statistics, sys, time, urllib.request
 from datetime import datetime
@@ -38,7 +44,7 @@ CONFIRM = 2           # consecutive agreeing readings required before declaring 
 
 RECO = {
     "MAKER": "PureMakerAgent (post liquidity; favor books with taker flow / per-book MTR < 0.4 for rebate+spread)",
-    "TAKER": "TakerScalperV2Agent (live) / TakerScalperV3Agent (tuned, A/B) — cross + scalp; favor maker-heavy books / MTR > 0.4 for taker rebate",
+    "TAKER": "TakerScalperAgent (final) — cross + scalp; favor maker-heavy books / MTR > 0.4 for taker rebate",
     "MIXED": "no clear edge — hold current mix; AdaptiveRouter (routes per book) is the safe default",
 }
 
@@ -74,17 +80,29 @@ def fee_at(x, p):
 
 
 def fetch():
+    """Return (metrics_by_uid, main_validator_sim_id). The sim_id is now CAPTURED (was discarded)
+    from the MAIN_VAL metric lines so run_once() can detect a simulation REFRESH (sim_id change)."""
     raw = urllib.request.urlopen(METRICS_URL, timeout=25).read().decode()
-    pat = re.compile(r'miner_gauges\{agent_id="(\d+)",miner_gauge_name="([^"]+)",netuid="79",'
-                     r'sim_id="[^"]+",wallet="([^"]+)"\}\s+([-\d.eE+]+)')
-    d = {}
+    pat = re.compile(r'miner_gauges\{agent_id="(?P<uid>\d+)",miner_gauge_name="(?P<gn>[^"]+)",'
+                     r'netuid="79",sim_id="(?P<sim>[^"]+)",wallet="(?P<wal>[^"]+)"\}\s+(?P<val>[-\d.eE+]+)')
+    rows, sim_seen = [], {}
     for m in pat.finditer(raw):
-        u, gn, wal, v = int(m.group(1)), m.group(2), m.group(3), float(m.group(4))
-        if wal != MAIN_VAL:
+        if m.group("wal") != MAIN_VAL:
+            continue
+        sim_seen[m.group("sim")] = sim_seen.get(m.group("sim"), 0) + 1
+        rows.append((int(m.group("uid")), m.group("gn"), m.group("sim"), m.group("val")))
+    # the main validator's CURRENT sim = the sim_id stamped on the most of its metric lines
+    # (during a clean changeover every line carries the new id; majority is robust to any straggler)
+    sim_id = max(sim_seen, key=sim_seen.get) if sim_seen else None
+    # build the metrics snapshot from ONLY the current sim's lines, so the bundled market status is a
+    # clean current-sim reading even if a stale-sim straggler is momentarily present at the boundary.
+    d = {}
+    for uid, gn, sim, val in rows:
+        if sim != sim_id:
             continue
         if gn in ("kappa", "average_daily_maker_volume", "average_daily_taker_volume"):
-            d.setdefault(u, {})[gn] = v
-    return d
+            d.setdefault(uid, {})[gn] = float(val)
+    return d, sim_id
 
 
 def classify(d, p):
@@ -122,7 +140,7 @@ def load_state():
     try:
         return json.load(open(STATE))
     except (OSError, ValueError):
-        return {"regime": None, "pending": None, "pending_count": 0, "since": None}
+        return {"regime": None, "pending": None, "pending_count": 0, "since": None, "sim_id": None}
 
 
 def save_state(s):
@@ -179,16 +197,47 @@ def notify(ts, old, new, info, from_side=None):
             f"market MTR {info['mtr']:.3f}  |  fees maker {info['mk_bps']:+.1f}bps, taker {info['tk_bps']:+.1f}bps")
 
 
+def notify_sim_refresh(ts, old_sim, new_sim, verdict, info, p):
+    """Fired when the MAIN validator starts a NEW simulation (its sim_id changed). Bundles the
+    current market status so the regime is visible at the moment of the reset. Same sinks as
+    notify(): banner + regime_history.log + REGIME_ALERT.txt + Discord (always — a refresh is rare
+    and operationally important: kappa/positions reset, agents cold-start)."""
+    msg = (f"[SN-79 SIM REFRESH] main validator started a NEW simulation @ {ts}\n"
+           f"  sim_id: {old_sim} -> {new_sim}\n"
+           f"  market now: {verdict}  (MTR={info['mtr']:.3f}, target={p['targetMTR']})\n"
+           f"  elite kappa: maker_med={info['mk_med']:.4f} ({info['mk_top']}) "
+           f"taker_med={info['tk_med']:.4f} ({info['tk_top']})\n"
+           f"  fees @ MTR {info['mtr']:.3f}: maker={info['mk_bps']:+.1f}bps taker={info['tk_bps']:+.1f}bps\n"
+           f"  recommend: {RECO[verdict]}\n"
+           f"  NOTE: kappa/positions reset on refresh — the leaderboard verdict is COLD ~60-90 min.")
+    banner = "\n" + "~" * 64 + "\n" + msg + "\n" + "~" * 64 + "\n"
+    print(banner)
+    sys.stdout.flush()
+    with open(HISTLOG, "a") as f:
+        f.write(f"{ts}\tSIM_REFRESH\t{old_sim}->{new_sim}\tverdict={verdict}\tMTR={info['mtr']:.3f}\n")
+    with open(ALERTFILE, "w") as f:
+        f.write(banner)
+    post_discord(
+        f"🆕 **SN-79 sim refresh — main validator started a new simulation**  ({ts})\n"
+        f"`{old_sim}` → `{new_sim}`\n"
+        f"Market now: **{verdict}**  |  MTR {info['mtr']:.3f}  |  "
+        f"fees maker {info['mk_bps']:+.1f}bps / taker {info['tk_bps']:+.1f}bps\n"
+        f"elite kappa — maker {info['mk_med']:.3f} / taker {info['tk_med']:.3f}\n"
+        f"Recommend: **{RECO[verdict]}**\n"
+        f"_kappa/positions reset on refresh — verdict cold ~60-90 min._")
+
+
 def run_once():
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     p = fee_params()
     try:
-        d = fetch()
+        d, sim_id = fetch()
     except Exception as e:
         print(f"[{ts}] fetch error: {e}")
         return
     verdict, info = classify(d, p)
     print(f"\n{'='*64}\n[{ts}]  FAVORED MODE: {verdict}   (market MTR={info['mtr']:.3f}, target={p['targetMTR']})")
+    print(f"  main-val sim_id: {sim_id}")
     print(f"{'='*64}")
     print(f"  elite (top {TOP_N} by kappa): {info['mk_top']} maker (median kappa {info['mk_med']:.4f}) "
           f"vs {info['tk_top']} taker (median kappa {info['tk_med']:.4f})")
@@ -200,6 +249,17 @@ def run_once():
     s = load_state()
     if s.get("last_firm") is None and s.get("regime") in ("MAKER", "TAKER"):
         s["last_firm"] = s["regime"]   # seed the last firm side from existing state
+
+    # --- MAIN-validator simulation refresh: alert (with market status) when the sim_id changes.
+    # Independent of the regime flip below. First run just records the id (no prior to compare).
+    prev_sim = s.get("sim_id")
+    if sim_id and sim_id != prev_sim:
+        if prev_sim is not None:
+            notify_sim_refresh(ts, prev_sim, sim_id, verdict, info, p)
+        else:
+            print(f"  [sim_id initialized: {sim_id}]")
+        s["sim_id"] = sim_id
+
     if s["regime"] is None:
         s["regime"] = verdict; s["since"] = ts; s["pending"] = None; s["pending_count"] = 0
         if verdict in ("MAKER", "TAKER"):

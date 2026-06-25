@@ -1,7 +1,7 @@
 {
-  "regime": "TAKER",
+  "regime": "MAKER",
   "pending": null,
   "pending_count": 0,
-  "since": "2026-06-24 22:56:20",
-  "last_firm": "TAKER"
+  "since": "2026-06-25 13:59:35",
+  "last_firm": "MAKER"
 }

@@ -1,6 +1,6 @@
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-[SN-79 REGIME CHANGE] MIXED -> TAKER @ 2026-06-24 22:56:20
-  recommend: TakerScalperV2Agent (live) / TakerScalperV3Agent (tuned, A/B) — cross + scalp; favor maker-heavy books / MTR > 0.4 for taker rebate
-  elite kappa: maker_med=0.0434 (3) taker_med=0.0535 (17) | market MTR=0.482 fees maker=+2.8bps taker=-0.5bps
+[SN-79 REGIME CHANGE] MIXED -> MAKER @ 2026-06-25 13:59:35
+  recommend: PureMakerAgent (post liquidity; favor books with taker flow / per-book MTR < 0.4 for rebate+spread)
+  elite kappa: maker_med=0.1138 (6) taker_med=0.0715 (14) | market MTR=0.462 fees maker=+1.6bps taker=+0.7bps
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
