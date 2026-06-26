@@ -117,6 +117,7 @@ def classify(d, p):
         rows.append((k, u, "maker" if mk > tk else "taker", (mk / tot if tot else 0.0)))
     rows.sort(reverse=True)
     top = rows[:TOP_N]
+    top10 = rows[:10]
     mk_k = [r[0] for r in top if r[2] == "maker"]
     tk_k = [r[0] for r in top if r[2] == "taker"]
     mk_med = statistics.median(mk_k) if mk_k else 0.0
@@ -132,8 +133,32 @@ def classify(d, p):
     mtr = allmk / (allmk + alltk) if (allmk + alltk) else 0.0
     mk_bps, tk_bps = fee_at(mtr, p)
     return verdict, dict(top5=top[:5], mk_top=len(mk_k), tk_top=len(tk_k),
+                         top10_mk=sum(1 for r in top10 if r[2] == "maker"),
+                         top10_tk=sum(1 for r in top10 if r[2] == "taker"),
                          mk_med=mk_med, tk_med=tk_med, mtr=mtr, mk_bps=mk_bps, tk_bps=tk_bps,
                          miners=len(rows))
+
+
+def strength_of(verdict, info):
+    """Conviction of the verdict → STRONG / MODERATE / WEAK, from the winning side's kappa edge
+    ratio over the loser, gated by the winner actually being positive. Returns (label, ratio).
+      ratio = winning median kappa / losing median kappa.
+      >=2.0 STRONG · >=1.5 MODERATE · >1.15 WEAK (just past the flip threshold).
+      If the winning side isn't even positive, it's a WEAK(flat) edge over a worse loser."""
+    if verdict == "MAKER":
+        win, lose = info["mk_med"], info["tk_med"]
+    elif verdict == "TAKER":
+        win, lose = info["tk_med"], info["mk_med"]
+    else:
+        return "no-edge", 1.0
+    ratio = (win / lose) if lose > 0 else (999.0 if win > 0 else 1.0)
+    if win <= 0:
+        return "WEAK(flat)", ratio
+    if ratio >= 2.0:
+        return "STRONG", ratio
+    if ratio >= 1.5:
+        return "MODERATE", ratio
+    return "WEAK", ratio
 
 
 def load_state():
@@ -176,25 +201,26 @@ def post_discord(text):
 
 def notify(ts, old, new, info, from_side=None):
     # local logging fires on EVERY confirmed change (incl. via MIXED)
-    msg = (f"[SN-79 REGIME CHANGE] {old} -> {new} @ {ts}\n"
+    strength, ratio = strength_of(new, info)
+    rtxt = f"{ratio:.2f}x" if ratio < 900 else "much"
+    msg = (f"[SN-79 REGIME CHANGE] {old} -> {new} [{strength}] @ {ts}\n"
            f"  recommend: {RECO[new]}\n"
-           f"  elite kappa: maker_med={info['mk_med']:.4f} ({info['mk_top']}) "
-           f"taker_med={info['tk_med']:.4f} ({info['tk_top']}) | market MTR={info['mtr']:.3f} "
-           f"fees maker={info['mk_bps']:+.1f}bps taker={info['tk_bps']:+.1f}bps")
+           f"  edge: {new} {rtxt} the other (maker k{info['mk_med']:.4f} / taker k{info['tk_med']:.4f})\n"
+           f"  FEES @ MTR {info['mtr']:.3f}: maker {info['mk_bps']:+.1f}bps  taker {info['tk_bps']:+.1f}bps  (+=pay, -=rebate)")
     banner = "\n" + "!" * 64 + "\n" + msg + "\n" + "!" * 64 + "\n"
     print(banner)
     sys.stdout.flush()
     with open(HISTLOG, "a") as f:
-        f.write(f"{ts}\tCHANGE\t{old}->{new}\tMTR={info['mtr']:.3f}\tmk_med={info['mk_med']:.4f}\ttk_med={info['tk_med']:.4f}\n")
+        f.write(f"{ts}\tCHANGE\t{old}->{new}\t{strength}\tMTR={info['mtr']:.3f}\tmk_med={info['mk_med']:.4f}\ttk_med={info['tk_med']:.4f}\n")
     with open(ALERTFILE, "w") as f:
         f.write(banner)
     # Discord fires ONLY on a firm TAKER<->MAKER side flip (from_side set); MIXED transitions are silent
     if from_side is not None:
         post_discord(
-            f"🔄 **SN-79 regime flip: {from_side} → {new}**  ({ts})\n"
+            f"🔄 **SN-79 regime flip: {from_side} → {new}**  [{strength}]  ({ts})\n"
             f"Recommend: **{RECO[new]}**\n"
-            f"elite kappa — maker {info['mk_med']:.3f} / taker {info['tk_med']:.3f}  |  "
-            f"market MTR {info['mtr']:.3f}  |  fees maker {info['mk_bps']:+.1f}bps, taker {info['tk_bps']:+.1f}bps")
+            f"edge: {new} {rtxt} the other — maker k{info['mk_med']:.3f} / taker k{info['tk_med']:.3f}  |  MTR {info['mtr']:.3f}\n"
+            f"**FEES: maker {info['mk_bps']:+.1f}bps, taker {info['tk_bps']:+.1f}bps**  (+ = pay, - = rebate)")
 
 
 def notify_sim_refresh(ts, old_sim, new_sim, verdict, info, p):
@@ -202,12 +228,15 @@ def notify_sim_refresh(ts, old_sim, new_sim, verdict, info, p):
     current market status so the regime is visible at the moment of the reset. Same sinks as
     notify(): banner + regime_history.log + REGIME_ALERT.txt + Discord (always — a refresh is rare
     and operationally important: kappa/positions reset, agents cold-start)."""
+    strength, ratio = strength_of(verdict, info)
+    rtxt = f"{ratio:.2f}x" if ratio < 900 else "much"
+    edge = "" if verdict == "MIXED" else f", {verdict.lower()} {rtxt} the other"
     msg = (f"[SN-79 SIM REFRESH] main validator started a NEW simulation @ {ts}\n"
            f"  sim_id: {old_sim} -> {new_sim}\n"
-           f"  market now: {verdict}  (MTR={info['mtr']:.3f}, target={p['targetMTR']})\n"
+           f"  market now: {verdict} [{strength}]  (MTR={info['mtr']:.3f}, target={p['targetMTR']}{edge})\n"
            f"  elite kappa: maker_med={info['mk_med']:.4f} ({info['mk_top']}) "
            f"taker_med={info['tk_med']:.4f} ({info['tk_top']})\n"
-           f"  fees @ MTR {info['mtr']:.3f}: maker={info['mk_bps']:+.1f}bps taker={info['tk_bps']:+.1f}bps\n"
+           f"  FEES @ MTR {info['mtr']:.3f}: maker {info['mk_bps']:+.1f}bps  taker {info['tk_bps']:+.1f}bps  (+=pay, -=rebate)\n"
            f"  recommend: {RECO[verdict]}\n"
            f"  NOTE: kappa/positions reset on refresh — the leaderboard verdict is COLD ~60-90 min.")
     banner = "\n" + "~" * 64 + "\n" + msg + "\n" + "~" * 64 + "\n"
@@ -220,8 +249,8 @@ def notify_sim_refresh(ts, old_sim, new_sim, verdict, info, p):
     post_discord(
         f"🆕 **SN-79 sim refresh — main validator started a new simulation**  ({ts})\n"
         f"`{old_sim}` → `{new_sim}`\n"
-        f"Market now: **{verdict}**  |  MTR {info['mtr']:.3f}  |  "
-        f"fees maker {info['mk_bps']:+.1f}bps / taker {info['tk_bps']:+.1f}bps\n"
+        f"Market now: **{verdict}** [{strength}]  |  MTR {info['mtr']:.3f}\n"
+        f"**FEES: maker {info['mk_bps']:+.1f}bps / taker {info['tk_bps']:+.1f}bps**  (+ = pay, - = rebate)\n"
         f"elite kappa — maker {info['mk_med']:.3f} / taker {info['tk_med']:.3f}\n"
         f"Recommend: **{RECO[verdict]}**\n"
         f"_kappa/positions reset on refresh — verdict cold ~60-90 min._")
@@ -236,13 +265,16 @@ def run_once():
         print(f"[{ts}] fetch error: {e}")
         return
     verdict, info = classify(d, p)
-    print(f"\n{'='*64}\n[{ts}]  FAVORED MODE: {verdict}   (market MTR={info['mtr']:.3f}, target={p['targetMTR']})")
+    strength, ratio = strength_of(verdict, info)
+    rtxt = f"{ratio:.2f}x" if ratio < 900 else "much"
+    edge = "" if verdict == "MIXED" else f"  ({verdict.lower()} {rtxt} the other side)"
+    print(f"\n{'='*64}\n[{ts}]  FAVORED: {verdict}  [{strength}]{edge}")
     print(f"  main-val sim_id: {sim_id}")
     print(f"{'='*64}")
-    print(f"  elite (top {TOP_N} by kappa): {info['mk_top']} maker (median kappa {info['mk_med']:.4f}) "
-          f"vs {info['tk_top']} taker (median kappa {info['tk_med']:.4f})")
-    print(f"  fee @ market MTR {info['mtr']:.3f}:  maker {info['mk_bps']:+.1f} bps   taker {info['tk_bps']:+.1f} bps  "
-          f"(+=pay, -=rebate; crossover at MTR {p['targetMTR']})")
+    print(f"  FEES @ MTR {info['mtr']:.3f}:  maker {info['mk_bps']:+.1f}bps   taker {info['tk_bps']:+.1f}bps   "
+          f"(+ = pay,  - = rebate;  crossover at MTR {p['targetMTR']})")
+    print(f"  elite (top {TOP_N}): {info['mk_top']} maker k{info['mk_med']:.4f}  vs  {info['tk_top']} taker k{info['tk_med']:.4f}"
+          f"   |  top10: {info['top10_mk']}M / {info['top10_tk']}T")
     print(f"  top 5: " + ", ".join(f"uid{u}({lean[0].upper()},k{k:.3f})" for k, u, lean, _ in info['top5']))
     print(f"  recommend: {RECO[verdict]}")
 

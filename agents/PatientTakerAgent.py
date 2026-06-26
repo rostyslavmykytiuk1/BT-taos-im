@@ -1,30 +1,31 @@
 """
-TakerScalperAgent — pure-taker round-trip + activity engine for subnet 79 (kappa-tuned).
-(Final version; formerly TakerScalperV4Agent. V1/V2/V3 removed.)
+PatientTakerAgent — uid179-style PATIENT, rebate-funded mean-reversion taker for subnet 79.
+(Derived from TakerScalperAgent; the ONLY behavioural change is the EXIT — patient reversion instead of
+the fast TP/SL scalp. Sleep is ON by default and there are NO AGENT_PARAMS toggles.)
 
-Design (reverse-engineered from the top taker uid184 @ 38.127.44.98):
-  * kappa is MAD-normalized → PnL magnitude is irrelevant; only the SHAPE matters: a consistent,
-    slightly-positive, low-downside RT series across AS MANY books as possible (median over ~80+).
-  * The top taker wins on BREADTH × CONSISTENCY × rebate harvest, net ~breakeven. Our edge over him:
-    SHORT holds + a TIGHT stop cap his 30s-drift downside tail.
-  * So it trades the dense profit engine on rebated books, drops the kappa-projection open-gate, and
-    TIGHTENS the stop/hold so the denser RTs stay low-downside.
-  * OPEN gate: a real rebate (rate <= -KAPPA_MIN_REBATE_BPS) AND positive expected RT PnL (est_pnl > 0,
-    i.e. the rebate beats the spread) — so we never open a trade the spread would eat. (Only the SLEEP
-    SET ignores spread: that set thrashes on spread noise, but a stateless per-open spread check does not.)
-  * SLEEP is FEE-ONLY with hysteresis: a book SLEEPS when its taker fee is POSITIVE (it pays to take)
-    and WAKES only once the fee is a rebate beyond SLEEP_WAKE_FEE_BPS (fee < -2bps); the (-2bps,0] band
-    keeps its state. The sleeping set is hard-capped at MAX_SLEEP — when more books pay than free slots,
-    the WORST (highest-fee) sleep and the rest stay awake; once full, NO more sleep (overshooting 48
-    inactive injects hard 0.0s into the validator median — catastrophic). Sleep is ALWAYS ON now (the
-    no_sleep toggle was removed). NB: the validator's real aggregation
-    is reward.py::calculate_kappa_score (normalize→activity/pnl-weight→median−outlier_penalty), which the
-    kappa helpers here do NOT model — judge live on the endpoint, not the internal proxy.
+Modelled on the current #1 taker uid179 (live trade data, "weak taker market": 1751 RTs / 128 books / ~18min):
+  * NOT a fast scalper. Median hold 36s (mean 88s, p90 255s, max 1159s); only ~20% of RTs < 2s.
+  * PAYS the spread to enter+exit (gross −3.6bps mean, only 18% of RTs gross-positive); the deep REBATE
+    (both legs, +5.3bps mean) funds a thin-POSITIVE net (+1.7bps/RT mean, 70% win) -> smooth -> high kappa.
+  * Mechanism: enter on a rebate, then HOLD until the price REVERTS to near-entry, then exit and bank the
+    rebate. NO tight stop — it holds adverse moves out and lets them mean-revert; only a rare genuine
+    runaway realises a (bounded) loss. The patient exit is the proven differentiator: our fast-cut takers
+    (TP2.5/SL4-12/hold3s) exit at adverse prices and bleed; uid179 waits for the rebate-funded reversion.
+
+So this agent ENTERS like TakerScalper (rebate-gated, est_pnl>0, microprice-biased one lot) but EXITS
+patiently: hold until gross reverts to within EXIT_REVERT_GROSS_BPS of entry (-> net positive via the
+rebate), with a WIDE CATASTROPHE_GROSS_BPS backstop for a true trend and a long MAX_HOLD_S patience window.
+
+SLEEP is FEE-ONLY with hysteresis (ALWAYS ON, no param): a book sleeps when its taker fee is POSITIVE
+(it pays to take) and wakes once the fee is a rebate beyond SLEEP_WAKE_FEE_BPS; hard-capped at MAX_SLEEP
+so we never overshoot the validator's ~48-inactive cliff (which injects hard 0.0s into the kappa median).
+NB: reward.py::calculate_kappa_score is the real aggregation; the kappa helpers here are logging-only —
+judge live on the endpoint, not the internal proxy.
 
 Market orders only: full immediate fills, nothing resting. One position per book, strictly sequential.
 
 Per book each tick (sleep/wake decided once up front in _update_sleep_states):
-  reconcile -> pending? wait : held? close(TP/SL/time) : open(profit | activity)   [asleep -> skip open]
+  reconcile -> pending? wait : held? close(revert/catastrophe/max-hold) : open(profit | activity) [asleep -> skip open]
 
 RT logging -> main validator only.
 """
@@ -53,11 +54,20 @@ EXCHANGE_MIN_ORDER_SIZE = 0.25
 # Entry lot, comfortably above the floor so a fill is always a sellable holding.
 LOT = 0.3
 
-# Hold / exit: tight holds → lower downside → higher kappa; our edge over uid184's ~30s holds.
-MIN_HOLD_S = 1.5
-MAX_HOLD_S = 3.0
-MIN_GROSS_TP_BPS = 2.5            # gross TP. Net win (~TP + 2×rebate) beats the rebate-cushioned SL -> per-RT skew is net-positive (kappa cubes downside).
-MAX_GROSS_SL_BPS = 4.0            # ALWAYS-ON cut (param removed): rebate-cushioned -> nets ~breakeven, NOT the old 2bps negative scratch-stream; and 2bps false-triggers on our own market-open impact (the open lifts the touch ~half a spread).
+# Hold / exit: PATIENT mean-reversion (uid179 style). Enter on rebate, then HOLD for the price to revert
+# to near-entry and exit banking the rebate — NOT a fast scalp. uid179 live: median hold 36s, exit gross
+# ~−1.5bps, net +1.7bps/RT, 70% win, 128 books. No tight stop; only a wide catastrophe + long max-hold.
+MIN_HOLD_S = 1.5                  # floor before any exit (avoids own-market-open-impact false exits)
+MAX_HOLD_S = 300.0               # patience window: hold up to ~5min for a reversion (uid179 p90=255s,
+                                 # median 36s). If still unreverted by here, give up and take the
+                                 # rebate-cushioned exit at whatever gross (the bounded max-hold tail).
+EXIT_REVERT_GROSS_BPS = -1.5      # EXIT once gross reverts to within 1.5bps of entry (or better). net =
+                                 # gross + 2×rebate is then solidly positive. Matches uid179's ~−1.4bps
+                                 # median exit. Starts at −spread after the taker cross, so this does NOT
+                                 # fire immediately on a wide book — it waits for the reversion.
+CATASTROPHE_GROSS_BPS = 30.0      # the ONLY hard cut: a genuine runaway that never reverted. WIDE so normal
+                                 # reversion-holds (which wander to ~−10bps, uid179 gross p10) never trip it;
+                                 # bounds the rare cube-downside tail (vs uid179's uncapped ~−70bps worst RT).
 
 # FEE-BASED SLEEP with hysteresis (2026-06-23 rework). Spread is too noisy to drive the sleep SET (it
 # would thrash tick-to-tick); the FEE is stable, so SLEEP keys on FEE only. A book SLEEPS when its taker
@@ -134,7 +144,7 @@ class _RtLogCtx:
     close_reason: str = "fill"
 
 
-class TakerScalperAgent(FinanceSimulationAgent):
+class PatientTakerAgent(FinanceSimulationAgent):
     def initialize(self) -> None:
         bt.logging.set_info()
 
@@ -160,9 +170,16 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self.kappa_min_rebate_rate = -KAPPA_MIN_REBATE_BPS / 1e4
         self.sleep_wake_rate = SLEEP_WAKE_FEE_BPS / 1e4   # wake a sleeper only when fee < this (rebate > 2bps)
 
-        # Sleep is ALWAYS ON (fee-based, hysteresis-gated, capped at MAX_SLEEP) and the stop-loss is
-        # ALWAYS the 4bps MAX_GROSS_SL_BPS cut — both AGENT_PARAM toggles (no_sleep, max_gross_sl_bps)
-        # were removed, so both behaviours now read straight from the module constants.
+        # SLEEP: ALWAYS ON (the no_sleep AGENT_PARAM was removed). Fee-based sleep with hysteresis — a
+        # book sleeps when its taker fee is positive and wakes once the fee is a rebate beyond
+        # SLEEP_WAKE_FEE_BPS, hard-capped at MAX_SLEEP so we never overshoot the validator inactivity
+        # cliff. Kept as a fixed-False attribute so the downstream sleep guard (`if self.no_sleep`) is
+        # unchanged — it is now a permanent no-op, so the fee-sleep logic always runs.
+        self.no_sleep = False
+
+        # EXIT: PATIENT reversion (no tight stop, no AGENT_PARAM). Hold until the price reverts to within
+        # EXIT_REVERT_GROSS_BPS of entry, then exit and bank the rebate; only a WIDE CATASTROPHE_GROSS_BPS
+        # runaway or the MAX_HOLD_S patience window forces an earlier exit. See _close.
 
         self.positions: dict[str, dict[int, _Position]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
@@ -173,8 +190,9 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self._active_validator: str | None = None
 
         bt.logging.info(
-            f"[TakerScalper uid={self.uid}] PURE-TAKER lot={LOT} exch_min={self.exch_min} "
-            f"hold={MIN_HOLD_S}-{max_hold_s:.1f}s tp={MIN_GROSS_TP_BPS}bps sl={MAX_GROSS_SL_BPS}bps "
+            f"[PatientTaker uid={self.uid}] PATIENT-TAKER(uid179-style) lot={LOT} exch_min={self.exch_min} "
+            f"hold={MIN_HOLD_S}-{max_hold_s:.0f}s exit=revert@{EXIT_REVERT_GROSS_BPS}bps "
+            f"catastrophe={CATASTROPHE_GROSS_BPS}bps (NO tight stop) "
             f"reopen_gap={MIN_REOPEN_GAP_S}s rt_window={RT_WINDOW_S / 60:.0f}m max={RT_MAX} "
             f"activity_deadline={activity_s:.0f}s "
             f"open_gate(rebate>={KAPPA_MIN_REBATE_BPS}bps AND est_pnl>0 [spread-aware]) "
@@ -204,7 +222,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         else:
             self._sim_id.pop(validator, None)
         bt.logging.info(
-            f"[TakerScalper uid={self.uid}] new simulation: {validator[:8]} sim_id={simulation_id}"
+            f"[PatientTaker uid={self.uid}] new simulation: {validator[:8]} sim_id={simulation_id}"
         )
 
     def _update_sleep_states(self, validator: str, now: int) -> None:
@@ -213,8 +231,10 @@ class TakerScalperAgent(FinanceSimulationAgent):
         beyond SLEEP_WAKE_FEE_BPS (fee < -2bps); in the (-2bps, 0] band it keeps its state. The sleeping
         set is hard-capped at MAX_SLEEP: when more books want to sleep than there are free slots, the
         WORST (highest-fee) ones sleep and the rest stay awake; once full, NO more books sleep (the
-        >48-inactive cliff in reward.py would crater the score). Sleep is always on (the no_sleep
-        toggle was removed), so this routine always runs."""
+        >48-inactive cliff in reward.py would crater the score). no_sleep disables all of this."""
+        if self.no_sleep:
+            return
+
         rates: dict[int, float] = {}
         for book_id, account in self.accounts.items():
             r = self._taker_fee_rate(account)
@@ -227,7 +247,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
             if st.sleeping and r < self.sleep_wake_rate:
                 st.sleeping = False
                 if self._rt_log_enabled(validator):
-                    bt.logging.info(f"[TakerScalper uid={self.uid}] WAKE book={book_id} (fee={r * 1e4:+.2f}bps)")
+                    bt.logging.info(f"[PatientTaker uid={self.uid}] WAKE book={book_id} (fee={r * 1e4:+.2f}bps)")
 
         # 2) SLEEP: awake books that PAY (fee > 0), WORST-first, into the remaining budget only.
         #    Never exceed MAX_SLEEP; once full, paying books stay awake (no displacement).
@@ -246,7 +266,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
                 st = self._bstate(validator, book_id)
                 st.sleeping = True
                 if self._rt_log_enabled(validator):
-                    bt.logging.info(f"[TakerScalper uid={self.uid}] SLEEP book={book_id} (fee={r * 1e4:+.2f}bps)")
+                    bt.logging.info(f"[PatientTaker uid={self.uid}] SLEEP book={book_id} (fee={r * 1e4:+.2f}bps)")
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
         response = FinanceAgentResponse(agent_id=self.uid)
@@ -269,7 +289,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
             try:
                 self._step_book(response, validator, book_id, book, account, vol_dp, volume_cap, now)
             except Exception as ex:
-                bt.logging.warning(f"[TakerScalper uid={self.uid}] step {book_id}: {ex}")
+                bt.logging.warning(f"[PatientTaker uid={self.uid}] step {book_id}: {ex}")
 
         return response
 
@@ -343,7 +363,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         # Half a volume tick: below this a holding is rounding noise, treat as flat.
         self._flat_eps = 0.5 * 10 ** (-volume_decimals)
         bt.logging.info(
-            f"[TakerScalper uid={self.uid}] volumeDecimals={volume_decimals} "
+            f"[PatientTaker uid={self.uid}] volumeDecimals={volume_decimals} "
             f"lot={lot} exch_min={self.exch_min}"
         )
 
@@ -652,7 +672,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         taker_bps_str = f"{ctx.taker_bps:.2f}" if ctx.taker_bps is not None else "n/a"
 
         bt.logging.info(
-            f"[TakerScalper uid={self.uid} RT] book={book_id} "
+            f"[PatientTaker uid={self.uid} RT] book={book_id} "
             f"open={ctx.open_reason}/{ctx.side} "
             f"open_rt_n={ctx.open_rt_window_n} open_rt_pnl={ctx.open_rt_pnl_list} "
             f"est_pnl={self._fmt_pnl(ctx.est_pnl)} "
@@ -699,9 +719,9 @@ class TakerScalperAgent(FinanceSimulationAgent):
         est_pnl = self._estimate_rt_pnl(rate, book, self.min_order_size)
         reopen_ok = st.last_rt_ns == 0 or (now - st.last_rt_ns) >= self.min_reopen_gap_ns
 
-        # Profit engine: scalp on awake books, throttled per book. Gated on a real rebate
+        # Profit engine: open on awake books, throttled per book. Gated on a real rebate
         # (rate <= -KAPPA_MIN_REBATE_BPS) AND POSITIVE expected PnL (est_pnl > 0 → the rebate beats the
-        # spread). The tight stop caps the downside of the fraction that still go against us.
+        # spread). The PATIENT reversion exit (_close) then waits for the price to revert before flattening.
         if (
             reopen_ok
             and self._rt_count(st, now) < RT_MAX
@@ -734,7 +754,11 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self, response, validator: str, book_id: int, book, account, pos: _Position,
         vol_dp: int, now: int,
     ) -> None:
-        """Held position: taker flatten on TP / SL / max-hold, after the min hold."""
+        """Held position: PATIENT (uid179-style) flatten. After the min hold, exit ONLY when the price has
+        REVERTED to near-entry (gross >= EXIT_REVERT_GROSS_BPS -> the rebate makes net positive); otherwise
+        keep HOLDING and waiting for the reversion. The only forced early exits are a WIDE catastrophe (a
+        genuine runaway) and the long MAX_HOLD_S patience window. No tight stop -> we never realise the
+        small adverse move that a fast cut would; the rebate-funded reversion is the edge."""
         mid = self._mid(book)
         if mid is None or mid <= 0 or pos.avg <= 0:
             return
@@ -745,14 +769,14 @@ class TakerScalperAgent(FinanceSimulationAgent):
         bid = book.bids[0].price if book.bids else None
         ask = book.asks[0].price if book.asks else None
         gross_bps = self._exit_gross_bps(pos, bid, ask, mid)
-        if gross_bps >= MIN_GROSS_TP_BPS:
-            reason = "tp"
-        elif gross_bps <= -MAX_GROSS_SL_BPS:
-            reason = "sl"
-        elif hold_ns >= self.max_hold_ns:
+        if gross_bps >= EXIT_REVERT_GROSS_BPS:        # reverted to near-entry (or a small profit) -> bank rebate
+            reason = "revert"
+        elif gross_bps <= -CATASTROPHE_GROSS_BPS:     # genuine runaway, no reversion -> bounded catastrophe cut
+            reason = "cut"
+        elif hold_ns >= self.max_hold_ns:             # patience window elapsed -> give up, take the exit
             reason = "time"
         else:
-            return
+            return                                    # keep HOLDING — wait for the reversion
 
         if self._rt_log_enabled(validator):
             ctx = self._rt_log.get((validator, book_id))
@@ -897,4 +921,4 @@ class TakerScalperAgent(FinanceSimulationAgent):
 
 
 if __name__ == "__main__":
-    launch(TakerScalperAgent)
+    launch(PatientTakerAgent)
