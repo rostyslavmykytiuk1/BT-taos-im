@@ -87,8 +87,12 @@ SHORT_LEVERAGE = 1.0
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
 RT_MAX = 40                        # max profit RTs per book per window
 
-# Force a taker RT once this long since the last RT (kept under RT_WINDOW_S).
-ACTIVITY_DEADLINE_S = 500.0
+# Force a taker RT once this long since the last RT. CRITICAL for the PATIENT exit: must satisfy
+# activity_deadline + MAX_HOLD_S < RT_WINDOW_S, so even a FORCED open that then holds to max-hold still
+# CLOSES within the activity window (otherwise the backstop's RT lands OUTSIDE the window and activity
+# decays). With max-hold ~324s jittered + 570s window => deadline must be < ~246; 220 leaves margin.
+# (The base used 500 because its hold was 3s; the 300s patient hold requires this much lower.)
+ACTIVITY_DEADLINE_S = 220.0
 # Min gap between RT closes and the next profit open (per book; throttles churn).
 MIN_REOPEN_GAP_S = 2.0
 # After submitting, wait this long for the fill before assuming the order was lost.

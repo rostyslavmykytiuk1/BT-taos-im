@@ -1,7 +1,7 @@
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-[SN-79 REGIME CHANGE] MIXED -> TAKER [WEAK] @ 2026-06-26 12:35:55
+[SN-79 REGIME CHANGE] MIXED -> TAKER [WEAK] @ 2026-06-26 17:16:56
   recommend: TakerScalperAgent (final) — cross + scalp; favor maker-heavy books / MTR > 0.4 for taker rebate
-  edge: TAKER 1.38x the other (maker k0.0404 / taker k0.0557)
-  FEES @ MTR 0.442: maker +0.7bps  taker +1.6bps  (+=pay, -=rebate)
+  edge: TAKER 1.24x the other (maker k0.0730 / taker k0.0902)
+  FEES @ MTR 0.416: maker +0.1bps  taker +2.2bps  (+=pay, -=rebate)
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

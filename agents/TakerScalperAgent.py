@@ -1,6 +1,10 @@
 """
 TakerScalperAgent — pure-taker round-trip + activity engine for subnet 79 (kappa-tuned).
-(Final version; formerly TakerScalperV4Agent. V1/V2/V3 removed.)
+The activity backstop forces ~5 RTs per 3h window (comfortably above the min_realized_observations=3 SCORED
+floor, 2-RT margin) — NOT the old ~18/window 10-min churn: activity=1.0 needs only a majority of books active
+over the 3h window, so forced 10-min churn just injected marginal/losing RTs. Tight rebate-cushioned scalp,
+SL=4, single-open. Taker losses are rebate-cushioned to net ~0. No AGENT_PARAMS toggles (sleep is always on,
+SL fixed at 4 — the former no_sleep / max_gross_sl_bps params were removed).
 
 Design (reverse-engineered from the top taker uid184 @ 38.127.44.98):
   * kappa is MAD-normalized → PnL magnitude is irrelevant; only the SHAPE matters: a consistent,
@@ -16,10 +20,12 @@ Design (reverse-engineered from the top taker uid184 @ 38.127.44.98):
     and WAKES only once the fee is a rebate beyond SLEEP_WAKE_FEE_BPS (fee < -2bps); the (-2bps,0] band
     keeps its state. The sleeping set is hard-capped at MAX_SLEEP — when more books pay than free slots,
     the WORST (highest-fee) sleep and the rest stay awake; once full, NO more sleep (overshooting 48
-    inactive injects hard 0.0s into the validator median — catastrophic). Sleep is ALWAYS ON now (the
-    no_sleep toggle was removed). NB: the validator's real aggregation
-    is reward.py::calculate_kappa_score (normalize→activity/pnl-weight→median−outlier_penalty), which the
-    kappa helpers here do NOT model — judge live on the endpoint, not the internal proxy.
+    inactive injects hard 0.0s into the validator median — catastrophic). Sleep is ALWAYS ON (no toggle).
+    NB: the validator's real aggregation is reward.py::calculate_kappa_score (normalize→activity/pnl-weight
+    →median−outlier_penalty), which the kappa helpers here do NOT model — judge live on the endpoint.
+
+No AGENT_PARAMS toggles: stop-loss is fixed at MAX_GROSS_SL_BPS=4 and sleep is always on (the former
+no_sleep and max_gross_sl_bps params were removed).
 
 Market orders only: full immediate fills, nothing resting. One position per book, strictly sequential.
 
@@ -57,7 +63,7 @@ LOT = 0.3
 MIN_HOLD_S = 1.5
 MAX_HOLD_S = 3.0
 MIN_GROSS_TP_BPS = 2.5            # gross TP. Net win (~TP + 2×rebate) beats the rebate-cushioned SL -> per-RT skew is net-positive (kappa cubes downside).
-MAX_GROSS_SL_BPS = 4.0            # ALWAYS-ON cut (param removed): rebate-cushioned -> nets ~breakeven, NOT the old 2bps negative scratch-stream; and 2bps false-triggers on our own market-open impact (the open lifts the touch ~half a spread).
+MAX_GROSS_SL_BPS = 4.0            # FIXED calm-regime cut (no param). Rebate-cushioned -> nets ~breakeven, NOT the old 2bps negative scratch-stream; 2bps false-triggers on our own market-open impact (the open lifts the touch ~half a spread).
 
 # FEE-BASED SLEEP with hysteresis (2026-06-23 rework). Spread is too noisy to drive the sleep SET (it
 # would thrash tick-to-tick); the FEE is stable, so SLEEP keys on FEE only. A book SLEEPS when its taker
@@ -75,10 +81,15 @@ MAX_SLEEP = 40
 SHORT_LEVERAGE = 1.0
 
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
-RT_MAX = 40                        # max profit RTs per book per window
+RT_MAX = 50                        # max profit RTs per book per window
 
-# Force a taker RT once this long since the last RT (kept under RT_WINDOW_S).
-ACTIVITY_DEADLINE_S = 500.0
+# NC EXPERIMENT: force a taker RT only this long since the last RT. Set to kappa_window/5 so a quiet book
+# makes ~5 forced RTs per 3h window — comfortably above min_realized_observations=3 (2-RT margin so a
+# single missed/slipped force can't drop the book to kappa=None), but still ~4× less churn than the old
+# ~18/window (500s). The owner confirmed activity=1.0 needs only a MAJORITY of books active over the 3h
+# window (median gate), so per-book 10-min forcing was overkill and only injected marginal/losing RTs.
+# Rebated books scalp naturally far above this floor. (Was 3000 = exactly 3/window with ZERO margin.)
+ACTIVITY_DEADLINE_S = 1500.0       # = KAPPA_RT_HISTORY_S / (KAPPA_MIN_OBS + 2)
 # Min gap between RT closes and the next profit open (per book; throttles churn).
 MIN_REOPEN_GAP_S = 2.0
 # After submitting, wait this long for the fill before assuming the order was lost.
@@ -147,7 +158,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
 
         jitter = ((self.uid * 2654435761) % 1000) / 1000.0
         max_hold_s = MAX_HOLD_S * (0.92 + 0.16 * jitter)
-        activity_s = ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter)   # ~460-500s
+        activity_s = ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter)   # ~1987-2160s (~5 forced RTs/3h)
 
         self.min_hold_ns = int(MIN_HOLD_S * _NS)
         self.max_hold_ns = int(max_hold_s * _NS)
@@ -160,9 +171,10 @@ class TakerScalperAgent(FinanceSimulationAgent):
         self.kappa_min_rebate_rate = -KAPPA_MIN_REBATE_BPS / 1e4
         self.sleep_wake_rate = SLEEP_WAKE_FEE_BPS / 1e4   # wake a sleeper only when fee < this (rebate > 2bps)
 
-        # Sleep is ALWAYS ON (fee-based, hysteresis-gated, capped at MAX_SLEEP) and the stop-loss is
-        # ALWAYS the 4bps MAX_GROSS_SL_BPS cut — both AGENT_PARAM toggles (no_sleep, max_gross_sl_bps)
-        # were removed, so both behaviours now read straight from the module constants.
+        # No AGENT_PARAMS toggles: sleep is ALWAYS ON (fee-based, hysteresis, capped at MAX_SLEEP) and
+        # the stop-loss is FIXED at MAX_GROSS_SL_BPS=4 (the proven calm-regime cut — rebate-cushioned to
+        # ~breakeven, above the SL=2 own-market-open-impact false-trigger). The former no_sleep and
+        # max_gross_sl_bps params were removed.
 
         self.positions: dict[str, dict[int, _Position]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
@@ -213,8 +225,7 @@ class TakerScalperAgent(FinanceSimulationAgent):
         beyond SLEEP_WAKE_FEE_BPS (fee < -2bps); in the (-2bps, 0] band it keeps its state. The sleeping
         set is hard-capped at MAX_SLEEP: when more books want to sleep than there are free slots, the
         WORST (highest-fee) ones sleep and the rest stay awake; once full, NO more books sleep (the
-        >48-inactive cliff in reward.py would crater the score). Sleep is always on (the no_sleep
-        toggle was removed), so this routine always runs."""
+        >48-inactive cliff in reward.py would crater the score). Always on (no toggle)."""
         rates: dict[int, float] = {}
         for book_id, account in self.accounts.items():
             r = self._taker_fee_rate(account)
@@ -712,7 +723,8 @@ class TakerScalperAgent(FinanceSimulationAgent):
             self._try_open(response, validator, book_id, book, account, direction, now, "profit", prune_vol=True)
             return
 
-        # Activity backstop: guarantee >=1 RT per book per window (awake books only).
+        # Activity backstop: force ~1 RT per ACTIVITY_DEADLINE_S (~5 per 3h kappa window) so a quiet
+        # book stays SCORED (>= min_realized_observations=3, with margin); awake books only.
         if self._activity_force_due(validator, st, now):
             tag = "taker_force" if (rate <= 0.0 and est_pnl > 0.0) else "activity"
             self._try_open(response, validator, book_id, book, account, direction, now, tag)
