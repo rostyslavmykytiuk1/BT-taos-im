@@ -1,19 +1,17 @@
-# SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
-# SPDX-License-Identifier: MIT
 """
 AdaptiveRouterAgent — per-book maker/taker router for subnet 79.
 
 Goal: stay near the top in ANY market by routing each book to the playbook that is +EV given the
 book's LIVE fee regime, mirroring the proven top miners:
-  * TAKER mode  (mirrors UID 126, TakerScalper logic): on deep-rebate books, cross the spread for
-    a tiny clip and recycle in seconds. The rebate (both legs) cushions a fast stop into a net win.
-    SINGLE-OPEN — one lot per book at a time (no pyramiding) — so a stop is a small, cube-friendly loss.
+  * TAKER mode  (mirrors UID 126): on deep-rebate books, cross the spread for tiny clips and
+    recycle in seconds. The rebate (both legs) cushions a fast stop into a net win. Small bounded
+    same-side inventory building is allowed while the rebate stays deep.
   * MAKER mode  (mirrors UID 109/149): on spread-rich books, post two-sided passive quotes and
     capture spread WIDER than the maker fee + an adverse-selection margin. When holding, work only
     the reducing side priced off the FIFO worst lot (no bagging), and cap every forced exit.
   * IDLE mode: for books where active trading would hurt more than idling. Two triggers: (1) fee
     regime — spread < maker_fee + adverse-selection cushion and no taker rebate; (2) PnL backoff —
-    a book's net realized PnL over the last 10 min is negative (≥5 RTs in window), indicating live
+    a book's net realized PnL over the last 10 min is negative (≥3 RTs in window), indicating live
     adverse selection or trending. Stay flat → the book gets Kappa=None and is DROPPED from the
     median (up to ~37.5% are free), which beats bleeding small losses into the median.
 
@@ -40,10 +38,9 @@ Why this wins (from taos/im/validator/reward.py + utils/kappa.py + _match_trade_
 Design notes addressing the known failure modes:
   * Routing has DWELL + HYSTERESIS and only switches when FLAT, so books do not flip-flop modes
     (the old DualEdge made ~2000 switches in an hour) and no position ever straddles two modes.
-  * PnL SCALE MATCHING: both modes trade a shared small clip notional and bound every forced exit
-    (taker: a tight 2bps cut; maker: a 10bps stop with capped IOC slippage), so a book's realized-RT
-    series keeps a consistent small scale across mode changes (mixing scales would distort the per-
-    book MAD and the cubic downside).
+  * PnL SCALE MATCHING: both modes target a shared clip notional and cap a single round-trip loss
+    to the same bound, so a book's realized-RT series keeps a consistent scale across mode changes
+    (mixing scales would distort the per-book MAD and the cubic downside).
   * Single shared FIFO inventory per book (validator-faithful), so kappa/activity accounting is
     identical regardless of which mode opened a position.
 
@@ -68,7 +65,7 @@ import bittensor as bt
 from taos.common.agents import launch
 from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
-from taos.im.protocol.events import OrderPlacementEvent, TradeEvent
+from taos.im.protocol.events import TradeEvent
 from taos.im.protocol.models import (
     LoanSettlementOption,
     OrderCurrency,
@@ -96,11 +93,10 @@ TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.
 
 # ---- routing thresholds (bps), with hysteresis so a book does not flip-flop ----
 # EVIDENCE (top-agent trade histories + live regime analysis): route by fee regime.
-# * TAKER: books with taker rebate ≥ 2.0bps — the route-enter bar is MATCHED to the _open() floor
-#   (TK_REBATE_FLOOR_BPS), so a book is routed here only when it can actually scalp (rebate ≥ 2.0
-#   AND est_pnl > 0 on the raw spread). Hysteresis keeps an existing taker book until rebate drops
-#   below TAKER_REBATE_EXIT_BPS (0.75); while it lingers in [0.75, 2.0) the profit engine is idle and
-#   only the rebate-funded activity backstop fires (force-open is intentionally NOT gated on est_pnl).
+# * TAKER: books with taker rebate ≥ 1.5bps — the _open() gate (est_bps = 2×rebate − 2×half_spread
+#   > 0) independently guards execution, so a 1.5bps-rebate book that has a wide spread won't trade
+#   in taker mode even if routed there. The 1.5bps bar captures the bulk of the rebate range that
+#   appeared during high-rebate regimes (formerly 3.0bps missed most books).
 # * MAKER: books where passive capture net of BOTH fee legs is positive WITH an adverse-selection
 #   cushion. Empirical data shows avg fee drag of ~0.8bps per RT from adverse selection; a 1.5bps
 #   edge requirement (half_spread − maker_fee ≥ 1.5bps) absorbs that and leaves margin. Books at
@@ -109,9 +105,8 @@ TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.
 # * IDLE: any book that is neither rebate-eligible for taker nor adequately edgy for maker. The
 #   validator allows up to 37.5% (48/128) idle books before kappa=None starts contributing 0.0
 #   to the median; staying below that limit makes idling strictly dominant over losing trades.
-TAKER_REBATE_ENTER_BPS = 2.0       # route to taker when rebate ≥ 2.0bps — MATCHED to the _open()
-                                   # execution floor (TK_REBATE_FLOOR_BPS) so a book is only routed
-                                   # here when it can actually scalp (rebate ≥ 2.0 AND est_pnl>0)
+TAKER_REBATE_ENTER_BPS = 1.5       # route to taker when rebate ≥ 1.5bps; execution gate in
+                                   # _TakerMode._open() independently checks 2×rebate > 2×half_spread
 TAKER_REBATE_EXIT_BPS = 0.75       # leave taker when rebate falls below 0.75bps (0.75bps hysteresis)
 MAKER_EDGE_ENTER_BPS = 1.5         # require half_spread − maker_fee ≥ 1.5bps to enter maker;
                                    # empirically the minimum to survive adverse selection
@@ -148,25 +143,18 @@ VOLUME_SAFETY = 0.8
 VOLUME_ASSESSMENT_NS = 86_400_000_000_000
 
 # ---- activity backstop: guarantee >=1 RT per book per window, bounded to one lot ----
-ACTIVITY_DEADLINE_S = 480.0        # force a close this long since the last counted RT (or since the
-                                   # book was first seen, before its first RT)
+ACTIVITY_DEADLINE_S = 480.0        # force a close this long since the last counted RT
 
-# ---- TAKER mode = TakerScalper logic (2026-06-25: single-open, tight cut; replaces the old
-#      pyramiding 3-lot/4bps taker — a bounded 1-lot/2bps RT is far cube-friendlier for kappa) ----
+# ---- TAKER mode (mirrors UID 126) ----
 TK_MIN_HOLD_S = 1.5
-TK_MAX_HOLD_S = 3.0                # V4 (was 4.0)
-TK_TP_BPS = 2.5                    # gross TP. With the both-leg rebate the NET win (~TP + 2×rebate)
-                                   # beats the rebate-cushioned SL, so per-RT skew is net-positive
-                                   # (kappa cubes downside).
-TK_SL_BPS = 4.0                    # gross stop, HARDCODED (proven/optimized value). Rebate-cushioned:
-                                   # the both-leg rebate nets it down to <= RT_LOSS_CAP_BPS. A tighter
-                                   # 2bps cut false-triggers constantly — our own market open lifts the
-                                   # touch ~half a spread, instantly showing ~2bps adverse on entry.
-TK_REOPEN_GAP_S = 2.0             # V4 MIN_REOPEN_GAP_S (was 1.5): min gap between a close and next open
-TK_REBATE_FLOOR_BPS = 2.0        # V4 KAPPA_MIN_REBATE_BPS: open ONLY on a real rebate (>=2bps)
-PENDING_TIMEOUT_S = 5.0          # V4: wait this long for a taker market fill before re-deriving (rule 3)
-SHORT_LEVERAGE = 1.0             # V4: margin-short leverage for a SELL open when free base is insufficient
-# SINGLE-OPEN (= V4): no pyramiding — the old TK_MAX_INVENTORY_LOTS / TK_PYRAMID_* build is removed.
+TK_MAX_HOLD_S = 4.0
+TK_TP_BPS = 2.5
+TK_SL_BPS = 4.0                    # rebate-cushioned; <= RT_LOSS_CAP_BPS in net terms
+TK_REOPEN_GAP_S = 1.5              # throttle between a close and the next open
+TK_MAX_INVENTORY_LOTS = 3          # bounded same-side build (126 averages in ~2-3 clips)
+TK_PYRAMID_GAP_S = 1.0
+TK_PYRAMID_MIN_REBATE_BPS = 3.0    # only stack while rebate is comfortably above entry threshold
+                                   # (entry bar is now 1.5bps; 3bps = books with meaningful cushion)
 
 # ---- MAKER mode (mirrors UID 109/149) ----
 MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
@@ -232,7 +220,7 @@ class _BookState:
     vol_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, traded quote vol)
     # taker bookkeeping
     last_close_ns: int = 0             # last taker close (reopen throttle)
-    pending_ns: int = 0                # V4: a taker market open/close is in flight (single-open guard)
+    last_add_ns: int = 0               # last same-side taker add (pyramid throttle)
     # per-book PnL backoff
     pnl_backoff_until_ns: int = 0      # if > now: book is in PnL-backoff, held at IDLE
     # managed-exit IOC escalation
@@ -270,7 +258,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         self.tk_max_hold_ns = int(TK_MAX_HOLD_S * (0.92 + 0.16 * jitter) * _NS)
         self.tk_min_hold_ns = int(TK_MIN_HOLD_S * _NS)
         self.tk_reopen_gap_ns = int(TK_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
-        self.pending_timeout_ns = int(PENDING_TIMEOUT_S * _NS)   # V4 single-open in-flight guard
+        self.tk_pyramid_gap_ns = int(TK_PYRAMID_GAP_S * (0.9 + 0.2 * jitter) * _NS)
         self.mk_quote_expiry_ns = int(MK_QUOTE_EXPIRY_S * _NS)
         self.mk_walk_start_ns = int(MK_EXIT_WALK_START_S * _NS)
         self.mk_giveup_ns = int(MK_EXIT_GIVEUP_S * (0.9 + 0.2 * jitter) * _NS)
@@ -307,7 +295,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             f"maker_edge>={MAKER_EDGE_ENTER_BPS}/{MAKER_EDGE_EXIT_BPS}bps, maker_fee<{MAKER_MAX_FEE_BPS}bps) "
             f"mk_giveup={MK_EXIT_GIVEUP_S:.0f}s mk_stop={MK_STOP_LOSS_BPS}/{MK_IOC_SLIPPAGE_BPS}bps "
             f"rt_loss_cap={RT_LOSS_CAP_BPS}bps activity_deadline={ACTIVITY_DEADLINE_S:.0f}s "
-            f"taker=V4(single-open tp={TK_TP_BPS}/sl={TK_SL_BPS}bps hold={TK_MIN_HOLD_S}-{TK_MAX_HOLD_S}s rebate_floor={TK_REBATE_FLOOR_BPS}) "
             f"rt_max={RT_MAX} rt_log={MAIN_VALIDATOR[:8]} "
             f"pnl_backoff(window={PNL_BACKOFF_WINDOW_S:.0f}s cooldown={PNL_BACKOFF_COOLDOWN_S:.0f}s min_rts={PNL_BACKOFF_MIN_RTS})"
         )
@@ -396,13 +383,7 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
 
         # Route only when FLAT and the dwell has elapsed, so no position straddles two modes and
         # books cannot flip-flop. A pending switch first cancels resting orders, then commits.
-        # ALSO skip routing while a taker MARKET order is in flight (pending_ns within timeout): such a
-        # book is still flat (the fill isn't in the FIFO yet) but a market order doesn't rest in
-        # account.orders, so re-routing it here would hand the taker-opened lot to maker/idle = a
-        # cross-mode straddle. Mirrors the guard in _TakerMode.step; pending self-clears on fill/reject/
-        # timeout. (Maker/idle never set pending_ns, so their routing is unaffected.)
-        in_flight = st.pending_ns and (now - st.pending_ns) < self.pending_timeout_ns
-        if flat and not in_flight:
+        if flat:
             # PnL backoff: checked BEFORE _route() so a bleeding book bypasses the fallback_maker
             # promotion. No dwell guard here — backoff is a safety trigger, not a fee-regime flip.
             if self._pnl_backoff_check(st, now):
@@ -506,16 +487,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         return cur if cur in ALLOWED_MODES else self.default_mode
 
     # ------------------------------------------------------------------ events
-    def onOrderRejected(self, event: OrderPlacementEvent) -> None:
-        """A rejected taker market order never filled — clear the in-flight single-open lock so the
-        book re-derives from net next step (instead of waiting out pending_timeout) and drop its stale
-        open stash (= V4). Required companion to the pending_ns guard."""
-        if event.bookId is None or not self._active_validator:
-            return
-        st = self._bstate(self._active_validator, event.bookId)
-        st.pending_ns = 0
-        self._rt_log.pop((self._active_validator, event.bookId), None)
-
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
         """Route maker AND taker fills into the shared FIFO. is_buy mirrors the validator:
         taker+BUY or maker+SELL-aggressor both mean WE bought."""
@@ -564,7 +535,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         fee: float, ts: int,
     ) -> None:
         inv = self._inv(validator, book_id)
-        self._bstate(validator, book_id).pending_ns = 0   # a fill resolved any in-flight taker order
         realized, rtv, matched_ts, gross = self._match_fifo(inv, is_buy, qty, price, fee, ts)
         if rtv > 0:
             st = self._bstate(validator, book_id)
@@ -803,17 +773,6 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             return None
 
     @staticmethod
-    def _estimate_rt_pnl(taker_rate: float, book, qty: float) -> float:
-        """Conservative taker RT on the RAW book: buy ask, sell bid, fees both legs (= V4). >0 iff the
-        rebate beats the spread (algebraically identical to the old est_bps=2*rebate-2*half_spread)."""
-        if not book.bids or not book.asks:
-            return 0.0
-        bid, ask = book.bids[0].price, book.asks[0].price
-        if bid <= 0 or ask <= 0:
-            return 0.0
-        return (bid - ask) * qty - taker_rate * (ask + bid) * qty
-
-    @staticmethod
     def _microprice(book, mid: float) -> float:
         bid, ask = book.bids[0], book.asks[0]
         denom = bid.quantity + ask.quantity
@@ -913,11 +872,12 @@ class _Mode:
         raise NotImplementedError
 
     # -- shared bounded activity backstop (one lot; keeps activity factor at 1.0) --
-    def _activity_close(self, agent, response, book_id, account, inv,
-                        best_bid, best_ask, vol_dp) -> bool:
-        """Force ONE round-trip-producing close of a held lot with capped slippage, so the book
-        generates round-trip volume within the activity window. Bounded to a single lot, so the rare
-        forced loss is tiny. Callers guard on abs(net) >= exch_min, so the book is never flat here."""
+    def _activity_close(self, agent, response, book_id, account, inv, net,
+                        best_bid, best_ask, vol_dp, *,
+                        direction: int = OrderDirection.BUY) -> bool:
+        """Force ONE round-trip-producing close (or seed one lot if flat) with capped slippage,
+        so the book generates round-trip volume within the activity window. Bounded to a single
+        lot, so the rare forced loss is tiny."""
         slip = RT_LOSS_CAP_BPS / 1e4
         pdp = agent._price_decimals
         long_q, short_q = agent._long_qty(inv), agent._short_qty(inv)
@@ -942,7 +902,17 @@ class _Mode:
                                 round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False,
                                 settlement=agent._loan_settlement(account))
         else:
-            return False   # only reached if a future caller invokes this flat; never seed a lot here
+            q = lot
+            if direction == OrderDirection.SELL and base_avail >= q:
+                agent._cancel_all(response, account, book_id)
+                agent._submit_limit(response, book_id, OrderDirection.SELL, q,
+                                    round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
+            else:
+                if quote_avail < q * best_ask * (1.0 + slip):
+                    return False
+                agent._cancel_all(response, account, book_id)
+                agent._submit_limit(response, book_id, OrderDirection.BUY, q,
+                                    round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False)
         return True
 
 
@@ -964,43 +934,35 @@ class _IdleMode(_Mode):
         if abs(net) >= agent.exch_min:
             agent._stash_open(validator, book_id, st, self.name, "drain",
                               "long" if net >= 0 else "short")
-            self._activity_close(agent, response, book_id, account, inv,
+            self._activity_close(agent, response, book_id, account, inv, net,
                                  best_bid, best_ask, vol_dp)
 
 
 class _TakerMode(_Mode):
-    """Deep-rebate scalper = TakerScalper logic. SINGLE small clip in the microprice-bias direction;
-    exit on TP / SL / max-hold within seconds. NO pyramiding (single-open, enforced by the flat-gate in
-    _step_book + the pending lock): one lot/book bounds the unwind so a stop is a small, cube-friendly
-    loss (the old 3-lot/4bps build could realize ~36bps if the rebate evaporated mid-hold). Open gate =
-    rebate >= 2bps AND est_pnl > 0 on the RAW spread; tight 2bps cut. A flat book that goes quiet
-    force-opens one rebate-funded RT (activity backstop) to stay dense/scored."""
+    """Deep-rebate scalper (mirrors UID 126). One small clip in the microprice-bias direction;
+    exit on TP / SL / max-hold within seconds — the rebate on both legs cushions a stop into a
+    net win. Bounded same-side inventory building is allowed while the rebate stays deep."""
 
     name = MODE_TAKER
 
     def step(self, agent, response, validator, book_id, book, account, st, inv, net,
              best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
-        # Rule 3 (= V4): one taker market order in flight at a time. Market open/close orders do NOT
-        # rest in account.orders, so without this guard a delayed or sub-exch-min partial fill lets the
-        # next step re-submit before the position is recognized -> a transient 2nd lot (breaks single-
-        # open). Wait pending_timeout for the fill, then re-derive from net.
-        if st.pending_ns and (now - st.pending_ns) < agent.pending_timeout_ns:
-            return
-        st.pending_ns = 0
         if abs(net) >= agent.exch_min:
-            self._exit(agent, response, validator, book_id, account, inv, net,
-                       best_bid, best_ask, vol_dp, now, st)
+            if not self._exit(agent, response, validator, book_id, account, inv, net,
+                              best_bid, best_ask, vol_dp, now, st):
+                self._maybe_add(agent, response, validator, book_id, book, account, st, inv, net,
+                                best_bid, best_ask, mid, volume_cap, now, vol_dp)
             return
         throttled = st.last_close_ns and (now - st.last_close_ns) < agent.tk_reopen_gap_ns
         if not throttled and self._open(agent, response, validator, book_id, book, account, st,
                                         best_bid, best_ask, mid, volume_cap, now, vol_dp):
             return
-        # Activity backstop (= V4): force ONE rebate-funded RT on a quiet flat book to keep it dense/
-        # scored. The router only sends rebated books here, so a forced RT is ~breakeven; the tight SL
-        # bounds the rare adverse one.
         if agent._activity_due(st, now):
-            self._force_open(agent, response, validator, book_id, book, account, st,
-                             best_bid, best_ask, mid, now, vol_dp)
+            act_dir = agent._bias(book, mid)
+            act_side = "long" if act_dir == OrderDirection.BUY else "short"
+            agent._stash_open(validator, book_id, st, self.name, "activity", act_side)
+            self._activity_close(agent, response, book_id, account, inv, net,
+                                 best_bid, best_ask, vol_dp, direction=act_dir)
 
     def _exit(self, agent, response, validator, book_id, account, inv, net,
               best_bid, best_ask, vol_dp, now, st) -> bool:
@@ -1031,16 +993,16 @@ class _TakerMode(_Mode):
         if net > 0:
             q = round(min(abs(net), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
-                return True   # orders cancelled; lot too small (dust) to exit this step
+                return True   # orders cancelled; lot too small to exit this step — return True
+                              # so the caller does NOT call _maybe_add() on a SL/TP position
             agent._submit_market(response, book_id, OrderDirection.SELL, q)
         else:
             q = round(min(abs(net), agent._avail(account.quote_balance) / best_ask if best_ask > 0 else abs(net)), vol_dp)
             if q < agent.exch_min:
-                return True
+                return True   # same: prevent _maybe_add() from accumulating past the SL/TP
             agent._submit_market(response, book_id, OrderDirection.BUY, q,
                                  settlement=agent._loan_settlement(account))
         st.last_close_ns = now
-        st.pending_ns = now            # close in flight — block re-action until the fill (rule 3)
         return True
 
     def _open(self, agent, response, validator, book_id, book, account, st,
@@ -1049,58 +1011,61 @@ class _TakerMode(_Mode):
         if taker_fee is None or not agent._budget_ok(validator, book_id, st, now, volume_cap):
             return False
         rebate_bps = -taker_fee * 1e4
-        if rebate_bps < TK_REBATE_FLOOR_BPS:          # = V4: open ONLY on a real rebate (>=2bps)
+        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 1e9
+        est_bps = 2.0 * rebate_bps - 2.0 * half_spread_bps   # rebate both legs minus 2 crossings
+        if est_bps <= 0.0:
             return False
+        direction = agent._bias(book, mid)
         q = round(agent.clip, vol_dp)
         if q < agent.exch_min:
             return False
-        if agent._estimate_rt_pnl(taker_fee, book, q) <= 0.0:   # = V4: rebate must beat the raw spread
-            return False
-        direction = agent._bias(book, mid)
-        if not self._submit_lot(agent, response, book_id, account, direction, q, best_bid, best_ask):
-            return False
-        st.pending_ns = now            # open in flight — block re-open until the fill (rule 3)
+        if direction == OrderDirection.BUY:
+            if agent._avail(account.quote_balance) < q * best_ask:
+                return False
+            agent._submit_market(response, book_id, OrderDirection.BUY, q,
+                                 settlement=agent._loan_settlement(account))
+        else:
+            if agent._avail(account.base_balance) < q:    # never naked-short from flat
+                return False
+            agent._submit_market(response, book_id, OrderDirection.SELL, q)
         agent._stash_open(validator, book_id, st, self.name, "scalp",
                           "long" if direction == OrderDirection.BUY else "short")
         return True
 
-    def _force_open(self, agent, response, validator, book_id, book, account, st,
-                    best_bid, best_ask, mid, now, vol_dp) -> bool:
-        """Force ONE rebate-funded RT (bypassing the est_pnl / rebate-floor profit gate) so a routed
-        taker book stays dense/scored across the activity window (= V4's backstop). Direction = bias;
-        the position then exits normally via _exit, bounded by the tight SL."""
+    def _maybe_add(self, agent, response, validator, book_id, book, account, st, inv, net,
+                   best_bid, best_ask, mid, volume_cap, now, vol_dp) -> None:
+        """Bounded same-side build while the rebate is DEEP (so a stacked stop stays net-positive),
+        mirroring 126 averaging into a paid edge. Hard inventory cap keeps the unwind small."""
+        if TK_MAX_INVENTORY_LOTS <= 1:
+            return
+        taker_fee = agent._taker_fee_rate(account)
+        if taker_fee is None:
+            return
+        if -taker_fee * 1e4 < TK_PYRAMID_MIN_REBATE_BPS:
+            return
+        if abs(net) + agent.clip > TK_MAX_INVENTORY_LOTS * agent.clip + agent._flat_eps:
+            return
+        if st.last_add_ns and (now - st.last_add_ns) < agent.tk_pyramid_gap_ns:
+            return
+        if not agent._budget_ok(validator, book_id, st, now, volume_cap):
+            return
+        direction = agent._bias(book, mid)
+        pos_dir = OrderDirection.BUY if net > 0 else OrderDirection.SELL
+        if direction != pos_dir:                          # only press our own side
+            return
         q = round(agent.clip, vol_dp)
         if q < agent.exch_min:
-            return False
-        direction = agent._bias(book, mid)
-        if not self._submit_lot(agent, response, book_id, account, direction, q, best_bid, best_ask):
-            return False
-        st.pending_ns = now
-        agent._stash_open(validator, book_id, st, self.name, "activity",
-                          "long" if direction == OrderDirection.BUY else "short")
-        return True
-
-    @staticmethod
-    def _submit_lot(agent, response, book_id, account, direction, q, best_bid, best_ask) -> bool:
-        """Cross for one lot = V4 _taker_open: BUY needs quote; SELL uses base, else a margin short
-        (keeps breadth on books with no base inventory). Returns whether an order was submitted."""
+            return
         if direction == OrderDirection.BUY:
-            if best_ask <= 0 or agent._avail(account.quote_balance) < q * best_ask:
-                return False
-            agent._submit_market(response, book_id, OrderDirection.BUY, q)   # = V4: open-BUY needs no
-            #                                       loan settlement (a flat open never covers a short)
+            if agent._avail(account.quote_balance) < q * best_ask:
+                return
+            agent._submit_market(response, book_id, OrderDirection.BUY, q,
+                                 settlement=agent._loan_settlement(account))
         else:
-            if best_bid <= 0:
-                return False
-            free_base = account.base_balance.free if account.base_balance else 0.0
-            if free_base >= q:
-                agent._submit_market(response, book_id, OrderDirection.SELL, q)
-            else:
-                quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
-                agent._submit_market(response, book_id, OrderDirection.SELL, q,
-                                     leverage=0.0 if quote_loan > 0 else SHORT_LEVERAGE,
-                                     settlement=agent._loan_settlement(account))
-        return True
+            if agent._avail(account.base_balance) < q:
+                return
+            agent._submit_market(response, book_id, OrderDirection.SELL, q)
+        st.last_add_ns = now
 
 class _MakerMode(_Mode):
     """Two-sided spread capture (mirrors UID 109/149). Flat -> quote both sides inside the touch.
@@ -1129,7 +1094,7 @@ class _MakerMode(_Mode):
         if agent._activity_due(st, now) and abs(net) >= agent.exch_min:
             agent._stash_open(validator, book_id, st, self.name, "activity",
                               "long" if net >= 0 else "short")
-            if self._activity_close(agent, response, book_id, account, inv,
+            if self._activity_close(agent, response, book_id, account, inv, net,
                                     best_bid, best_ask, vol_dp):
                 return
         desired = self._desired_quotes(agent, validator, book_id, account, inv, net,
