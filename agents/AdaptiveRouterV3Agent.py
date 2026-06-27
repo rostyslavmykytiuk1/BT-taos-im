@@ -1,6 +1,38 @@
 """
-AdaptiveRouterV2Agent — per-book maker/taker/idle router for subnet 79 (optimized fork of
-AdaptiveRouterAgent). V2 CHANGES (2026-06-26, evidence/A-B-derived; taker leg unchanged):
+AdaptiveRouterV3Agent — per-book REGIME-ADAPTIVE router for subnet 79 (fork of AdaptiveRouterV2Agent).
+
+V3 CORE IDEA (2026-06-27, data + adversarial-review derived): the entire measured V2 loss is a ONE-SIDED held
+maker lot caught by a directional move and realized at the 15bps stop (uid64: cuts −258 net / −9.11 kappa,
+wiping +8.48 from good fills; corr(price-range, cut)=+0.44). So V3 classifies each book's CHARACTER live and
+routes by it, using three PROVEN, O(1)-cheap algorithms:
+  * Kaufman EFFICIENCY RATIO (ER = |net move| / path length over a time-windowed sub-sampled mid series) — canonical
+    trend-vs-noise discriminator. ER→1 = one-sided trend; ER→0 = mean-reverting range. THE key signal
+    (raw amplitude does NOT separate winners/losers; one-sidedness does).
+  * EWMA volatility (RiskMetrics σ²ₙ=λσ²ₙ₋₁+(1−λ)rₙ²) — amplitude estimate for the magnitude gate + A-S spread.
+  * Avellaneda-Stoikov inventory skew (reservation r = mid − q·γ·σ²) — the two-sided maker leans its quotes
+    AGAINST inventory so it stops accumulating into a move (kills the adverse-selection that V2 suffered).
+Per book → char ∈ {SMOOTH, CHOP, DIRECTIONAL}, latched with a 2-step ENTRY confirm (DIR_CONFIRM_STEPS) +
+hysteresis + min-dwell so a single mid spike can't flip a held lot's regime:
+  * SMOOTH / CHOP (low one-sidedness; CHOP = high-amplitude mean-reverting) → continuous TWO-SIDED never-cut
+    maker (A-S-skewed) — the home engine. A held loser is realized ONLY by the 15bps never-cut stop (rare),
+    WHOLE-SIDE in one shot.
+  * DIRECTIONAL (one-sided trend) → do NOT open a passive maker lot; route to the PATIENT REBATE TAKER
+    (uid62 archetype: ~59s holds, bleed WITH the move in rebate-funded clips, catastrophe-only stop) if the
+    fee regime makes it +EV, else IDLE (free-drop; at the idle CLIFF, fall through to a resting maker instead).
+    A maker lot ALREADY held when a book turns DIRECTIONAL just rides the pure never-cut stop (it can't re-route
+    mid-position) — see below.
+Held-lot cuts = PURE NEVER-CUT 15bps WHOLE-SIDE, regardless of character. The detector is used for ROUTING ONLY.
+This was SETTLED empirically by the §10.1 offline kappa replay (tests/arv3_kappa_replay.py — real validator
+kappa_3 on real MAKER and TREND price paths): two fancier ideas were tested and BOTH lost to pure never-cut-15:
+(1) scaling the cut out one clip at a time (Δ≈-0.012 on the mean-reverting home regime — fragments one cut into
+clustered negative RTs and forgoes the clean re-enter-lower on the revert); (2) a tighter 6bps stop on
+DIRECTIONAL books (WORSE in EVERY regime incl. trends, uid184 Δ-0.020 — real trends are noisy so a tight stop is
+whipsawed into many small realized losses that the cube-downside kappa punishes harder than one rare 15bps cut,
+and trends often retrace <15bps). So the maker's only loss-realiser is the 15bps never-cut, for all regimes —
+simplest, fastest, and the kappa-max choice. The PatientTaker still scales out (proven uid62 REBATE-taker
+mechanism, a different context). The SMOOTH path is byte-equivalent to V2, so V3 cannot regress the calm regime.
+
+Inherited V2 changes (taker leg unchanged):
   (1) MAKER reduce walks only to BREAKEVEN (never the touch), holds losers for reversion, and realizes a
       loss ONLY on a trending-loser stop = MK_STOP_LOSS_BPS (V2.1: 15bps; no 90s time-cut). The breakeven
       floor is the win (fills 68% vs v1 57% live + banks deep reversions); the stop was retuned 35→15 after
@@ -34,7 +66,7 @@ Calibrated from the top agents' own trade histories (other agents data/*.csv):
   * They route by FEE REGIME: UID 126 (#1, Kappa 0.263) is 100% taker on rebate books; UID 66
     (Kappa 0.104) is mixed and takes only where the taker side is rebated; UID 109/165 are pure
     makers — 165 makes profitably even at +11.5bps fee. We do the same: take where rebated, make
-    everywhere else, no maker fee ceiling.
+    everywhere else, gated by an 8bps maker-fee ceiling (with an in-mode / idle-cliff bypass).
   * Kappa rises with FREQUENCY (149 at 1.7 RT/book/10min → Kappa 0.040; 66/109 at ~26 → 0.10),
     because per-book Kappa ≈ (share of step-timestamps closed positive)^(2/3). So we quote
     continuously with short cooldowns, NOT sparse high-target round-trips.
@@ -90,9 +122,61 @@ from taos.im.protocol.models import (
 _NS = 1_000_000_000
 
 # ======================================================================== config
-# Which modes the router may use. {"taker"} => pure taker (== TakerScalper); {"maker"} => pure
-# maker; full set => adaptive per-book routing (the default).
-ALLOWED_MODES = {"taker", "maker", "idle"}
+# Which modes the router may use. full set => adaptive per-book routing (the default). "ptaker" (V3) is the
+# PatientTaker directional response (uid62 archetype). The fast _TakerMode stays available for A/B.
+ALLOWED_MODES = {"taker", "maker", "idle", "ptaker"}
+
+# ======================================================================= V3 regime-adaptive config
+# Per-book CHARACTER detector — three PROVEN O(1) algorithms (Kaufman Efficiency Ratio + RiskMetrics EWMA vol),
+# computed from sub-sampled mids in _step_book (onTrade only fires on OUR fills — verified self.events =
+# state.notices[self.uid] — so it can't see market mids; the per-publish state IS the only continuous mid feed).
+# TIME-BASED window (NOT a fixed publish count): the live publish_interval is 1 sim-second (simulation_0.xml
+# step="1000000000"), so a fixed 10-publish window = ~10s — ~12x too short for a REGIME property and it badly
+# mis-classifies (validated: tests/arv3_detector_realcsv.py). Instead sub-sample one mid every CHAR_SAMPLE_GAP_S
+# and keep a CHAR_WINDOW_S span, so the detector timescale is decoupled from publish_interval for ANY interval
+# up to ~CHAR_WINDOW_S/(CHAR_MIN_SAMPLES-1) ≈ 30s (covers the live 1s with huge margin). ABOVE that the window
+# can't gather CHAR_MIN_SAMPLES mids and the detector stays SMOOTH (degrades to the V2 never-cut maker — a SAFE
+# no-op, not a crash); `initialize` logs a WARNING if it ever sees such an interval so a config change can't
+# silently disable the detector.
+CHAR_WINDOW_S = 150.0              # Efficiency-Ratio window SPAN in sim-seconds (~2.5min — a real regime timescale)
+CHAR_SAMPLE_GAP_S = 12.0          # min sim-seconds between recorded mids (sub-sample: filters 1s micro-noise so ER
+                                   # measures the regime, not microstructure; also caps the window to ~13 samples)
+CHAR_MIN_SAMPLES = 6              # need this many sub-sampled mids in the window before classifying (else SMOOTH)
+CHAR_HIST_CAP = 24               # deque maxlen backstop (CHAR_WINDOW_S/CHAR_SAMPLE_GAP_S + slack)
+VOL_EWMA_LAMBDA = 0.94             # RiskMetrics decay: vol_var = λ·vol_var + (1−λ)·r²  (per-SAMPLE return var)
+ER_DIRT_ENTER = 0.65               # Efficiency Ratio ≥ this (AND amplitude gates) -> DIRECTIONAL (one-sided)
+ER_DIRT_EXIT = 0.45                # ER ≤ this -> leave DIRECTIONAL (0.65/0.45 anti-flip band)
+RVS_ENTER = 2.5                    # window range / full-spread ≥ this = amplitude big enough to matter (review:
+                                   # 3.0 under-detected trends on the live wide-spread books; safe to loosen now
+                                   # that a false DIRECTIONAL only diverts ROUTING — it never opens a fresh maker lot
+                                   # and suppresses the maker ADD leg, but never cuts an existing held lot)
+RVS_EXIT = 1.6                     # range/full-spread ≤ this -> leave DIRECTIONAL (2.5/1.6 anti-flip band)
+EXC_ENTER_BPS = 6.0                # |window net move| ≥ this bps to call DIRECTIONAL (loosened 8→6 with RVS so the
+                                   # protection actually engages; a false positive only costs a routing divert, not a cut)
+DIR_CONFIRM_STEPS = 2              # is_dir must hold this many CONSECUTIVE samples (~24s) before latching
+                                   # DIRECTIONAL — a single transient mid spike must not divert routing away from a
+                                   # passive maker lot / suppress the maker ADD leg (review #8)
+SPREAD_FLOOR_BPS = 4.0             # floor the range/spread denominator so tight books don't false-trip DIRECTIONAL
+CHAR_MIN_DWELL_S = 90.0            # DIRECTIONAL latch min lifetime (ride the aftershock; mirrors ROUTE dwell)
+KAPPA_REFRESH_MIN_GAP_S = 45.0     # min WALL seconds between per-book kappa3 recomputes (kappa3 is LOGGING-ONLY;
+                                   # throttle the O(B²·E) cross-book scan that otherwise fires most steps — review #1)
+
+# Avellaneda-Stoikov inventory skew for the two-sided maker: reservation r = mid − q·γ·σ². We lean BOTH quotes
+# against inventory so the maker stops accumulating into a move (kills the V2 adverse-selection accumulation).
+AS_GAMMA = 0.5                     # risk aversion; skew_bps = (net/clip)·AS_GAMMA·vol_bps, capped below
+AS_MAX_SKEW_BPS = 6.0              # cap inventory skew so quotes stay sane
+MK_SOFT_INVENTORY_LOTS = 1.5      # maker stops re-posting the ADD/entry side at/above this (nests under risk_trim 2.0)
+
+# PatientTaker (uid62 archetype) — the DIRECTIONAL response: patient, rebate-funded, bleed-with-the-move in clips.
+PT_TICK_S = 8.0                    # min seconds between PatientTaker actions per book (uid62 median inter-fill 8s)
+PT_MIN_HOLD_S = 45.0               # reduce a lot only after this hold (jitter -> ~59s median, uid62)
+PT_SOFT_INV_LOTS = 3.0             # start reducing / stop accumulating at this inventory
+PT_MAX_INV_LOTS = 3.0              # hard inventory cap (uid62 typical peak, NOT its p90 — cube-tail safety)
+PT_CATASTROPHE_BPS = 20.0         # catastrophe stop, scaled DOWN by inventory (PT_CATASTROPHE/inv_lots) -> bounded cube
+                                   # (review #5: 30→20 so the one un-fragmented worst-case RT is a smaller cube;
+                                   # 1 lot=20bps, 3 lots≈6.7bps. The per-tick scale-out should exit well before this)
+PT_REDUCE_SLIP_BPS = 2.0          # near-touch IOC slip on the patient reduce
+PT_MAX_RT_COST_BPS = 3.0          # taker-pays gate: open only if (2·half_spread − 2·rebate) ≤ this, else IDLE
 
 # ---- shared sizing / precision ----
 EXCHANGE_MIN_ORDER_SIZE = 0.25     # sim minOrderSize floor for any BASE order
@@ -201,7 +285,11 @@ MK_STOP_LOSS_BPS = 15.0            # V2.1: 35→15 (was 35 catastrophe; before t
                                    # cube-units (vs 10bps=1k) cratered kappa to −0.0156 despite better raw PnL.
                                    # 15 keeps the breakeven-floor fills + a little reversion room, but caps the
                                    # cube-bomb (15³=3375 ≈ 13× less downside than 35). The reduce still walks to
-                                   # BREAKEVEN (never the touch); this stop is only the trending-loser backstop.
+                                   # BREAKEVEN (never the touch); this stop is the ONLY loss-realiser, for ALL
+                                   # regimes. (A V3 experiment with a tighter 6bps stop on DIRECTIONAL books was
+                                   # tested in the §10.1 kappa replay and REMOVED — it lost to pure never-cut-15
+                                   # in every regime incl. trends, since a tight stop gets whipsawed into many
+                                   # small cube-punished losses. The detector is used for ROUTING only.)
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
 MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
@@ -228,6 +316,12 @@ MAIN_VALIDATOR = "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"
 MODE_TAKER = "taker"
 MODE_MAKER = "maker"
 MODE_IDLE = "idle"
+MODE_PTAKER = "ptaker"   # V3 PatientTaker (uid62 archetype): directional response
+
+# Book CHARACTER (V3 detector output)
+CHAR_SMOOTH = "smooth"
+CHAR_CHOP = "chop"
+CHAR_DIRECTIONAL = "directional"
 
 @dataclass
 class _Inv:
@@ -249,13 +343,15 @@ class _BookState:
     mk_loss_streak: int = 0            # consecutive losing maker cuts (reset on a positive close)
     mk_streak_cooldown_until_ns: int = 0  # pause maker entries on a persistently toxic book
     seen_ns: int = 0                   # first-seen ts; activity clock before the first RT
-    rt_events: list[tuple[int, float]] = field(default_factory=list)   # (sim_ts, realized_pnl); ALL validators,
+    rt_events: deque = field(default_factory=deque)   # (sim_ts, realized_pnl) FIFO; ALL validators,
                                                                        # short-retained (RT_EVENTS_RETENTION_S):
                                                                        # feeds pnl-backoff + rt_count only
     kappa_events: list[tuple[int, float]] = field(default_factory=list) # (wall_ts, realized_pnl); MAIN validator
                                                                         # ONLY (kappa3 is logging-only)
     kappa3: float | None = None        # logging-only (RT log); never read by a routing/mode decision
-    vol_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, traded quote vol)
+    kappa_refresh_ns: int = 0          # wall ts of the last kappa3 recompute (throttle the cross-book scan)
+    vol_log: deque = field(default_factory=deque)    # (ts, traded quote vol), FIFO; pruned from the left
+    vol_sum: float = 0.0               # running sum of vol_log volumes (O(1) rolled-volume; review #13)
     # taker bookkeeping
     last_close_ns: int = 0             # last taker close (reopen throttle)
     last_add_ns: int = 0               # last same-side taker add (pyramid throttle)
@@ -267,6 +363,15 @@ class _BookState:
     # V2 routing-spread EMA (de-noise the instantaneous spread for ROUTING only; raw used in _open)
     spread_ema_bps: float = 0.0        # EMA of half_spread_bps; 0 = uninitialised
     spread_ema_ns: int = 0             # last EMA update ts (for the dt-based decay)
+    # V3 per-book CHARACTER detector (Kaufman Efficiency Ratio + EWMA vol over a time-windowed sub-sampled mid series)
+    mid_hist: deque = field(default_factory=lambda: deque(maxlen=CHAR_HIST_CAP))  # recent (ts, mid) sub-samples
+    last_mid_sample_ns: int = 0        # ts of the last recorded mid sub-sample (CHAR_SAMPLE_GAP_S throttle)
+    vol_var: float = 0.0               # EWMA variance of per-sub-sample returns (RiskMetrics); 0 = uninitialised
+    char: str = CHAR_SMOOTH            # latched book character; SMOOTH/CHOP keep maker, DIRECTIONAL diverts
+    char_since_ns: int = 0             # when the current char latched (dwell clock)
+    dir_streak: int = 0               # consecutive is_dir steps (entry confirmation before latching DIRECTIONAL)
+    # V3 PatientTaker bookkeeping
+    pt_last_act_ns: int = 0            # last PatientTaker action (per-book tick throttle)
 
 
 @dataclass
@@ -275,13 +380,21 @@ class _RtLogCtx:
     mode: str = "?"
     open_reason: str = "?"
     side: str = "?"
-    kappa_at_open: float | None = None
     close_reason: str = "fill"
 
-class AdaptiveRouterV2Agent(FinanceSimulationAgent):
+
+class AdaptiveRouterV3Agent(FinanceSimulationAgent):
     # ------------------------------------------------------------------ setup
     def initialize(self) -> None:
         bt.logging.set_info()
+        # RESPONSE-TIME: the framework's update() builds a per-book DEBUG string (balances/orders/levels/loans
+        # for all 128 books) EVERY step and passes it to bt.logging.debug() — discarded at INFO, so it is pure
+        # waste (~3.4ms/step, ~96% of update(); benchmarked). lazy_load=True skips that block with ZERO visible
+        # change at INFO. Cheap per-miner, but it matters fleet-wide (≈30 miners on shared CPU → less contention
+        # → fewer transport timeouts). Agent compute is ~0.5% of the ~1.5s response time; the rest is network +
+        # state (de)serialization, which is a bittensor/host concern, not the agent's.
+        if getattr(self, "config", None) is not None:
+            self.config.lazy_load = True
 
         self.clip = TARGET_CLIP
         self.exch_min = EXCHANGE_MIN_ORDER_SIZE
@@ -309,8 +422,14 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         self.mk_streak_cooldown_ns = int(MK_STREAK_COOLDOWN_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
+        self.kappa_refresh_min_gap_ns = int(KAPPA_REFRESH_MIN_GAP_S * _NS)   # throttle the logging-only kappa scan
         self.pnl_backoff_window_ns = int(PNL_BACKOFF_WINDOW_S * _NS)
         self.pnl_backoff_cooldown_ns = int(PNL_BACKOFF_COOLDOWN_S * _NS)
+        self.char_min_dwell_ns = int(CHAR_MIN_DWELL_S * _NS)        # V3 detector latch dwell
+        self.char_window_ns = int(CHAR_WINDOW_S * _NS)             # V3 detector time-based window span
+        self.char_sample_gap_ns = int(CHAR_SAMPLE_GAP_S * _NS)     # V3 detector sub-sample cadence
+        self.pt_tick_ns = int(PT_TICK_S * (0.9 + 0.2 * jitter) * _NS)   # V3 PatientTaker per-book tick
+        self.pt_min_hold_ns = int(PT_MIN_HOLD_S * (0.9 + 0.4 * jitter) * _NS)   # jitter -> ~45-63s
 
         # Default mode = the most permissive allowed playbook (so a {"taker"}-only config always
         # runs taker and behaves like a pure scalper; idle is only a fallback when allowed).
@@ -322,6 +441,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             MODE_TAKER: _TakerMode(),
             MODE_MAKER: _MakerMode(),
             MODE_IDLE: _IdleMode(),
+            MODE_PTAKER: _PatientTakerMode(),
         }
 
         self.inv: dict[str, dict[int, _Inv]] = {}
@@ -330,13 +450,19 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         self._sim_id: dict[str, str] = {}
         self._step_ts_ns: dict[str, int] = {}
         self._active_validator: str | None = None
+        self._pub_checked = False           # one-time publish_interval sanity check (detector window feasibility)
 
         bt.logging.info(
-            f"[AdaptiveRouterV2 uid={self.uid}] modes={sorted(ALLOWED_MODES)} default={self.default_mode} "
+            f"[AdaptiveRouterV3 uid={self.uid}] modes={sorted(ALLOWED_MODES)} default={self.default_mode} "
             f"clip={TARGET_CLIP} dwell={ROUTE_MIN_DWELL_S:.0f}s "
             f"route(taker_rebate>={TAKER_REBATE_ENTER_BPS}/{TAKER_REBATE_EXIT_BPS}bps, "
             f"maker_edge>={MAKER_EDGE_ENTER_BPS}/{MAKER_EDGE_EXIT_BPS}bps, maker_fee<{MAKER_MAX_FEE_BPS}bps) "
-            f"mk=reduce->breakeven,stop={MK_STOP_LOSS_BPS:.0f}bps "
+            f"mk=reduce->breakeven,never-cut,stop={MK_STOP_LOSS_BPS:.0f}bps-whole-side(all-regimes) "
+            f"char(win={CHAR_WINDOW_S:.0f}s/samp{CHAR_SAMPLE_GAP_S:.0f}s ER>={ER_DIRT_ENTER}/{ER_DIRT_EXIT} "
+            f"rvs>={RVS_ENTER}/{RVS_EXIT} net>={EXC_ENTER_BPS}bps confirm={DIR_CONFIRM_STEPS}) "
+            f"as_skew(g={AS_GAMMA},cap={AS_MAX_SKEW_BPS}bps,soft_inv={MK_SOFT_INVENTORY_LOTS}) "
+            f"ptaker(tick={PT_TICK_S:.0f}s hold={PT_MIN_HOLD_S:.0f}s inv<={PT_MAX_INV_LOTS} "
+            f"cata={PT_CATASTROPHE_BPS:.0f}bps gate_rt<={PT_MAX_RT_COST_BPS}bps) "
             f"route_ema={ROUTE_SPREAD_EMA_HALFLIFE_S:.0f}s idle_cap={MAX_IDLE_BOOKS}/cliff={CLIFF_IDLE_BOOKS} "
             f"rt_loss_cap={RT_LOSS_CAP_BPS}bps activity_deadline={ACTIVITY_DEADLINE_S:.0f}s "
             f"rt_max={RT_MAX} rt_log={MAIN_VALIDATOR[:8]} "
@@ -347,6 +473,19 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
     def update(self, state: MarketSimulationStateUpdate) -> None:
         self._active_validator = state.dendrite.hotkey
         self._step_ts_ns[self._active_validator] = int(state.timestamp)
+        if not self._pub_checked:
+            # One-time guard: the time-based CHARACTER window needs CHAR_MIN_SAMPLES mids within CHAR_WINDOW_S,
+            # which holds only while publish_interval <= CHAR_WINDOW_S/(CHAR_MIN_SAMPLES-1). Past that the
+            # detector silently stays SMOOTH (safe V2 fallback) — warn so a config change can't hide it.
+            self._pub_checked = True
+            pub_ns = getattr(state.config, "publish_interval", 0) or 0
+            max_pub_ns = self.char_window_ns / max(CHAR_MIN_SAMPLES - 1, 1)
+            if pub_ns > max_pub_ns:
+                bt.logging.warning(
+                    f"[AdaptiveRouterV3 uid={self.uid}] publish_interval={pub_ns/_NS:.1f}s > "
+                    f"{max_pub_ns/_NS:.1f}s — CHARACTER detector will stay SMOOTH (V2 fallback); "
+                    f"lower CHAR_SAMPLE_GAP_S / raise CHAR_WINDOW_S to re-enable regime routing."
+                )
         self._ensure_simulation(self._active_validator, state.config.simulation_id)
         super().update(state)
 
@@ -362,7 +501,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         else:
             self._sim_id.pop(validator, None)
         bt.logging.info(
-            f"[AdaptiveRouterV2 uid={self.uid}] new simulation: {validator[:8]} sim_id={simulation_id}"
+            f"[AdaptiveRouterV3 uid={self.uid}] new simulation: {validator[:8]} sim_id={simulation_id}"
         )
 
     def respond(self, state: MarketSimulationStateUpdate) -> FinanceAgentResponse:
@@ -396,7 +535,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                 self._step_book(response, validator, book_id, book, account,
                                 vol_dp, volume_cap, now, fallback_maker, cliff)
             except Exception as ex:
-                bt.logging.warning(f"[AdaptiveRouterV2 uid={self.uid}] step {book_id}: {ex}")
+                bt.logging.warning(f"[AdaptiveRouterV3 uid={self.uid}] step {book_id}: {ex}")
 
         return response
 
@@ -426,6 +565,8 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             alpha = 1.0 - 0.5 ** (dt / self.spread_ema_halflife_ns) if dt > 0 else 0.0
             st.spread_ema_bps += alpha * (inst_half - st.spread_ema_bps)
         st.spread_ema_ns = now
+        # V3: update the per-book CHARACTER (Kaufman ER + EWMA vol; time-windowed sub-sampled mids). Bookkeeping.
+        self._update_char(st, mid, now)
         if st.mode_since_ns == 0:
             # Backdate the dwell clock so the FIRST routing decision can fire immediately. Without
             # this every book is pinned to default_mode (taker) for ROUTE_MIN_DWELL_S, spending 3
@@ -436,7 +577,14 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         if pruned and self._rt_log_enabled(validator):
             # kappa3 is LOGGING-ONLY and the RT log is MAIN-validator-only; skip the kappa refresh (and its
             # cross-book scan) for non-scoring validators. rt_events is still pruned above for all validators.
-            self._refresh_book_kappa(validator, book_id, time.time_ns())
+            # THROTTLE (review #1): _prune_rt_events returns True most steps (events age out of the 900s window
+            # continuously), so this O(B²·E) cross-book scan would fire nearly every step on every active book.
+            # kappa3 is a pure log field, so recompute at most once per KAPPA_REFRESH_MIN_GAP_S wall-seconds per
+            # book (the on-CLOSE refresh in _record_rt_close stays un-throttled so the RT log is always fresh).
+            wall = time.time_ns()
+            if wall - st.kappa_refresh_ns >= self.kappa_refresh_min_gap_ns:
+                st.kappa_refresh_ns = wall
+                self._refresh_book_kappa(validator, book_id, wall)
 
         net = self._net_qty(inv)
         flat = abs(net) < self.exch_min
@@ -452,7 +600,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                         self._cancel_all(response, account, book_id)
                         return
                     bt.logging.info(
-                        f"[AdaptiveRouterV2 uid={self.uid}] PNL-BACKOFF {st.mode}->idle book={book_id}"
+                        f"[AdaptiveRouterV3 uid={self.uid}] PNL-BACKOFF {st.mode}->idle book={book_id}"
                     )
                     st.mode, st.mode_since_ns = MODE_IDLE, now
             else:
@@ -462,7 +610,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                 want = self._route(st, account, best_bid, best_ask, mid,
                                    fallback_maker=fallback_maker, cliff=cliff)
                 if want != st.mode:
-                    # Emergency flip: bypass the 180s dwell guard when the current mode has
+                    # Emergency flip: bypass the route dwell guard (ROUTE_MIN_DWELL_S) when the current mode has
                     # turned clearly net-negative (not just borderline — only on obviously-wrong-
                     # side regimes). Only reachable when flat, so no active position is disrupted.
                     taker_fee_em = self._taker_fee_rate(account)
@@ -473,17 +621,20 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                     ) - ((maker_fee_em * 1e4) if maker_fee_em is not None else 1e9)
                     emergency = (
                         (st.mode == MODE_TAKER and rebate_em < EMERGENCY_TAKER_EXIT_BPS) or
-                        (st.mode == MODE_MAKER and mk_edge_em < EMERGENCY_MAKER_EXIT_BPS)
+                        (st.mode == MODE_MAKER and mk_edge_em < EMERGENCY_MAKER_EXIT_BPS) or
+                        # V3: a maker book whose character just turned DIRECTIONAL must leave promptly
+                        # (don't wait the 300s dwell to stop posting passive quotes into a trend).
+                        (st.mode == MODE_MAKER and st.char == CHAR_DIRECTIONAL and want != MODE_MAKER)
                     )
                     if emergency or (now - st.mode_since_ns) >= self.route_min_dwell_ns:
                         if account.orders:
                             self._cancel_all(response, account, book_id)
                             return
                         bt.logging.info(
-                            f"[AdaptiveRouterV2 uid={self.uid}] "
+                            f"[AdaptiveRouterV3 uid={self.uid}] "
                             f"{'EMERGENCY-FLIP' if emergency else 'ROUTE'} "
                             f"{st.mode}->{want} book={book_id} "
-                            f"taker_fee={self._taker_fee_rate(account)} maker_fee={self._maker_fee_rate(account)} "
+                            f"taker_fee={taker_fee_em} maker_fee={maker_fee_em} "   # reuse (no re-lookup)
                             f"spread_bps={(best_ask - best_bid) / mid * 1e4:.1f}"
                             + (" [cliff]" if cliff else (" [fallback-maker]" if fallback_maker else ""))
                         )
@@ -492,6 +643,64 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         mode = self._modes.get(st.mode) or self._modes[self.default_mode]
         mode.step(self, response, validator, book_id, book, account, st, inv, net,
                   best_bid, best_ask, mid, vol_dp, volume_cap, now)
+
+    # ------------------------------------------------------------------ V3 character detector
+    def _update_char(self, st: _BookState, mid: float, now: int) -> None:
+        """Per-book CHARACTER via two proven O(window) signals over a TIME-BASED sub-sampled mid window:
+          * Kaufman EFFICIENCY RATIO  er = |net move| / path length  — ~1 one-sided trend, ~0 mean-reverting.
+          * RiskMetrics EWMA vol      vol_var = λ·vol_var + (1−λ)·r²  — amplitude (feeds the A-S maker skew).
+        The window is a CHAR_WINDOW_S span of mids sub-sampled every CHAR_SAMPLE_GAP_S (NOT a fixed publish
+        count) so the regime timescale is correct for any publish_interval up to ~30s (the live value is 1s),
+        and 1s microstructure noise doesn't inflate the path length. Latches char in {SMOOTH, CHOP, DIRECTIONAL} with hysteresis +
+        a min dwell. SMOOTH/CHOP keep the maker; DIRECTIONAL diverts. Warmup / thin window = SMOOTH (home)."""
+        hist = st.mid_hist
+        # SUB-SAMPLE: only record a mid once per CHAR_SAMPLE_GAP_S; other publishes leave char latched.
+        if hist and (now - st.last_mid_sample_ns) < self.char_sample_gap_ns:
+            return
+        if hist:                                    # EWMA return variance from the last sub-sampled return
+            base = hist[-1][1]
+            if base > 0:
+                r = (mid - base) / base
+                st.vol_var = (VOL_EWMA_LAMBDA * st.vol_var + (1.0 - VOL_EWMA_LAMBDA) * r * r
+                              if st.vol_var > 0.0 else r * r)
+        hist.append((now, mid))
+        st.last_mid_sample_ns = now
+        cutoff = now - self.char_window_ns          # prune the front beyond the time window
+        while len(hist) > 1 and hist[0][0] < cutoff:
+            hist.popleft()
+        if len(hist) < CHAR_MIN_SAMPLES:            # not enough span/samples yet -> stay SMOOTH
+            return
+        # ONE pass over the window: endpoints, Kaufman path length, range (no list materialisation)
+        first = last = prev = 0.0
+        path = mn = mx = 0.0
+        for i, (_, px) in enumerate(hist):
+            if i == 0:
+                first = mn = mx = px
+            else:
+                path += abs(px - prev)
+                if px < mn:
+                    mn = px
+                elif px > mx:
+                    mx = px
+            prev = px
+            last = px
+        net = abs(last - first)
+        er = (net / path) if path > 1e-12 else 0.0  # Kaufman Efficiency Ratio
+        full_spread_bps = max(2.0 * st.spread_ema_bps, SPREAD_FLOOR_BPS)
+        rvs = ((mx - mn) / mid * 1e4 / full_spread_bps) if mid > 0 else 0.0   # range vs spread
+        net_bps = (net / mid * 1e4) if mid > 0 else 0.0
+        is_dir = (er >= ER_DIRT_ENTER and rvs >= RVS_ENTER and net_bps >= EXC_ENTER_BPS)
+        st.dir_streak = min(st.dir_streak + 1, DIR_CONFIRM_STEPS) if is_dir else 0   # clamp (only the >= test matters)
+        if st.char == CHAR_DIRECTIONAL:
+            faded = (er <= ER_DIRT_EXIT or rvs <= RVS_EXIT)     # anti-flip exit band
+            if faded and (now - st.char_since_ns) >= self.char_min_dwell_ns:
+                st.char = CHAR_CHOP if rvs >= RVS_ENTER else CHAR_SMOOTH
+                st.char_since_ns = now
+        elif st.dir_streak >= DIR_CONFIRM_STEPS:    # entry confirmation: a 1-step spike can't latch DIRECTIONAL
+            st.char = CHAR_DIRECTIONAL
+            st.char_since_ns = now
+        else:
+            st.char = CHAR_CHOP if rvs >= RVS_ENTER else CHAR_SMOOTH
 
     # ------------------------------------------------------------------ routing
     def _route(self, st: _BookState, account, best_bid: float, best_ask: float, mid: float,
@@ -510,6 +719,27 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                            else ((best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 0.0))
         maker_fee_bps = (maker_fee * 1e4) if maker_fee is not None else 1e9
         maker_edge_bps = half_spread_bps - maker_fee_bps   # capture half-spread, pay the maker fee
+
+        # === V3 CHARACTER GATE (above the fee routing) ===
+        # A DIRECTIONAL (one-sided trend) book must NOT open a passive maker lot — that is the V2 loss
+        # (adverse selection -> the 15bps cut). Route it to the PatientTaker if a cross is ~+EV given the fee
+        # regime, else IDLE (free-drop). SMOOTH/CHOP books fall through to the existing fee-based routing
+        # (the two-sided never-cut maker cycles them — incl. high-amplitude CHOP). Applies uniformly to ALL
+        # modes: routing is flat-gated upstream, so a flat PTAKER book on a still-directional book must STAY
+        # ptaker/idle (not fee-route back into a maker lot); returning cur==ptaker is a harmless no-op flip.
+        if st.char == CHAR_DIRECTIONAL:
+            rt_cost_bps = 2.0 * half_spread_bps - 2.0 * max(rebate_bps, 0.0)   # net cost to cross both legs
+            if MODE_PTAKER in ALLOWED_MODES and rt_cost_bps <= PT_MAX_RT_COST_BPS:
+                return MODE_PTAKER                # cheap cross -> rebate-funded patient scale-out taker
+            if not cliff:
+                return MODE_IDLE if MODE_IDLE in ALLOWED_MODES else cur
+            # At the CLIFF (idle overflow): a market-wide trend sends MANY books here at once and idling them
+            # all blows the 48-book budget with no backstop (review #2). Forcing an expensive taker cross would
+            # just guarantee a negative-kappa book, so instead FALL THROUGH to the fee router — which at the
+            # cliff relaxes the maker enter-edge to 0 and rests a maker quote WHENEVER there is any spread edge
+            # (half_spread >= maker_fee; true on essentially every real book). That maker earns the spread on
+            # fills and holds adverse fills never-cut, realizing a loss only at the 15bps whole-side stop
+            # (_managed_exit), which beats a 0.0 idle-median drag. If there is no spread edge it still idles.
 
         taker_min_rebate = TAKER_REBATE_EXIT_BPS if cur == MODE_TAKER else TAKER_REBATE_ENTER_BPS
         # Maker enter bar: relaxed under the idle-overflow fallback, and HARD-relaxed (→0) at the cliff so
@@ -548,8 +778,8 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
         """Route maker AND taker fills into the shared FIFO. is_buy mirrors the validator:
         taker+BUY or maker+SELL-aggressor both mean WE bought."""
-        if event.bookId is None:
-            return
+        if event.bookId is None or event.quantity is None or event.price is None:
+            return                              # malformed fill -> skip (onTrade isn't try/except-wrapped upstream)
         validator = validator or self._active_validator
         if validator is None:
             return
@@ -567,10 +797,22 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ FIFO state
     def _inv(self, validator: str, book_id: int) -> _Inv:
-        return self.inv.setdefault(validator, {}).setdefault(book_id, _Inv())
+        books = self.inv.get(validator)
+        if books is None:
+            books = self.inv[validator] = {}
+        obj = books.get(book_id)
+        if obj is None:                       # construct only on a miss (setdefault would build one every call)
+            obj = books[book_id] = _Inv()
+        return obj
 
     def _bstate(self, validator: str, book_id: int) -> _BookState:
-        return self.books_state.setdefault(validator, {}).setdefault(book_id, _BookState())
+        books = self.books_state.get(validator)
+        if books is None:
+            books = self.books_state[validator] = {}
+        st = books.get(book_id)
+        if st is None:                        # construct only on a miss (hot path: called many times per step)
+            st = books[book_id] = _BookState()
+        return st
 
     @staticmethod
     def _long_qty(inv: _Inv) -> float:
@@ -601,15 +843,15 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             if st.mode == MODE_MAKER and realized > 0:
                 st.mk_loss_streak = 0          # a winning maker close clears the toxic-book streak
             self._record_rt_close(validator, book_id, ts, realized)
-            self._log_rt(validator, book_id, ts,
+            self._log_rt(validator, book_id,
                          hold_s=(ts - matched_ts) / _NS if matched_ts else None,
-                         side=("buy" if is_buy else "sell"), exit_px=price, rtv=rtv,
+                         exit_px=price, rtv=rtv,
                          gross=gross, net=realized, kappa_before=kappa_before, kappa_after=st.kappa3)
         elif rtv == 0 and self._rt_log_enabled(validator) and (validator, book_id) not in self._rt_log:
             # Pure opening fill with no prior stash -> a passive maker quote got hit. Record context
             # now so the eventual closing RT logs a real open_reason/side instead of "?".
             st = self._bstate(validator, book_id)
-            self._stash_open(validator, book_id, st, st.mode, "passive",
+            self._stash_open(validator, book_id, st.mode, "passive",
                              "long" if is_buy else "short")
 
     def _match_fifo(
@@ -647,10 +889,15 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ kappa-3
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
-        cutoff = now - self.rt_events_retention_ns   # only the <=600s pnl-backoff/rt_count windows read this
-        before = len(st.rt_events)
-        st.rt_events = [(t, p) for t, p in st.rt_events if t >= cutoff]
-        return len(st.rt_events) != before
+        # FIFO deque (appends are time-ordered) -> popleft the aged-out front. O(dropped), not an O(N) rebuild
+        # every step. Only the <=600s pnl-backoff / <=570s rt_count windows read rt_events.
+        cutoff = now - self.rt_events_retention_ns
+        ev = st.rt_events
+        dropped = False
+        while ev and ev[0][0] < cutoff:
+            ev.popleft()
+            dropped = True
+        return dropped
 
     def _pnl_backoff_check(self, st: _BookState, now: int) -> bool:
         """True if net realized PnL over the rolling window is negative; holds the book at IDLE."""
@@ -688,8 +935,10 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                     ts_set.add(ts)
         return sorted(ts_set)
 
-    def _book_pnl_series(self, validator: str, book_id: int, now: int) -> list[float]:
-        timestamps = self._global_rt_timestamps(validator, now)
+    def _book_pnl_series(self, validator: str, book_id: int, now: int,
+                         timestamps: list[int] | None = None) -> list[float]:
+        if timestamps is None:
+            timestamps = self._global_rt_timestamps(validator, now)
         if not timestamps:
             return []
         cutoff = now - self.kappa_rt_history_ns
@@ -724,31 +973,29 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             return (mean_r - tau) / ((upm3 + reg) ** (1.0 / 3.0))
         return 0.0
 
-    def _kappa_history_ready(self, validator: str, now: int) -> bool:
-        ts = self._global_rt_timestamps(validator, now)
-        return len(ts) >= 2 and ts[-1] - ts[0] >= self.kappa_min_lookback_ns
-
     def _refresh_book_kappa(self, validator: str, book_id: int, now: int) -> None:
         st = self._bstate(validator, book_id)
-        if not self._kappa_history_ready(validator, now):
+        # Build the cross-book timestamp axis ONCE and reuse it for the readiness test AND the series builder
+        # (was scanned 2-3x per call). kappa3 is logging-only, so this whole path is best-effort/cheap.
+        timestamps = self._global_rt_timestamps(validator, now)
+        if len(timestamps) < 2 or timestamps[-1] - timestamps[0] < self.kappa_min_lookback_ns:
             st.kappa3 = None
-            ts_list = self._global_rt_timestamps(validator, now)
-            if ts_list:
+            if timestamps:
                 bt.logging.info(
-                    f"[AdaptiveRouterV2 uid={self.uid}] kappa_not_ready book={book_id} "
-                    f"ts_count={len(ts_list)} span_s={(ts_list[-1]-ts_list[0])/1e9:.0f} "
+                    f"[AdaptiveRouterV3 uid={self.uid}] kappa_not_ready book={book_id} "
+                    f"ts_count={len(timestamps)} span_s={(timestamps[-1]-timestamps[0])/1e9:.0f} "
                     f"need_span_s={self.kappa_min_lookback_ns/1e9:.0f}"
                 )
             else:
                 bt.logging.info(
-                    f"[AdaptiveRouterV2 uid={self.uid}] kappa_no_events book={book_id}"
+                    f"[AdaptiveRouterV3 uid={self.uid}] kappa_no_events book={book_id}"
                 )
             return
-        pnl = self._book_pnl_series(validator, book_id, now)
+        pnl = self._book_pnl_series(validator, book_id, now, timestamps)
         result = self._kappa3_raw(pnl)
         if result is None:
             bt.logging.info(
-                f"[AdaptiveRouterV2 uid={self.uid}] kappa_raw_none book={book_id} "
+                f"[AdaptiveRouterV3 uid={self.uid}] kappa_raw_none book={book_id} "
                 f"series_len={len(pnl)} nonzero={sum(1 for x in pnl if x != 0.0)}"
             )
         st.kappa3 = result
@@ -765,16 +1012,24 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
     def _record_trade_volume(self, validator, book_id, qty, price, ts_ns) -> None:
         vol = float(qty) * float(price)
         if vol > 0:
-            self._bstate(validator, book_id).vol_log.append((ts_ns, vol))
+            st = self._bstate(validator, book_id)
+            st.vol_log.append((ts_ns, vol))
+            st.vol_sum += vol
 
     def _prune_vol_log(self, st: _BookState, now_ns: int) -> None:
+        # FIFO deque (appends are time-ordered) -> popleft the aged-out front and decrement the running sum.
+        # O(dropped) instead of rebuilding the whole list each call (review #13).
         cutoff = now_ns - self.volume_assessment_ns
-        st.vol_log = [(t, v) for t, v in st.vol_log if t >= cutoff]
+        vl = st.vol_log
+        while vl and vl[0][0] < cutoff:
+            st.vol_sum -= vl.popleft()[1]
+        if not vl:
+            st.vol_sum = 0.0            # reset any float drift once the window empties
 
     def _rolled_quote_volume(self, validator: str, book_id: int, now_ns: int) -> float:
         st = self._bstate(validator, book_id)
         self._prune_vol_log(st, now_ns)
-        return sum(v for _, v in st.vol_log)
+        return st.vol_sum
 
     def _budget_ok(self, validator: str, book_id: int, st: _BookState, now: int, volume_cap: float) -> bool:
         return (self._rt_count(st, now) < RT_MAX
@@ -791,7 +1046,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         self.exch_min = max(EXCHANGE_MIN_ORDER_SIZE, 10 ** (-volume_decimals))
         self._flat_eps = 0.5 * 10 ** (-volume_decimals)
         bt.logging.info(
-            f"[AdaptiveRouterV2 uid={self.uid}] priceDecimals={price_decimals} tick={self._tick} "
+            f"[AdaptiveRouterV3 uid={self.uid}] priceDecimals={price_decimals} tick={self._tick} "
             f"volumeDecimals={volume_decimals} clip={self.clip} exch_min={self.exch_min}"
         )
 
@@ -882,12 +1137,11 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
     def _rt_log_enabled(validator: str) -> bool:
         return validator == MAIN_VALIDATOR
 
-    def _stash_open(self, validator: str, book_id: int, st: _BookState, mode: str,
+    def _stash_open(self, validator: str, book_id: int, mode: str,
                     reason: str, side: str) -> None:
         if not self._rt_log_enabled(validator):
             return
-        self._rt_log[(validator, book_id)] = _RtLogCtx(
-            mode=mode, open_reason=reason, side=side, kappa_at_open=st.kappa3)
+        self._rt_log[(validator, book_id)] = _RtLogCtx(mode=mode, open_reason=reason, side=side)
 
     @staticmethod
     def _fmt_kappa_pair(before: float | None, after: float | None) -> str:
@@ -899,7 +1153,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             return f"{before:.4f}->n/a"
         return f"{before:.4f}->{after:.4f}"
 
-    def _log_rt(self, validator, book_id, ts, *, hold_s, side, exit_px, rtv, gross, net,
+    def _log_rt(self, validator, book_id, *, hold_s, exit_px, rtv, gross, net,
                 kappa_before, kappa_after) -> None:
         if not self._rt_log_enabled(validator):
             return
@@ -908,7 +1162,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             ctx.mode = self._bstate(validator, book_id).mode   # maker fills open passively (no stash)
         hold_str = f"{hold_s:.2f}" if hold_s is not None else "n/a"
         bt.logging.info(
-            f"[AdaptiveRouterV2 uid={self.uid} RT] book={book_id} mode={ctx.mode} "
+            f"[AdaptiveRouterV3 uid={self.uid} RT] book={book_id} mode={ctx.mode} "
             f"open={ctx.open_reason}/{ctx.side} close={ctx.close_reason} "
             f"rtv={rtv:.4f} exit={exit_px:.4f} hold_s={hold_str} "
             f"gross={gross:+.4f} net={net:+.4f} "
@@ -928,7 +1182,7 @@ class _Mode:
         raise NotImplementedError
 
     # -- shared bounded activity backstop (one lot; keeps activity factor at 1.0) --
-    def _activity_close(self, agent, response, book_id, account, inv, net,
+    def _activity_close(self, agent, response, book_id, account, inv,
                         best_bid, best_ask, vol_dp, *,
                         direction: int = OrderDirection.BUY) -> bool:
         """Force ONE round-trip-producing close (or seed one lot if flat) with capped slippage,
@@ -988,9 +1242,9 @@ class _IdleMode(_Mode):
         # Only act to flatten a residual position carried in from a previous mode; otherwise stay
         # completely flat so the book remains kappa=None (free-dropped, not penalized).
         if abs(net) >= agent.exch_min:
-            agent._stash_open(validator, book_id, st, self.name, "drain",
+            agent._stash_open(validator, book_id, self.name, "drain",
                               "long" if net >= 0 else "short")
-            self._activity_close(agent, response, book_id, account, inv, net,
+            self._activity_close(agent, response, book_id, account, inv,
                                  best_bid, best_ask, vol_dp)
 
 
@@ -1006,8 +1260,8 @@ class _TakerMode(_Mode):
         if abs(net) >= agent.exch_min:
             if not self._exit(agent, response, validator, book_id, account, inv, net,
                               best_bid, best_ask, vol_dp, now, st):
-                self._maybe_add(agent, response, validator, book_id, book, account, st, inv, net,
-                                best_bid, best_ask, mid, volume_cap, now, vol_dp)
+                self._maybe_add(agent, response, validator, book_id, book, account, st, net,
+                                best_ask, mid, volume_cap, now, vol_dp)
             return
         throttled = st.last_close_ns and (now - st.last_close_ns) < agent.tk_reopen_gap_ns
         if not throttled and self._open(agent, response, validator, book_id, book, account, st,
@@ -1016,8 +1270,8 @@ class _TakerMode(_Mode):
         if agent._activity_due(st, now):
             act_dir = agent._bias(book, mid)
             act_side = "long" if act_dir == OrderDirection.BUY else "short"
-            agent._stash_open(validator, book_id, st, self.name, "activity", act_side)
-            self._activity_close(agent, response, book_id, account, inv, net,
+            agent._stash_open(validator, book_id, self.name, "activity", act_side)
+            self._activity_close(agent, response, book_id, account, inv,
                                  best_bid, best_ask, vol_dp, direction=act_dir)
 
     def _exit(self, agent, response, validator, book_id, account, inv, net,
@@ -1084,12 +1338,12 @@ class _TakerMode(_Mode):
             if agent._avail(account.base_balance) < q:    # never naked-short from flat
                 return False
             agent._submit_market(response, book_id, OrderDirection.SELL, q)
-        agent._stash_open(validator, book_id, st, self.name, "scalp",
+        agent._stash_open(validator, book_id, self.name, "scalp",
                           "long" if direction == OrderDirection.BUY else "short")
         return True
 
-    def _maybe_add(self, agent, response, validator, book_id, book, account, st, inv, net,
-                   best_bid, best_ask, mid, volume_cap, now, vol_dp) -> None:
+    def _maybe_add(self, agent, response, validator, book_id, book, account, st, net,
+                   best_ask, mid, volume_cap, now, vol_dp) -> None:
         """Bounded same-side build while the rebate is DEEP (so a stacked stop stays net-positive),
         mirroring 126 averaging into a paid edge. Hard inventory cap keeps the unwind small."""
         if TK_MAX_INVENTORY_LOTS <= 1:
@@ -1123,6 +1377,133 @@ class _TakerMode(_Mode):
             agent._submit_market(response, book_id, OrderDirection.SELL, q)
         st.last_add_ns = now
 
+
+class _PatientTakerMode(_Mode):
+    """uid62 archetype — the V3 DIRECTIONAL response. Patient, rebate-funded, SCALE-OUT taker: enter one clip on
+    the microprice lean, HOLD (no fast TP/SL), and unwind ONE clip per ~8s tick — reducing once the lot is old,
+    inventory is high, OR the move turns against it (bleed WITH the move). Press the lean one clip only while it
+    is young AND the move favors it (bounded). The ONLY hard stop is a catastrophe, scaled DOWN by inventory so
+    a stacked reversal can't become a big cube. The rebate (both legs) funds the thin edge; the per-tick scale-out
+    smooths the realised stream. NOT momentum-prediction — it harvests rebate and exits gradually."""
+
+    name = MODE_PTAKER
+
+    def step(self, agent, response, validator, book_id, book, account, st, inv, net,
+             best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
+        if st.pt_last_act_ns and (now - st.pt_last_act_ns) < agent.pt_tick_ns:
+            return   # per-book tick throttle (uid62 ~8s inter-action)
+        if abs(net) >= agent.exch_min:
+            self._manage(agent, response, validator, book_id, book, account, st, inv, net,
+                         best_bid, best_ask, mid, vol_dp, volume_cap, now)
+            return
+        if self._open(agent, response, validator, book_id, book, account, st,
+                      best_bid, best_ask, mid, volume_cap, now, vol_dp):
+            st.pt_last_act_ns = now
+            return
+        if agent._activity_due(st, now):
+            act_dir = agent._bias(book, mid)
+            agent._stash_open(validator, book_id, self.name, "activity",
+                              "long" if act_dir == OrderDirection.BUY else "short")
+            if self._activity_close(agent, response, book_id, account, inv,
+                                    best_bid, best_ask, vol_dp, direction=act_dir):
+                st.pt_last_act_ns = now
+
+    def _open(self, agent, response, validator, book_id, book, account, st,
+              best_bid, best_ask, mid, volume_cap, now, vol_dp) -> bool:
+        if not agent._budget_ok(validator, book_id, st, now, volume_cap):
+            return False
+        # re-check the regime-agnostic entry gate (route gated at flip; fees can drift): cross only if cheap
+        taker_fee = agent._taker_fee_rate(account)
+        rebate_bps = (-taker_fee * 1e4) if taker_fee is not None else 0.0
+        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 1e9
+        if (2.0 * half_spread_bps - 2.0 * max(rebate_bps, 0.0)) > PT_MAX_RT_COST_BPS:
+            return False
+        direction = agent._bias(book, mid)
+        q = round(agent.clip, vol_dp)
+        if q < agent.exch_min:
+            return False
+        if direction == OrderDirection.BUY:
+            if agent._avail(account.quote_balance) < q * best_ask:
+                return False
+            agent._submit_market(response, book_id, OrderDirection.BUY, q,
+                                 settlement=agent._loan_settlement(account))
+        else:
+            if agent._avail(account.base_balance) < q:    # never naked-short from flat
+                return False
+            agent._submit_market(response, book_id, OrderDirection.SELL, q)
+        agent._stash_open(validator, book_id, self.name, "patient",
+                          "long" if direction == OrderDirection.BUY else "short")
+        return True
+
+    def _manage(self, agent, response, validator, book_id, book, account, st, inv, net,
+                best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
+        clip = agent.clip
+        inv_lots = abs(net) / clip if clip > 0 else 0.0
+        if net > 0:
+            avg = agent._side_avg(inv.longs); ts0 = inv.longs[0][0]
+            underwater_bps = (avg - best_bid) / avg * 1e4 if avg > 0 else 0.0
+        else:
+            avg = agent._side_avg(inv.shorts); ts0 = inv.shorts[0][0]
+            underwater_bps = (best_ask - avg) / avg * 1e4 if avg > 0 else 0.0
+        hold_age = now - ts0
+        # catastrophe-only stop, scaled DOWN by inventory -> bounded single-RT cube. Whole side, one IOC.
+        if underwater_bps >= PT_CATASTROPHE_BPS / max(1.0, inv_lots):
+            self._tag(agent, validator, book_id, "cut")
+            agent._cancel_all(response, account, book_id)
+            self._exit_side(agent, response, book_id, account, net, best_bid, best_ask,
+                            vol_dp, qty=abs(net), slip_bps=MK_IOC_SLIPPAGE_BPS)
+            st.pt_last_act_ns = now
+            return
+        bias_with = ((agent._bias(book, mid) == OrderDirection.BUY) == (net > 0))   # microprice leans our way
+        reduce_now = (hold_age >= agent.pt_min_hold_ns or inv_lots >= PT_SOFT_INV_LOTS or not bias_with)
+        if reduce_now:
+            self._tag(agent, validator, book_id, "revert")
+            agent._cancel_all(response, account, book_id)
+            self._exit_side(agent, response, book_id, account, net, best_bid, best_ask,
+                            vol_dp, qty=min(abs(net), clip), slip_bps=PT_REDUCE_SLIP_BPS)   # scale out ONE clip
+            st.pt_last_act_ns = now
+        elif (underwater_bps <= 0.0 and inv_lots + 1.0 <= PT_MAX_INV_LOTS
+              and agent._budget_ok(validator, book_id, st, now, volume_cap)):
+            # press the lean ONE clip — only PYRAMID A WINNER (underwater<=0): never average down into a lot that
+            # is already red, so a momentum-press can't stack into a reversal catastrophe (review #7)
+            q = round(clip, vol_dp)                       # press the lean ONE clip (young + move favors)
+            if q >= agent.exch_min:
+                if net > 0 and agent._avail(account.quote_balance) >= q * best_ask:
+                    agent._submit_market(response, book_id, OrderDirection.BUY, q,
+                                         settlement=agent._loan_settlement(account))
+                    st.pt_last_act_ns = now
+                elif net < 0 and agent._avail(account.base_balance) >= q:
+                    agent._submit_market(response, book_id, OrderDirection.SELL, q)
+                    st.pt_last_act_ns = now
+
+    @staticmethod
+    def _exit_side(agent, response, book_id, account, net, best_bid, best_ask, vol_dp, *, qty, slip_bps) -> None:
+        slip = slip_bps / 1e4
+        pdp = agent._price_decimals
+        if net > 0:                                       # long -> SELL near-touch IOC
+            q = round(min(qty, agent._avail(account.base_balance)), vol_dp)
+            if q < agent.exch_min:
+                return
+            agent._submit_limit(response, book_id, OrderDirection.SELL, q,
+                                round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
+        else:                                             # short -> BUY near-touch IOC
+            buy_px = best_ask * (1.0 + slip)
+            q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else qty
+            q = round(min(qty, q_max), vol_dp)
+            if q < agent.exch_min:
+                return
+            agent._submit_limit(response, book_id, OrderDirection.BUY, q,
+                                round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False,
+                                settlement=agent._loan_settlement(account))
+
+    @staticmethod
+    def _tag(agent, validator, book_id, reason) -> None:
+        if agent._rt_log_enabled(validator):
+            c = agent._rt_log.get((validator, book_id))
+            if c is not None:
+                c.close_reason = reason
+
+
 class _MakerMode(_Mode):
     """Two-sided spread capture (mirrors UID 109/149). Flat -> quote both sides inside the touch.
     Holding -> work ONLY the reducing side, priced off the FIFO worst lot and walked toward the
@@ -1134,10 +1515,10 @@ class _MakerMode(_Mode):
 
     def step(self, agent, response, validator, book_id, book, account, st, inv, net,
              best_bid, best_ask, mid, vol_dp, volume_cap, now) -> None:
-        if (self._risk_trim(agent, response, book_id, account, inv, net, mid,
+        if (self._risk_trim(agent, response, book_id, account, net, mid,
                             vol_dp, best_bid, best_ask)
                 or self._managed_exit(agent, response, validator, book_id, account, inv, net,
-                                      best_bid, best_ask, vol_dp, now)):
+                                      best_bid, best_ask, vol_dp)):
             # Count forced IOC cuts (risk-trim or managed-exit) as losses until proven otherwise;
             # a positive close in _apply_fill resets the streak. After STREAK_LIMIT consecutive
             # cuts, pause maker entries for mk_streak_cooldown_ns to avoid re-bleeding on a
@@ -1154,16 +1535,16 @@ class _MakerMode(_Mode):
             px0 = agent._side_avg(inv.longs if net > 0 else inv.shorts)
             be_ok = (best_bid >= px0 > 0) if net > 0 else (0.0 < best_ask <= px0)
             if be_ok:
-                agent._stash_open(validator, book_id, st, self.name, "activity",
+                agent._stash_open(validator, book_id, self.name, "activity",
                                   "long" if net >= 0 else "short")
-                if self._activity_close(agent, response, book_id, account, inv, net,
+                if self._activity_close(agent, response, book_id, account, inv,
                                         best_bid, best_ask, vol_dp):
                     return
         desired = self._desired_quotes(agent, validator, book_id, account, inv, net,
                                        best_bid, best_ask, mid, volume_cap, now, vol_dp, st)
         self._reconcile(agent, response, account, book_id, desired)
 
-    def _risk_trim(self, agent, response, book_id, account, inv, net, mid,
+    def _risk_trim(self, agent, response, book_id, account, net, mid,
                    vol_dp, best_bid: float = 0.0, best_ask: float = 0.0) -> bool:
         qty = abs(net)
         if qty < agent._flat_eps:
@@ -1200,7 +1581,7 @@ class _MakerMode(_Mode):
         return True
 
     def _managed_exit(self, agent, response, validator, book_id, account, inv, net,
-                      best_bid, best_ask, vol_dp, now) -> bool:
+                      best_bid, best_ask, vol_dp) -> bool:
         if abs(net) < agent.exch_min:
             # Clear escalation state so a new position doesn't inherit a stale miss count.
             st = agent._bstate(validator, book_id)
@@ -1224,10 +1605,21 @@ class _MakerMode(_Mode):
         else:
             slip = MK_IOC_SLIPPAGE_BPS / 1e4
         pdp = agent._price_decimals
+        # PURE NEVER-CUT, WHOLE-SIDE, regardless of book character. A held loser is realized ONLY at the 15bps
+        # catastrophe stop. The §10.1 offline kappa replay (tests/arv3_kappa_replay.py — real validator kappa_3
+        # on real MAKER and TREND price paths) settled two earlier ideas, both DOMINATED by pure never-cut-15:
+        #   (1) scaling the cut out one clip at a time — WORSE (Δ≈-0.012) on the mean-reverting home regime
+        #       (fragments a cut into clustered negative RTs + forgoes the clean re-enter-lower on the revert);
+        #   (2) a tighter 6bps stop on DIRECTIONAL books — WORSE in EVERY regime incl. trends (uid184 Δ-0.020),
+        #       because real trends are noisy: a tight stop gets whipsawed into many small realized losses that
+        #       the cube-downside kappa punishes harder than one rare 15bps cut, and trends often retrace <15bps.
+        # The detector's value is ROUTING (don't OPEN a maker lot on a directional book — validated), NOT a
+        # tighter held-lot cut. So one stop, never-cut, like V2 — simple, fast, and the kappa-max choice today.
+        stop_bps = MK_STOP_LOSS_BPS
         if net > 0:
             _, _, px0, _ = inv.longs[0]
             underwater = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
-            if underwater < MK_STOP_LOSS_BPS:   # V2 NEVER-CUT: catastrophe stop ONLY, no time-cut — hold for revert
+            if underwater < stop_bps:           # NEVER-CUT: hold for revert; realize only at the 15bps stop
                 st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
@@ -1240,7 +1632,7 @@ class _MakerMode(_Mode):
             if st.mk_ioc_miss_count >= 2:
                 label = "IOC-CROSS" if st.mk_ioc_miss_count >= 4 else "IOC-ESCALATE"
                 bt.logging.info(
-                    f"[AdaptiveRouterV2 uid={agent.uid}] {label} book={book_id} "
+                    f"[AdaptiveRouterV3 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
             self._tag_close(agent, validator, book_id, "cut")
@@ -1250,7 +1642,7 @@ class _MakerMode(_Mode):
         else:
             _, _, px0, _ = inv.shorts[0]
             underwater = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
-            if underwater < MK_STOP_LOSS_BPS:   # V2 NEVER-CUT: catastrophe stop ONLY, no time-cut — hold for revert
+            if underwater < stop_bps:           # NEVER-CUT: hold for revert; realize only at the 15bps stop
                 st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
@@ -1265,7 +1657,7 @@ class _MakerMode(_Mode):
             if st.mk_ioc_miss_count >= 2:
                 label = "IOC-CROSS" if st.mk_ioc_miss_count >= 4 else "IOC-ESCALATE"
                 bt.logging.info(
-                    f"[AdaptiveRouterV2 uid={agent.uid}] {label} book={book_id} "
+                    f"[AdaptiveRouterV3 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
             self._tag_close(agent, validator, book_id, "cut")
@@ -1283,7 +1675,7 @@ class _MakerMode(_Mode):
                 c.close_reason = reason
 
     def _desired_quotes(self, agent, validator, book_id, account, inv, net,
-                        best_bid, best_ask, mid, volume_cap, now, vol_dp, st) -> dict:
+                        best_bid, best_ask, mid, volume_cap, now, vol_dp, st) -> dict[int, tuple[float, float]]:
         maker_fee = agent._maker_fee_rate(account)
         pdp = agent._price_decimals
         desired: dict[int, tuple[float, float]] = {}
@@ -1291,10 +1683,11 @@ class _MakerMode(_Mode):
         floor_bps = MK_TP_FEE_MULT * fee_bps + (agent._tick / mid) * 1e4
         base_target = max(MK_TP_BPS, floor_bps) / 1e4
 
-        free_base = account.base_balance.free if account.base_balance else 0.0
-        free_quote = account.quote_balance.free if account.quote_balance else 0.0
-        base_avail = agent._avail(account.base_balance)
-        quote_avail = agent._avail(account.quote_balance)
+        base_bal, quote_bal = account.base_balance, account.quote_balance
+        free_base = base_bal.free if base_bal else 0.0
+        free_quote = quote_bal.free if quote_bal else 0.0
+        base_avail = agent._avail(base_bal)
+        quote_avail = agent._avail(quote_bal)
 
         spread = best_ask - best_bid
         improve = agent._tick if spread > 2 * agent._tick else 0.0
@@ -1303,25 +1696,56 @@ class _MakerMode(_Mode):
         if bid_inside >= ask_inside:
             bid_inside, ask_inside = round(best_bid, pdp), round(best_ask, pdp)
 
+        # === Avellaneda-Stoikov inventory skew ===
+        # Lean BOTH quotes against the open lot, sized by inventory(lots) × recent EWMA vol(bps), capped.
+        # r = mid − q·γ·σ² in the bps-bounded form: LONG -> shift the pair DOWN (eager to sell, shy to add);
+        # SHORT -> UP. Flat -> no shift. This is what the top two-sided makers do to mean-revert inventory.
+        inv_lots = abs(net) / agent.clip if agent.clip > 0 else 0.0
+        vol_bps = math.sqrt(st.vol_var) * 1e4 if st.vol_var > 0.0 else 0.0
+        skew_bps = min(AS_MAX_SKEW_BPS, AS_GAMMA * inv_lots * vol_bps)
+        sign = 1.0 if net > 0 else (-1.0 if net < 0 else 0.0)
+        skew_frac = sign * skew_bps / 1e4
+        bid_skew = round(bid_inside * (1.0 - skew_frac), pdp)
+        ask_skew = round(ask_inside * (1.0 - skew_frac), pdp)
+        if bid_skew <= 0:
+            bid_skew = bid_inside
+        if ask_skew <= 0:
+            ask_skew = ask_inside
+        toxic = bool(st.mk_streak_cooldown_until_ns and now < st.mk_streak_cooldown_until_ns)
+        # CONTINUOUS two-sided: keep re-posting the spread-capture (ADD) leg while holding — UNLESS the book
+        # is directional, inventory hit the soft cap, or the book is in a loss-streak pause (don't pile in).
+        add_ok = (st.char != CHAR_DIRECTIONAL and inv_lots < MK_SOFT_INVENTORY_LOTS and not toxic
+                  and agent._budget_ok(validator, book_id, st, now, volume_cap))
+
         if net >= agent.exch_min:
+            # REDUCE side (SELL) — never-cut walk floored at BREAKEVEN; the A-S skew lets it rest closer to
+            # market (faster exit) when inventory/vol is high, but _reduce_price never sells below entry.
             age = now - inv.longs[0][0]
             fifo_px = inv.longs[0][2]
-            px = self._reduce_price(True, fifo_px, age, ask_inside, base_target, pdp, agent)
+            px = self._reduce_price(True, fifo_px, age, ask_skew, base_target, pdp, agent)
             q = round(min(agent._long_qty(inv), base_avail), vol_dp)
             if q >= agent.exch_min and px > 0:
                 desired[OrderDirection.SELL] = (px, q)
+            qa = round(agent.clip, vol_dp)   # ADD side (BUY) — skewed cheaper; off on a trend / over soft-cap
+            if add_ok and qa >= agent.exch_min and bid_skew > 0 and free_quote >= qa * bid_skew:
+                desired[OrderDirection.BUY] = (bid_skew, qa)
         elif net <= -agent.exch_min:
             age = now - inv.shorts[0][0]
             fifo_px = inv.shorts[0][2]
-            px = self._reduce_price(False, fifo_px, age, bid_inside, base_target, pdp, agent)
+            px = self._reduce_price(False, fifo_px, age, bid_skew, base_target, pdp, agent)
             q_max = quote_avail / px if px > 0 else agent._short_qty(inv)
             q = round(min(agent._short_qty(inv), q_max), vol_dp)
             if q >= agent.exch_min and px > 0:
                 desired[OrderDirection.BUY] = (px, q)
-        elif st.mk_streak_cooldown_until_ns and now < st.mk_streak_cooldown_until_ns:
+            qa = round(agent.clip, vol_dp)   # ADD side (SELL) — skewed dearer; off on a trend / over soft-cap
+            if add_ok and qa >= agent.exch_min and free_base >= qa:
+                desired[OrderDirection.SELL] = (ask_skew, qa)
+        elif toxic:
             pass   # persistently toxic book (streak of losing cuts) -> long pause, stop quoting
         elif st.last_cut_ns > 0 and now - st.last_cut_ns < agent.mk_reentry_cooldown_ns:
             pass   # just cut a loser -> pause fresh entries so we don't re-bag a trend
+        elif st.char == CHAR_DIRECTIONAL:
+            pass   # book turned directional while flat -> don't open passive liquidity into a trend
         elif agent._budget_ok(validator, book_id, st, now, volume_cap):
             if st.mk_streak_cooldown_until_ns:    # streak cooldown elapsed -> clear and fresh start
                 st.mk_loss_streak = 0
@@ -1385,5 +1809,5 @@ class _MakerMode(_Mode):
 
 
 if __name__ == "__main__":
-    launch(AdaptiveRouterV2Agent)
+    launch(AdaptiveRouterV3Agent)
 
