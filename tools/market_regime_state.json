@@ -1,8 +1,8 @@
 {
-  "regime": "MIXED",
-  "pending": "MAKER",
-  "pending_count": 1,
-  "since": "2026-06-27 17:22:14",
+  "regime": "MAKER",
+  "pending": null,
+  "pending_count": 0,
+  "since": "2026-06-27 19:43:57",
   "last_firm": "MAKER",
   "sim_id": "20260621_1813"
 }

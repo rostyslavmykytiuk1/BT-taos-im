@@ -99,6 +99,7 @@ Per book each step:
          risk/managed-exit (bounded) -> activity backstop (bounded) -> mode's profit engine.
 """
 
+import gc
 import math
 import time
 from collections import deque
@@ -172,6 +173,8 @@ PT_TICK_S = 8.0                    # min seconds between PatientTaker actions pe
 PT_MIN_HOLD_S = 45.0               # reduce a lot only after this hold (jitter -> ~59s median, uid62)
 PT_SOFT_INV_LOTS = 3.0             # start reducing / stop accumulating at this inventory
 PT_MAX_INV_LOTS = 3.0              # hard inventory cap (uid62 typical peak, NOT its p90 — cube-tail safety)
+PT_MAX_HOLD_S = 180.0             # PROJECT RULE: never hold forever. Force-close the whole patient position past
+                                   # this even if the per-tick scale-out stalls (missed IOCs / pressing) — bounds the bag.
 PT_CATASTROPHE_BPS = 20.0         # catastrophe stop, scaled DOWN by inventory (PT_CATASTROPHE/inv_lots) -> bounded cube
                                    # (review #5: 30→20 so the one un-fragmented worst-case RT is a smaller cube;
                                    # 1 lot=20bps, 3 lots≈6.7bps. The per-tick scale-out should exit well before this)
@@ -274,22 +277,16 @@ MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
 MK_EXIT_WALK_START_S = 30.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 90.0            # V2: WALK-completion time only (reduce reaches BREAKEVEN by here, then
-                                   # HOLDS for reversion). NO time-cut anymore — never-cut holds losers; a
-                                   # loss is realized ONLY by the catastrophe stop below.
-MK_STOP_LOSS_BPS = 15.0            # V2.1: 35→15 (was 35 catastrophe; before that 10 tight-cut). Live A/B
-                                   # (uid64 vs v1 uid78, same 45m window) showed the GOOD half of never-cut is
-                                   # the reduce-to-BREAKEVEN floor (fills 68% win/+0.0211 vs v1 57%/+0.0139 and
-                                   # it banks deep reversions v1 cuts off). The BAD half was the 35bps stop:
-                                   # non-reverting losers rode 80-500s to −38bps and CUT there → 38³≈55k
-                                   # cube-units (vs 10bps=1k) cratered kappa to −0.0156 despite better raw PnL.
-                                   # 15 keeps the breakeven-floor fills + a little reversion room, but caps the
-                                   # cube-bomb (15³=3375 ≈ 13× less downside than 35). The reduce still walks to
-                                   # BREAKEVEN (never the touch); this stop is the ONLY loss-realiser, for ALL
-                                   # regimes. (A V3 experiment with a tighter 6bps stop on DIRECTIONAL books was
-                                   # tested in the §10.1 kappa replay and REMOVED — it lost to pure never-cut-15
-                                   # in every regime incl. trends, since a tight stop gets whipsawed into many
-                                   # small cube-punished losses. The detector is used for ROUTING only.)
+MK_EXIT_GIVEUP_S = 150.0            # WALK-completion: reduce reaches BREAKEVEN by here, then rests for revert
+                                   # (tape: ~3-4% of wins close 90-180s; 150s holds through the grind-up)
+MK_MAX_HOLD_S = 180.0             # PROJECT RULE: never hold forever. The never-cut hold is ONLY for the
+                                   # sharp-dump→revert window (MeanReversionAgent: dump then grind up over
+                                   # minutes; tape-tuned close-anyway = 180s). Still underwater after this -> it
+                                   # did NOT revert -> force-cut (frees the book to re-route + bounds the bag/tail).
+                                   # Pairs with the 20bps catastrophe stop: realize a held loser on EITHER uw>=stop OR
+                                   # age>=this — never indefinitely. (Fixes the mode-stuck + bag/critical-loss gap.)
+MK_STOP_LOSS_BPS = 20.0            # catastrophe stop above 20bps dump band (tape); below 35-60 cube-bomb zone
+                                   # (reduce still walks to BREAKEVEN; this is the ONLY loss-realiser)
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
 MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
@@ -418,6 +415,7 @@ class AdaptiveRouterV3Agent(FinanceSimulationAgent):
         self.mk_quote_expiry_ns = int(MK_QUOTE_EXPIRY_S * _NS)
         self.mk_walk_start_ns = int(MK_EXIT_WALK_START_S * _NS)
         self.mk_giveup_ns = int(MK_EXIT_GIVEUP_S * (0.9 + 0.2 * jitter) * _NS)
+        self.mk_max_hold_ns = int(MK_MAX_HOLD_S * (0.9 + 0.2 * jitter) * _NS)   # never-hold-forever time cap
         self.mk_reentry_cooldown_ns = int(MK_REENTRY_COOLDOWN_S * _NS)
         self.mk_streak_cooldown_ns = int(MK_STREAK_COOLDOWN_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
@@ -430,6 +428,7 @@ class AdaptiveRouterV3Agent(FinanceSimulationAgent):
         self.char_sample_gap_ns = int(CHAR_SAMPLE_GAP_S * _NS)     # V3 detector sub-sample cadence
         self.pt_tick_ns = int(PT_TICK_S * (0.9 + 0.2 * jitter) * _NS)   # V3 PatientTaker per-book tick
         self.pt_min_hold_ns = int(PT_MIN_HOLD_S * (0.9 + 0.4 * jitter) * _NS)   # jitter -> ~45-63s
+        self.pt_max_hold_ns = int(PT_MAX_HOLD_S * (0.9 + 0.2 * jitter) * _NS)   # never-hold-forever cap
 
         # Default mode = the most permissive allowed playbook (so a {"taker"}-only config always
         # runs taker and behaves like a pure scalper; idle is only a fallback when allowed).
@@ -457,17 +456,39 @@ class AdaptiveRouterV3Agent(FinanceSimulationAgent):
             f"clip={TARGET_CLIP} dwell={ROUTE_MIN_DWELL_S:.0f}s "
             f"route(taker_rebate>={TAKER_REBATE_ENTER_BPS}/{TAKER_REBATE_EXIT_BPS}bps, "
             f"maker_edge>={MAKER_EDGE_ENTER_BPS}/{MAKER_EDGE_EXIT_BPS}bps, maker_fee<{MAKER_MAX_FEE_BPS}bps) "
-            f"mk=reduce->breakeven,never-cut,stop={MK_STOP_LOSS_BPS:.0f}bps-whole-side(all-regimes) "
+            f"mk=reduce->breakeven,stop={MK_STOP_LOSS_BPS:.0f}bps,max_hold={MK_MAX_HOLD_S:.0f}s "
             f"char(win={CHAR_WINDOW_S:.0f}s/samp{CHAR_SAMPLE_GAP_S:.0f}s ER>={ER_DIRT_ENTER}/{ER_DIRT_EXIT} "
             f"rvs>={RVS_ENTER}/{RVS_EXIT} net>={EXC_ENTER_BPS}bps confirm={DIR_CONFIRM_STEPS}) "
             f"as_skew(g={AS_GAMMA},cap={AS_MAX_SKEW_BPS}bps,soft_inv={MK_SOFT_INVENTORY_LOTS}) "
             f"ptaker(tick={PT_TICK_S:.0f}s hold={PT_MIN_HOLD_S:.0f}s inv<={PT_MAX_INV_LOTS} "
-            f"cata={PT_CATASTROPHE_BPS:.0f}bps gate_rt<={PT_MAX_RT_COST_BPS}bps) "
+            f"cata={PT_CATASTROPHE_BPS:.0f}bps max_hold={PT_MAX_HOLD_S:.0f}s gate_rt<={PT_MAX_RT_COST_BPS}bps) "
             f"route_ema={ROUTE_SPREAD_EMA_HALFLIFE_S:.0f}s idle_cap={MAX_IDLE_BOOKS}/cliff={CLIFF_IDLE_BOOKS} "
             f"rt_loss_cap={RT_LOSS_CAP_BPS}bps activity_deadline={ACTIVITY_DEADLINE_S:.0f}s "
             f"rt_max={RT_MAX} rt_log={MAIN_VALIDATOR[:8]} "
             f"pnl_backoff(window={PNL_BACKOFF_WINDOW_S:.0f}s cooldown={PNL_BACKOFF_COOLDOWN_S:.0f}s min_rts={PNL_BACKOFF_MIN_RTS})"
         )
+        self._tune_gc()
+
+    def _tune_gc(self) -> None:
+        """RESPONSE-TIME: the asyncio/axon layer retains completed Task objects that hold ~128-orderbook state,
+        so the long-lived heap is large and EVERY gen2 GC sweep rescans it — pauses spike to tens of ms, and
+        when one lands mid-handle() it stretches the response past the validator timeout. We can't fix axon's
+        task lifecycle, but we control this process's GC. Measured (tests): a gen2 gc.collect() drops ~34ms -> 0
+        after freeze. Three knobs, all behaviour-neutral:
+          1) history_len=0  — the framework deep-copies the FULL 128-book state every step and keeps 10 copies
+             (self.history); we never read it. Kills that per-step model_copy + a big chunk of the scanned heap.
+          2) gc.freeze()    — move the ~120k permanent import/setup objects into the frozen gen so GC NEVER
+             rescans them; gen2 sweeps then only touch the small per-request churn.
+          3) raise thresholds — gen2 sweeps far less often, so a sweep rarely coincides with handle()."""
+        self.history_len = 0
+        try:
+            gc.collect()
+            gc.freeze()                       # exclude the permanent import/setup heap from all future sweeps
+            gc.set_threshold(50_000, 500, 500)  # gen2 sweeps far less frequently
+            bt.logging.info(f"[AdaptiveRouterV3 uid={self.uid}] gc tuned: frozen={gc.get_freeze_count()} "
+                            f"thresholds={gc.get_threshold()} history_len=0")
+        except Exception as ex:
+            bt.logging.warning(f"[AdaptiveRouterV3 uid={self.uid}] gc tune skipped: {ex}")
 
     # --------------------------------------------------------------- lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:
@@ -1454,6 +1475,15 @@ class _PatientTakerMode(_Mode):
                             vol_dp, qty=abs(net), slip_bps=MK_IOC_SLIPPAGE_BPS)
             st.pt_last_act_ns = now
             return
+        # PROJECT RULE: never hold forever. Past the max-hold the patient bet hasn't paid -> force-close the
+        # WHOLE side (the per-tick scale-out can stall on missed IOCs / pressing); bounds the bag, frees the book.
+        if hold_age >= agent.pt_max_hold_ns:
+            self._tag(agent, validator, book_id, "time")
+            agent._cancel_all(response, account, book_id)
+            self._exit_side(agent, response, book_id, account, net, best_bid, best_ask,
+                            vol_dp, qty=abs(net), slip_bps=MK_IOC_SLIPPAGE_BPS)
+            st.pt_last_act_ns = now
+            return
         bias_with = ((agent._bias(book, mid) == OrderDirection.BUY) == (net > 0))   # microprice leans our way
         reduce_now = (hold_age >= agent.pt_min_hold_ns or inv_lots >= PT_SOFT_INV_LOTS or not bias_with)
         if reduce_now:
@@ -1518,7 +1548,7 @@ class _MakerMode(_Mode):
         if (self._risk_trim(agent, response, book_id, account, net, mid,
                             vol_dp, best_bid, best_ask)
                 or self._managed_exit(agent, response, validator, book_id, account, inv, net,
-                                      best_bid, best_ask, vol_dp)):
+                                      best_bid, best_ask, vol_dp, now)):
             # Count forced IOC cuts (risk-trim or managed-exit) as losses until proven otherwise;
             # a positive close in _apply_fill resets the streak. After STREAK_LIMIT consecutive
             # cuts, pause maker entries for mk_streak_cooldown_ns to avoid re-bleeding on a
@@ -1581,7 +1611,7 @@ class _MakerMode(_Mode):
         return True
 
     def _managed_exit(self, agent, response, validator, book_id, account, inv, net,
-                      best_bid, best_ask, vol_dp) -> bool:
+                      best_bid, best_ask, vol_dp, now) -> bool:
         if abs(net) < agent.exch_min:
             # Clear escalation state so a new position doesn't inherit a stale miss count.
             st = agent._bstate(validator, book_id)
@@ -1614,15 +1644,20 @@ class _MakerMode(_Mode):
         #       because real trends are noisy: a tight stop gets whipsawed into many small realized losses that
         #       the cube-downside kappa punishes harder than one rare 15bps cut, and trends often retrace <15bps.
         # The detector's value is ROUTING (don't OPEN a maker lot on a directional book — validated), NOT a
-        # tighter held-lot cut. So one stop, never-cut, like V2 — simple, fast, and the kappa-max choice today.
+        # tighter held-lot cut. So the bps stop is a single 15bps catastrophe (replay-optimal). BUT — PROJECT
+        # RULE: never hold forever. A held lot is ALSO force-cut once it has been held past MK_MAX_HOLD_S (the
+        # sharp-dump→revert window); a lot still underwater after ~3min did NOT revert, so cutting it frees the
+        # book to re-route and bounds the bag/tail (fixes the mode-stuck + critical-loss failure mode).
         stop_bps = MK_STOP_LOSS_BPS
         if net > 0:
-            _, _, px0, _ = inv.longs[0]
+            ts0, _, px0, _ = inv.longs[0]
             underwater = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
-            if underwater < stop_bps:           # NEVER-CUT: hold for revert; realize only at the 15bps stop
+            timed_out = (now - ts0) >= agent.mk_max_hold_ns
+            if underwater < stop_bps and not timed_out:   # hold for revert ONLY within BOTH the stop AND max-hold
                 st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
+            reason = "time" if (timed_out and underwater < stop_bps) else "cut"
             q = round(min(agent._long_qty(inv), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
                 st.mk_ioc_miss_count = 0
@@ -1635,17 +1670,19 @@ class _MakerMode(_Mode):
                     f"[AdaptiveRouterV3 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
-            self._tag_close(agent, validator, book_id, "cut")
+            self._tag_close(agent, validator, book_id, reason)
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.SELL, q,
                                 round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
         else:
-            _, _, px0, _ = inv.shorts[0]
+            ts0, _, px0, _ = inv.shorts[0]
             underwater = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
-            if underwater < stop_bps:           # NEVER-CUT: hold for revert; realize only at the 15bps stop
+            timed_out = (now - ts0) >= agent.mk_max_hold_ns
+            if underwater < stop_bps and not timed_out:   # hold for revert ONLY within BOTH the stop AND max-hold
                 st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
+            reason = "time" if (timed_out and underwater < stop_bps) else "cut"
             buy_px = best_ask * (1.0 + slip)
             q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else agent._short_qty(inv)
             q = round(min(agent._short_qty(inv), q_max), vol_dp)
@@ -1660,7 +1697,7 @@ class _MakerMode(_Mode):
                     f"[AdaptiveRouterV3 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
-            self._tag_close(agent, validator, book_id, "cut")
+            self._tag_close(agent, validator, book_id, reason)
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.BUY, q,
                                 round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False,

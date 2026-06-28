@@ -109,9 +109,10 @@ QUOTE_EXPIRY_S = 12.0
 #   * the reduce walks only to BREAKEVEN, never the touch (see _reduce_price) — a late passive fill
 #     nets ~0; anything that can't fill there is IOC-cut by the bounded managed-exit.
 EXIT_WALK_START_S = 30.0           # start walking reduce from target toward breakeven after 30s
-EXIT_GIVEUP_S = 150.0              # tight time-cut at ~2.5min (= V1; AR uses 90s) — below the activity backstop
-EXIT_STOP_LOSS_BPS = 10.0          # FLOOR of the vol-scaled stop band (calm-book default) — cut tight
-EXIT_STOP_CAP_BPS = 14.0           # CAP of the band — bounds a single realized loss on volatile books
+EXIT_GIVEUP_S = 180.0              # time-cut at 3min = the sharp-dump→revert window (project rule: never hold
+                                   # forever — MeanReversionAgent's tape-tuned close-anyway = 180s; was 150)
+EXIT_STOP_LOSS_BPS = 18.0          # FLOOR of the vol-scaled stop band — above 20bps dump noise (tape)
+EXIT_STOP_CAP_BPS = 25.0           # CAP of the band — catastrophe bound below cube-bomb zone
 EXIT_STOP_NOISE_MULT = 6.0         # stop ≈ MULT × per-book per-step mid-noise(bps), clamped to band
 NOISE_EWMA_ALPHA = 0.05            # EWMA weight for the per-book mid-noise estimate (~20-step memory)
 EXIT_CUT_SLIPPAGE_BPS = 4.0        # initial IOC-cut price concession

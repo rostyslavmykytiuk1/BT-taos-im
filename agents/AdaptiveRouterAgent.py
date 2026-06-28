@@ -54,6 +54,7 @@ Per book each step:
          risk/managed-exit (bounded) -> activity backstop (bounded) -> mode's profit engine.
 """
 
+import gc
 import math
 import time
 from collections import deque
@@ -161,12 +162,8 @@ MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
 MK_EXIT_WALK_START_S = 30.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 90.0            # ... walk to the touch by here, then IOC-cut. Matches PureMaker:
-                                   # most maker books mean-revert within 60-90s; cutting at 50s was
-                                   # too eager, triggering cuts on positions that would have filled.
-MK_STOP_LOSS_BPS = 10.0            # TRIGGER: IOC-cut a held lot underwater beyond this. Kept at 10
-                                   # (not tighter) because normal oscillation hits 5-8bps on low-fee
-                                   # maker books and a 6bps stop churns; the tighter lever is size.
+MK_EXIT_GIVEUP_S = 180.0           # IOC time-cut at 3min = sharp-dump→revert window (tape: 97% revert by 180s)
+MK_STOP_LOSS_BPS = 20.0            # TRIGGER: catastrophe stop above 20bps dump band, below cube-bomb zone
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
 MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
@@ -298,6 +295,24 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
             f"rt_max={RT_MAX} rt_log={MAIN_VALIDATOR[:8]} "
             f"pnl_backoff(window={PNL_BACKOFF_WINDOW_S:.0f}s cooldown={PNL_BACKOFF_COOLDOWN_S:.0f}s min_rts={PNL_BACKOFF_MIN_RTS})"
         )
+        self._tune_gc()
+
+    def _tune_gc(self) -> None:
+        """RESPONSE-TIME (axon GC-pause mitigation): the asyncio/axon layer retains completed Task objects
+        holding ~128-orderbook state, so every gen2 GC sweep rescans a large heap — pauses spike to tens of ms
+        and stretch handle() past the validator timeout. We own this process's GC. Measured: a gen2 gc.collect()
+        drops ~34ms->0 after freeze. (1) history_len=0: framework deep-copies the FULL 128-book state every step
+        and keeps 10 (self.history) which we never read — skip it; (2) gc.freeze(): exclude the ~120k permanent
+        import heap from every sweep; (3) raise thresholds: gen2 sweeps far less often. All behaviour-neutral."""
+        self.history_len = 0
+        try:
+            gc.collect()
+            gc.freeze()
+            gc.set_threshold(50_000, 500, 500)
+            bt.logging.info(f"[AdaptiveRouter uid={self.uid}] gc tuned: frozen={gc.get_freeze_count()} "
+                            f"thresholds={gc.get_threshold()} history_len=0")
+        except Exception as ex:
+            bt.logging.warning(f"[AdaptiveRouter uid={self.uid}] gc tune skipped: {ex}")
 
     # --------------------------------------------------------------- lifecycle
     def update(self, state: MarketSimulationStateUpdate) -> None:

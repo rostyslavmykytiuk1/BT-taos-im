@@ -92,6 +92,7 @@ def agent():
     a.mk_quote_expiry_ns = int(12 * NS_PER_S)
     a.mk_walk_start_ns = int(20 * NS_PER_S)
     a.mk_giveup_ns = int(120 * NS_PER_S)
+    a.mk_max_hold_ns = int(180 * NS_PER_S)
     a.mk_reentry_cooldown_ns = int(30 * NS_PER_S)
     a.mk_streak_cooldown_ns = int(600 * NS_PER_S)
     a.char_min_dwell_ns = int(mod.CHAR_MIN_DWELL_S * NS_PER_S)
@@ -99,6 +100,7 @@ def agent():
     a.char_sample_gap_ns = int(mod.CHAR_SAMPLE_GAP_S * NS_PER_S)
     a.pt_tick_ns = int(mod.PT_TICK_S * NS_PER_S)
     a.pt_min_hold_ns = int(mod.PT_MIN_HOLD_S * NS_PER_S)
+    a.pt_max_hold_ns = int(mod.PT_MAX_HOLD_S * NS_PER_S)
     return a
 
 
@@ -389,7 +391,7 @@ st = st_of(a, char=mod.CHAR_SMOOTH, mode=mod.MODE_MAKER)
 bb = 300.0 * (1 - 8e-4)
 inv = long_inv(300.0, a.clip, NOW - a.mk_walk_start_ns)
 r = Resp()
-cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4)
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4, NOW)
 check(cut is False and not r.limit, "long 8bps uw + SMOOTH -> HELD (never-cut 15bps)")
 
 # 5b. long 8bps underwater, DIRECTIONAL -> STILL HELD (no more 6bps tighten; never-cut regardless of char)
@@ -398,7 +400,7 @@ st = st_of(a, char=mod.CHAR_DIRECTIONAL, mode=mod.MODE_MAKER)
 bb = 300.0 * (1 - 8e-4)
 inv = long_inv(300.0, a.clip, NOW - a.mk_walk_start_ns)
 r = Resp()
-cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4)
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4, NOW)
 check(cut is False and not r.limit, "long 8bps uw + DIRECTIONAL -> HELD (never-cut, no regime tighten)")
 
 # 5c. long 8bps underwater, CHOP -> STILL HELD (8 < 15, regardless of char)
@@ -407,7 +409,7 @@ st = st_of(a, char=mod.CHAR_CHOP, mode=mod.MODE_MAKER)
 bb = 300.0 * (1 - 8e-4)
 inv = long_inv(300.0, a.clip, NOW - a.mk_walk_start_ns)
 r = Resp()
-cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4)
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4, NOW)
 check(cut is False and not r.limit, "long 8bps uw + CHOP -> HELD (never-cut 15bps)")
 
 # 5d. long 16bps underwater, DIRECTIONAL -> CUT at 15bps WHOLE side (the one stop fires regardless of char)
@@ -417,7 +419,7 @@ held = 3 * a.clip
 bb = 300.0 * (1 - 16e-4)
 inv = long_inv(300.0, held, NOW - a.mk_walk_start_ns)
 r = Resp()
-cut = mk._managed_exit(a, r, "test", 1, acct(), inv, held, bb, bb + 0.02, 4)
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, held, bb, bb + 0.02, 4, NOW)
 check(cut is True and len(r.limit) == 1 and r.limit[0]["direction"] == SELL
       and r.limit[0].get("timeInForce") == TIF.IOC and abs(r.limit[0]["quantity"] - held) < 1e-9,
       f"long 16bps uw -> 15bps WHOLE-side IOC SELL regardless of char ({r.limit[0]['quantity'] if r.limit else None})")
@@ -428,10 +430,28 @@ st = st_of(a, char=mod.CHAR_SMOOTH, mode=mod.MODE_MAKER)
 ba = 300.0 * (1 + 16e-4)
 inv = short_inv(300.0, held, NOW - a.mk_walk_start_ns)
 r = Resp()
-cut = mk._managed_exit(a, r, "test", 1, acct(), inv, -held, ba - 0.02, ba, 4)
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, -held, ba - 0.02, ba, 4, NOW)
 check(cut is True and len(r.limit) == 1 and r.limit[0]["direction"] == BUY
       and abs(r.limit[0]["quantity"] - held) < 1e-9,
       f"short 16bps uw -> 15bps WHOLE-side IOC BUY ({r.limit[0]['quantity'] if r.limit else None})")
+
+# 5f. MAX-HOLD (project rule: never hold forever): a lot only 8bps underwater (< 15bps stop) but held PAST
+#     mk_max_hold_ns -> force-CUT (it didn't revert), and NOT cut if still within max-hold.
+a = agent()
+st = st_of(a, char=mod.CHAR_SMOOTH, mode=mod.MODE_MAKER)
+bb = 300.0 * (1 - 8e-4)   # only 8bps uw -> the 15bps stop does NOT fire
+inv = long_inv(300.0, a.clip, NOW - a.mk_max_hold_ns - GAP)   # aged just past max-hold
+r = Resp()
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4, NOW)
+check(cut is True and len(r.limit) == 1 and r.limit[0]["direction"] == SELL,
+      "8bps uw but aged > max-hold -> force-CUT (never hold forever)")
+# and the same lot WITHIN max-hold is still HELD (revert window)
+a = agent()
+st = st_of(a, char=mod.CHAR_SMOOTH, mode=mod.MODE_MAKER)
+inv = long_inv(300.0, a.clip, NOW - a.mk_max_hold_ns // 2)   # half the max-hold -> still in revert window
+r = Resp()
+cut = mk._managed_exit(a, r, "test", 1, acct(), inv, a.clip, bb, bb + 0.02, 4, NOW)
+check(cut is False and not r.limit, "8bps uw within max-hold -> HELD (revert window)")
 
 
 # =====================================================================================
