@@ -1,18 +1,15 @@
 """
-AdaptiveRouterV2Agent — per-book maker/taker/idle router for subnet 79 (optimized fork of
-AdaptiveRouterAgent). V2 CHANGES (2026-06-26, evidence/A-B-derived; taker leg unchanged):
-  (1) MAKER reduce walks only to BREAKEVEN (never the touch), holds losers for reversion, and realizes a
-      loss ONLY on a trending-loser stop = MK_STOP_LOSS_BPS (V2.1: 15bps; no 90s time-cut). The breakeven
-      floor is the win (fills 68% vs v1 57% live + banks deep reversions); the stop was retuned 35→15 after
-      the A/B showed 35bps cuts are cube-bombs (38³ craters kappa) while 15 caps the downside ~13×.
-  (2) maker fee CEILING re-enabled at 8bps (was off) with a cur==MODE_MAKER in-mode bypass — auto-gates
-      maker OFF in maker-pays regimes, ON when fees are cheap; never ejects an in-position maker.
-  (3) ROUTING classifies on a 60s EMA of the half-spread (de-noise chop); the RAW spread stays in the
-      _open execution gate.
-  (4) idle CLIFF-FIRST override — near the 48-book free-drop budget, relax the maker fallback to rest
-      FREE passive quotes rather than force-cross taker (a free unfilled quote beats a guaranteed loss).
-  (5) NO maker→taker demote on a recent-PnL blip (it contaminated the per-book Sortino).
-  (6) dwell 180→300s, activity 480→1200s, fallback edge 0.5→1.0.
+AdaptiveRouterV2Agent — per-book maker/taker router for subnet 79 (hardened fork of
+AdaptiveRouterAgent / V1). Same architecture; V2 layers ONLY validated fixes from the live
+V1-vs-V2 study, with NO spread-EMA routing and NO idle-cliff override (both regressed in old V2):
+  * Maker gate hardened: enter edge 1.5→3.0bps (=6bps round-trip over both fee legs), a REAL
+    always-on maker-fee ceiling (6bps; no cliff/fallback bypass), and an absolute half-spread
+    floor (MK_MIN_SPREAD_BPS) so passive capture clears the two-legged fee drag.
+  * Idle overflow NEVER forces a −EV maker book: the fallback only relaxes the edge to 1.5bps and
+    keeps the fee ceiling + spread floor; a book that cannot clear them stays idle (idle=0.0 beats
+    a guaranteed loss, and ≤48 idle books are dropped from the kappa median for free).
+  * Maker cut held longer: stop 20→30bps (stops firing inside the reverting dump band) and
+    giveup 180→240s (cut-log study: aged time-cuts cost −0.02 vs −0.11 for early stop-cuts).
 
 Goal: stay near the top in ANY market by routing each book to the playbook that is +EV given the
 book's LIVE fee regime, mirroring the proven top miners:
@@ -122,26 +119,26 @@ TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.
 TAKER_REBATE_ENTER_BPS = 1.5       # route to taker when rebate ≥ 1.5bps; execution gate in
                                    # _TakerMode._open() independently checks 2×rebate > 2×half_spread
 TAKER_REBATE_EXIT_BPS = 0.75       # leave taker when rebate falls below 0.75bps (0.75bps hysteresis)
-MAKER_EDGE_ENTER_BPS = 1.5         # require half_spread − maker_fee ≥ 1.5bps to enter maker;
-                                   # empirically the minimum to survive adverse selection
-MAKER_EDGE_EXIT_BPS = -0.5         # exit maker when edge falls below −0.5bps (2bps hysteresis band)
-MAKER_MAX_FEE_BPS = 8.0            # V2: REAL ceiling (was 1000=off). A high maker fee = adverse-selection
-                                   # signal → don't ENTER maker above it (self-gates maker OFF in maker-pays
-                                   # regimes, ON when fees are cheap). In-mode BYPASS in _route so a book
-                                   # already in maker isn't ejected by a transient fee tick (mirrors the
-                                   # cur==taker spread bypass). ~8 keeps the 6-8bps maker-favorable band.
-MAKER_FALLBACK_EDGE_BPS = 1.0      # V2: idle-overflow promote books with ≥ 1.0bps edge (was 0.5) — above
-                                   # the −EV 0.5-edge books, below the 1.5 normal enter.
+MAKER_EDGE_ENTER_BPS = 3.0         # V2: require half_spread − maker_fee ≥ 3.0bps to enter maker (was
+                                   # 1.5). edge is a PER-LEG figure, so 3.0 here = a 6bps ROUND-TRIP
+                                   # edge over both fee legs — the fee-drag study showed the old 1.5
+                                   # (3bps round-trip) was below our ~2bps two-legged fee drag, so
+                                   # gross-positive trades closed net-negative.
+MAKER_EDGE_EXIT_BPS = -0.5         # exit maker when edge falls below −0.5bps (hysteresis band)
+MAKER_MAX_FEE_BPS = 6.0            # V2: REAL absolute ceiling, ALWAYS enforced (no cliff/fallback
+                                   # bypass). A high maker fee is adverse-selection territory no matter
+                                   # how wide the spread looks; skip those books (idle is +EV vs a loss).
+MK_MIN_SPREAD_BPS = 5.0            # V2: absolute half-spread FLOOR for maker entry, independent of the
+                                   # fee-relative edge. A near-zero-fee book can pass the edge gate on a
+                                   # 1bps spread, but there is no room to capture after the round trip —
+                                   # require real spread so passive capture clears the two fee legs.
+MAKER_FALLBACK_EDGE_BPS = 1.5      # V2: when the idle guard fires, relax the enter edge to 1.5bps (the
+                                   # old normal bar) — NOT to zero. The fee ceiling and min-spread floor
+                                   # stay fully enforced in fallback, so we never force a −EV maker book.
 MAX_IDLE_BOOKS = 40                # allow up to 40 idle books before promoting borderline ones to
                                    # maker via fallback; 40 is comfortably below the 48-book
                                    # validator budget (37.5% × 128) where kappa=None is free
-CLIFF_IDLE_BOOKS = 46              # V2 cliff-first override: above this, RELAX the maker fallback (rest
-                                   # free passive quotes, fee-ceiling off) to pull idle back under 48 —
-                                   # NEVER force-cross taker to rescue the cliff (a free quote beats a loss).
-ROUTE_MIN_DWELL_S = 300.0          # V2: 300 (was 180) — slug maker↔taker churn that contaminates the ~20h
-                                   # per-book kappa window; NOT 600 (would pin a book across a real sub-turn)
-ROUTE_SPREAD_EMA_HALFLIFE_S = 60.0 # V2: half-life of the per-book ROUTING spread EMA (de-noise chop);
-                                   # the RAW spread is still used for the _open execution gate
+ROUTE_MIN_DWELL_S = 180.0          # min time in a mode before switching (only switches when flat)
 EMERGENCY_TAKER_EXIT_BPS = -1.0    # bypass dwell guard when taker rebate goes clearly negative
 EMERGENCY_MAKER_EXIT_BPS = -3.0    # bypass dwell guard when maker edge goes deeply negative
 
@@ -162,18 +159,12 @@ RT_LOSS_CAP_BPS = 4.0              # hard cap on a single forced-exit adverse mo
                                    # consistent loss tail beats an occasional large cut.
 RT_WINDOW_S = 570.0                # validator activity sampling window (~10 min)
 RT_MAX = 30                        # max profit RTs per book per window
-RT_EVENTS_RETENTION_S = 900.0      # RAM: rt_events (sim-time) feeds ONLY the <=600s pnl-backoff + <=570s
-                                   # rt_count windows, so retain just above that (1.5x = 900s). It is NOT the
-                                   # kappa history (that is kappa_events, wall-time, KAPPA_RT_HISTORY_S). Was
-                                   # pruned to KAPPA_RT_HISTORY_S (10800s) = ~18x over-retention at sim pace.
 CAPITAL_TURNOVER_CAP = 10.0        # volume cap = this * miner_wealth (24h) — avoid the ceiling
 VOLUME_SAFETY = 0.8
 VOLUME_ASSESSMENT_NS = 86_400_000_000_000
 
 # ---- activity backstop: guarantee >=1 RT per book per window, bounded to one lot ----
-ACTIVITY_DEADLINE_S = 1200.0       # V2: 1200 (was 480) — activity.impact=0 so only a MAJORITY of books
-                                   # active in the 3h window is needed; ~9 forced RTs/window not ~22 (cuts
-                                   # forced-loss drag). 1200 (not 1800) keeps margin for slow restarted books.
+ACTIVITY_DEADLINE_S = 1500.0        # force a close this long since the last counted RT
 
 # ---- TAKER mode (mirrors UID 126) ----
 TK_MIN_HOLD_S = 1.5
@@ -190,17 +181,15 @@ TK_PYRAMID_MIN_REBATE_BPS = 3.0    # only stack while rebate is comfortably abov
 MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
-MK_EXIT_WALK_START_S = 30.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 150.0            # WALK-completion: reduce reaches BREAKEVEN by here, then rests for revert
-                                   # (tape: ~3-4% of wins close 90-180s; 150s holds through the grind-up)
-MK_MAX_HOLD_S = 180.0             # PROJECT RULE: never hold forever. The never-cut hold is ONLY for the
-                                   # sharp-dump→revert window (MeanReversionAgent: ~123/128 books dump then grind
-                                   # up over minutes; its tape-tuned close-anyway = 180s). If a lot is STILL
-                                   # underwater after this, it did NOT revert → force-cut it (frees the book to
-                                   # re-route, and bounds the bag/tail loss). Pairs with the 15bps big stop below:
-                                   # a held loser is realized on EITHER underwater>=stop OR age>=this — never held
-                                   # indefinitely. (Fixes the mode-stuck + bag/critical-loss failure mode.)
-MK_STOP_LOSS_BPS = 20.0            # catastrophe stop above 20bps dump band (tape); below 35-60 cube-bomb zone
+MK_EXIT_WALK_START_S = 40.0        # V2: rest reduce at full target below this lot age (scaled with the
+                                   # longer giveup below, keeping the ~1/6 walk-start:giveup ratio)
+MK_EXIT_GIVEUP_S = 240.0           # V2: IOC time-cut at 4min (was 180). Cut-log study: time-driven cuts
+                                   # (aged out) cost −0.02 vs −0.11 for early stop-driven cuts; giving the
+                                   # dump→revert more room converts expensive early cuts into cheap ones.
+MK_STOP_LOSS_BPS = 30.0            # V2: TRIGGER raised 20→30. 75% of maker cuts were the 20bps stop firing
+                                   # INSIDE the 20–38bps dump band (mean −0.11) before reversion. 30bps
+                                   # clears the typical dump so reverting lots ride; the streak cooldown +
+                                   # IOC-escalation still bound the genuinely-trending (non-revert) tail.
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
 MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
@@ -248,12 +237,9 @@ class _BookState:
     mk_loss_streak: int = 0            # consecutive losing maker cuts (reset on a positive close)
     mk_streak_cooldown_until_ns: int = 0  # pause maker entries on a persistently toxic book
     seen_ns: int = 0                   # first-seen ts; activity clock before the first RT
-    rt_events: list[tuple[int, float]] = field(default_factory=list)   # (sim_ts, realized_pnl); ALL validators,
-                                                                       # short-retained (RT_EVENTS_RETENTION_S):
-                                                                       # feeds pnl-backoff + rt_count only
-    kappa_events: list[tuple[int, float]] = field(default_factory=list) # (wall_ts, realized_pnl); MAIN validator
-                                                                        # ONLY (kappa3 is logging-only)
-    kappa3: float | None = None        # logging-only (RT log); never read by a routing/mode decision
+    rt_events: list[tuple[int, float]] = field(default_factory=list)   # (sim_ts, realized_pnl)
+    kappa_events: list[tuple[int, float]] = field(default_factory=list) # (wall_ts, realized_pnl)
+    kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)    # (ts, traded quote vol)
     # taker bookkeeping
     last_close_ns: int = 0             # last taker close (reopen throttle)
@@ -263,9 +249,6 @@ class _BookState:
     # managed-exit IOC escalation
     mk_ioc_miss_count: int = 0         # consecutive exit IOCs with no position reduction
     mk_ioc_prev_net: float = 0.0       # abs(net) when the last exit IOC was submitted
-    # V2 routing-spread EMA (de-noise the instantaneous spread for ROUTING only; raw used in _open)
-    spread_ema_bps: float = 0.0        # EMA of half_spread_bps; 0 = uninitialised
-    spread_ema_ns: int = 0             # last EMA update ts (for the dt-based decay)
 
 
 @dataclass
@@ -293,10 +276,8 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         # Per-UID jitter so a fleet does not act in lockstep.
         jitter = ((self.uid * 2654435761) % 1000) / 1000.0  # Knuth multiplicative hash
         self.route_min_dwell_ns = int(ROUTE_MIN_DWELL_S * (0.9 + 0.2 * jitter) * _NS)
-        self.spread_ema_halflife_ns = int(ROUTE_SPREAD_EMA_HALFLIFE_S * _NS)   # V2 routing-spread EMA
         self.activity_deadline_ns = int(ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter) * _NS)
         self.rt_window_ns = int(RT_WINDOW_S * _NS)
-        self.rt_events_retention_ns = int(RT_EVENTS_RETENTION_S * _NS)   # RAM: short rt_events prune window
         self.tk_max_hold_ns = int(TK_MAX_HOLD_S * (0.92 + 0.16 * jitter) * _NS)
         self.tk_min_hold_ns = int(TK_MIN_HOLD_S * _NS)
         self.tk_reopen_gap_ns = int(TK_REOPEN_GAP_S * (0.9 + 0.2 * jitter) * _NS)
@@ -304,7 +285,6 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         self.mk_quote_expiry_ns = int(MK_QUOTE_EXPIRY_S * _NS)
         self.mk_walk_start_ns = int(MK_EXIT_WALK_START_S * _NS)
         self.mk_giveup_ns = int(MK_EXIT_GIVEUP_S * (0.9 + 0.2 * jitter) * _NS)
-        self.mk_max_hold_ns = int(MK_MAX_HOLD_S * (0.9 + 0.2 * jitter) * _NS)   # never-hold-forever time cap
         self.mk_reentry_cooldown_ns = int(MK_REENTRY_COOLDOWN_S * _NS)
         self.mk_streak_cooldown_ns = int(MK_STREAK_COOLDOWN_S * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
@@ -336,8 +316,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             f"clip={TARGET_CLIP} dwell={ROUTE_MIN_DWELL_S:.0f}s "
             f"route(taker_rebate>={TAKER_REBATE_ENTER_BPS}/{TAKER_REBATE_EXIT_BPS}bps, "
             f"maker_edge>={MAKER_EDGE_ENTER_BPS}/{MAKER_EDGE_EXIT_BPS}bps, maker_fee<{MAKER_MAX_FEE_BPS}bps) "
-            f"mk=reduce->breakeven,stop={MK_STOP_LOSS_BPS:.0f}bps,max_hold={MK_MAX_HOLD_S:.0f}s "
-            f"route_ema={ROUTE_SPREAD_EMA_HALFLIFE_S:.0f}s idle_cap={MAX_IDLE_BOOKS}/cliff={CLIFF_IDLE_BOOKS} "
+            f"mk_giveup={MK_EXIT_GIVEUP_S:.0f}s mk_stop={MK_STOP_LOSS_BPS}/{MK_IOC_SLIPPAGE_BPS}bps "
             f"rt_loss_cap={RT_LOSS_CAP_BPS}bps activity_deadline={ACTIVITY_DEADLINE_S:.0f}s "
             f"rt_max={RT_MAX} rt_log={MAIN_VALIDATOR[:8]} "
             f"pnl_backoff(window={PNL_BACKOFF_WINDOW_S:.0f}s cooldown={PNL_BACKOFF_COOLDOWN_S:.0f}s min_rts={PNL_BACKOFF_MIN_RTS})"
@@ -346,12 +325,11 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
 
     def _tune_gc(self) -> None:
         """RESPONSE-TIME (axon GC-pause mitigation): the asyncio/axon layer retains completed Task objects
-        holding ~128-orderbook state, so the long-lived heap is large and every gen2 GC sweep rescans it —
-        pauses spike to tens of ms and stretch handle() past the validator timeout. We control this process's
-        GC. Measured: a gen2 gc.collect() drops ~34ms->0 after freeze. (1) history_len=0: the framework
-        deep-copies the FULL 128-book state every step and keeps 10 (self.history) which we never read — skip it;
-        (2) gc.freeze(): exclude the ~120k permanent import heap from every sweep; (3) raise thresholds: gen2
-        sweeps far less often. All behaviour-neutral."""
+        holding ~128-orderbook state, so every gen2 GC sweep rescans a large heap — pauses spike to tens of ms
+        and stretch handle() past the validator timeout. We own this process's GC. Measured: a gen2 gc.collect()
+        drops ~34ms->0 after freeze. (1) history_len=0: framework deep-copies the FULL 128-book state every step
+        and keeps 10 (self.history) which we never read — skip it; (2) gc.freeze(): exclude the ~120k permanent
+        import heap from every sweep; (3) raise thresholds: gen2 sweeps far less often. All behaviour-neutral."""
         self.history_len = 0
         try:
             gc.collect()
@@ -401,10 +379,6 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             if bst.mode == MODE_IDLE
         )
         fallback_maker = idle_count > MAX_IDLE_BOOKS
-        # V2 cliff-first: above CLIFF_IDLE_BOOKS, relax the maker fallback HARD (edge→0, fee-ceiling off)
-        # so borderline books rest FREE passive maker quotes and pull idle back under the 48 cliff —
-        # never force-cross taker to rescue the cliff (a free unfilled quote beats a guaranteed loss).
-        cliff = idle_count > CLIFF_IDLE_BOOKS
 
         for book_id in sorted(self.accounts.keys()):
             book = state.books.get(book_id)
@@ -413,7 +387,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                 continue
             try:
                 self._step_book(response, validator, book_id, book, account,
-                                vol_dp, volume_cap, now, fallback_maker, cliff)
+                                vol_dp, volume_cap, now, fallback_maker)
             except Exception as ex:
                 bt.logging.warning(f"[AdaptiveRouterV2 uid={self.uid}] step {book_id}: {ex}")
 
@@ -422,7 +396,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
     # ------------------------------------------------------------------ per-book dispatch
     def _step_book(
         self, response, validator: str, book_id: int, book, account,
-        vol_dp: int, volume_cap: float, now: int, fallback_maker: bool = False, cliff: bool = False,
+        vol_dp: int, volume_cap: float, now: int, fallback_maker: bool = False,
     ) -> None:
         if not book.bids or not book.asks:
             return
@@ -436,25 +410,13 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
         st = self._bstate(validator, book_id)
         if st.seen_ns == 0:
             st.seen_ns = now
-        # V2: update the routing-spread EMA (de-noise chop for ROUTING; _open keeps the raw spread).
-        inst_half = (best_ask - best_bid) / mid * 0.5 * 1e4
-        if st.spread_ema_bps <= 0.0 or st.spread_ema_ns == 0:
-            st.spread_ema_bps = inst_half
-        elif self.spread_ema_halflife_ns > 0:
-            dt = now - st.spread_ema_ns
-            alpha = 1.0 - 0.5 ** (dt / self.spread_ema_halflife_ns) if dt > 0 else 0.0
-            st.spread_ema_bps += alpha * (inst_half - st.spread_ema_bps)
-        st.spread_ema_ns = now
         if st.mode_since_ns == 0:
             # Backdate the dwell clock so the FIRST routing decision can fire immediately. Without
             # this every book is pinned to default_mode (taker) for ROUTE_MIN_DWELL_S, spending 3
             # minutes crossing the spread on books that should be maker/idle.
             st.mode = self.default_mode
             st.mode_since_ns = now - self.route_min_dwell_ns - 1
-        pruned = self._prune_rt_events(st, now)
-        if pruned and self._rt_log_enabled(validator):
-            # kappa3 is LOGGING-ONLY and the RT log is MAIN-validator-only; skip the kappa refresh (and its
-            # cross-book scan) for non-scoring validators. rt_events is still pruned above for all validators.
+        if self._prune_rt_events(st, now):
             self._refresh_book_kappa(validator, book_id, time.time_ns())
 
         net = self._net_qty(inv)
@@ -475,11 +437,16 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                     )
                     st.mode, st.mode_since_ns = MODE_IDLE, now
             else:
-                # V2: NO maker→taker demote on a recent-PnL blip — flipping a mean-reverting maker book
-                # contaminates its per-book Sortino for the ~20h window. The never-cut maker (hold for
-                # revert) + the realized-PnL backoff below handle genuine losers instead.
-                want = self._route(st, account, best_bid, best_ask, mid,
-                                   fallback_maker=fallback_maker, cliff=cliff)
+                pnl_bad = st.mode == MODE_MAKER and self._recent_pnl_bad(st)
+                if pnl_bad:
+                    taker_fee = self._taker_fee_rate(account)
+                    rebate_bps = (-taker_fee * 1e4) if taker_fee is not None else -1e9
+                    want = (MODE_TAKER if rebate_bps >= TAKER_REBATE_ENTER_BPS
+                            else self._route(st, account, best_bid, best_ask, mid,
+                                             fallback_maker=fallback_maker))
+                else:
+                    want = self._route(st, account, best_bid, best_ask, mid,
+                                       fallback_maker=fallback_maker)
                 if want != st.mode:
                     # Emergency flip: bypass the 180s dwell guard when the current mode has
                     # turned clearly net-negative (not just borderline — only on obviously-wrong-
@@ -504,7 +471,8 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
                             f"{st.mode}->{want} book={book_id} "
                             f"taker_fee={self._taker_fee_rate(account)} maker_fee={self._maker_fee_rate(account)} "
                             f"spread_bps={(best_ask - best_bid) / mid * 1e4:.1f}"
-                            + (" [cliff]" if cliff else (" [fallback-maker]" if fallback_maker else ""))
+                            + (" [adverse-sel]" if pnl_bad else "")
+                            + (" [fallback-maker]" if fallback_maker else "")
                         )
                         st.mode, st.mode_since_ns = want, now
 
@@ -514,39 +482,40 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ routing
     def _route(self, st: _BookState, account, best_bid: float, best_ask: float, mid: float,
-               *, fallback_maker: bool = False, cliff: bool = False) -> str:
+               *, fallback_maker: bool = False) -> str:
         """Pick the +EV playbook for this book from the LIVE fee regime, with hysteresis: the
         current mode is held to a looser EXIT threshold than the ENTER threshold for switching in,
-        so a book near a boundary stays put instead of flip-flopping. V2: classification uses the
-        SMOOTHED (EMA) half-spread to de-noise chop; the raw spread stays in the _open exec gate."""
+        so a book near a boundary stays put instead of flip-flopping."""
         cur = st.mode
         taker_fee = self._taker_fee_rate(account)
         maker_fee = self._maker_fee_rate(account)
         rebate_bps = (-taker_fee * 1e4) if taker_fee is not None else -1e9
-        # V2: use the EMA half-spread for ROUTING (de-noise transient ticks); fall back to instantaneous
-        # only before the EMA has warmed up.
-        half_spread_bps = (st.spread_ema_bps if st.spread_ema_bps > 0.0
-                           else ((best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 0.0))
+        half_spread_bps = (best_ask - best_bid) / mid * 0.5 * 1e4 if mid > 0 else 0.0
         maker_fee_bps = (maker_fee * 1e4) if maker_fee is not None else 1e9
         maker_edge_bps = half_spread_bps - maker_fee_bps   # capture half-spread, pay the maker fee
 
         taker_min_rebate = TAKER_REBATE_EXIT_BPS if cur == MODE_TAKER else TAKER_REBATE_ENTER_BPS
-        # Maker enter bar: relaxed under the idle-overflow fallback, and HARD-relaxed (→0) at the cliff so
-        # borderline books rest free maker quotes rather than tipping idle past the 48 budget.
-        maker_enter_edge = (0.0 if cliff
-                            else MAKER_FALLBACK_EDGE_BPS if fallback_maker
-                            else MAKER_EDGE_ENTER_BPS)
+        # When the idle-book guard fires, borderline books get a relaxed enter threshold so they
+        # prefer marginal maker over idle. The fee ceiling is kept strict: a high fee signals
+        # adverse selection regardless of spread, and that does not change in fallback.
+        maker_enter_edge = MAKER_FALLBACK_EDGE_BPS if fallback_maker else MAKER_EDGE_ENTER_BPS
         maker_min_edge = MAKER_EDGE_EXIT_BPS if cur == MODE_MAKER else maker_enter_edge
-        # Taker viable only when the rebate covers the crossing cost (rebate > half_spread); books already
-        # in taker skip the spread check (transient spikes shouldn't eject; _open gates execution).
+        # Taker is only viable when the rebate covers the crossing cost (rebate > half_spread so
+        # est_bps = 2×rebate − 2×half_spread > 0 and _TakerMode._open() will actually execute).
+        # For books ALREADY in taker mode, skip the spread check — transient spread spikes must not
+        # eject a taker book before the rebate itself drops below the exit threshold; the execution
+        # gate in _open() already suppresses trading when the spread is temporarily too wide.
         spread_viable = (cur == MODE_TAKER) or (rebate_bps > half_spread_bps)
         taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_min_rebate and spread_viable
-        # Maker requires a net spread edge AND maker_fee below the ceiling (a high fee = adverse
-        # selection). V2: the ceiling has a cur==MODE_MAKER BYPASS (don't eject an in-position maker on a
-        # transient fee tick — mirrors the taker spread bypass) and a cliff bypass (free-quote rescue).
-        maker_fee_ok = (cur == MODE_MAKER) or cliff or (maker_fee_bps < MAKER_MAX_FEE_BPS)
+        # Maker requires (1) a net spread edge over the fee, (2) an absolute fee below the ceiling
+        # (always enforced — a wide spread on a high-fee book is adverse selection, not opportunity),
+        # and (3) V2: an absolute half-spread floor so there is real room to capture after the two fee
+        # legs. The floor is an ENTER gate only — an in-position maker is not ejected on a transient
+        # spread dip (mirrors the taker spread bypass); the edge-exit hysteresis governs ejection.
+        maker_spread_ok = (cur == MODE_MAKER) or (half_spread_bps >= MK_MIN_SPREAD_BPS)
         maker_ok = ((MODE_MAKER in ALLOWED_MODES)
-                    and maker_fee_ok
+                    and maker_fee_bps < MAKER_MAX_FEE_BPS
+                    and maker_spread_ok
                     and maker_edge_bps >= maker_min_edge)
 
         if taker_ok and maker_ok:
@@ -666,7 +635,7 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ kappa-3
     def _prune_rt_events(self, st: _BookState, now: int) -> bool:
-        cutoff = now - self.rt_events_retention_ns   # only the <=600s pnl-backoff/rt_count windows read this
+        cutoff = now - self.kappa_rt_history_ns
         before = len(st.rt_events)
         st.rt_events = [(t, p) for t, p in st.rt_events if t >= cutoff]
         return len(st.rt_events) != before
@@ -684,19 +653,21 @@ class AdaptiveRouterV2Agent(FinanceSimulationAgent):
             return True
         return False
 
+    def _recent_pnl_bad(self, st: _BookState, n: int = 4) -> bool:
+        """True if the last n realized RT PnLs sum negative — adverse selection signal."""
+        if len(st.rt_events) < n:
+            return False
+        return sum(p for _, p in st.rt_events[-n:]) < 0
+
     def _record_rt_close(self, validator: str, book_id: int, ts: int, net_pnl: float) -> None:
         st = self._bstate(validator, book_id)
         self._prune_rt_events(st, ts)
         st.rt_events.append((ts, net_pnl))
-        # kappa_events / kappa3 are LOGGING-ONLY (kappa3 feeds no routing/mode decision; the RT log is
-        # MAIN-validator-only). Maintain them only for the scoring validator — saves the kappa_events list
-        # and the per-RT cross-book kappa scan on every other validator, with zero change to orders/logs.
-        if self._rt_log_enabled(validator):
-            wall_ns = time.time_ns()
-            cutoff = wall_ns - self.kappa_rt_history_ns
-            st.kappa_events = [(t, p) for t, p in st.kappa_events if t >= cutoff]
-            st.kappa_events.append((wall_ns, net_pnl))
-            self._refresh_book_kappa(validator, book_id, wall_ns)
+        wall_ns = time.time_ns()
+        cutoff = wall_ns - self.kappa_rt_history_ns
+        st.kappa_events = [(t, p) for t, p in st.kappa_events if t >= cutoff]
+        st.kappa_events.append((wall_ns, net_pnl))
+        self._refresh_book_kappa(validator, book_id, wall_ns)
 
     def _global_rt_timestamps(self, validator: str, now: int) -> list[int]:
         cutoff = now - self.kappa_rt_history_ns
@@ -1166,18 +1137,12 @@ class _MakerMode(_Mode):
             if st.mk_loss_streak >= MK_LOSS_STREAK_LIMIT:
                 st.mk_streak_cooldown_until_ns = now + agent.mk_streak_cooldown_ns
             return
-        # V2 NEVER-CUT activity: force-close a HELD lot for activity ONLY if it exits at BREAKEVEN-or-
-        # better (bid≥entry long / ask≤entry short). An underwater lot is left resting on its breakeven
-        # reduce quote — never realize a loss just to register activity (maker = rest/walk, not cross).
         if agent._activity_due(st, now) and abs(net) >= agent.exch_min:
-            px0 = agent._side_avg(inv.longs if net > 0 else inv.shorts)
-            be_ok = (best_bid >= px0 > 0) if net > 0 else (0.0 < best_ask <= px0)
-            if be_ok:
-                agent._stash_open(validator, book_id, st, self.name, "activity",
-                                  "long" if net >= 0 else "short")
-                if self._activity_close(agent, response, book_id, account, inv, net,
-                                        best_bid, best_ask, vol_dp):
-                    return
+            agent._stash_open(validator, book_id, st, self.name, "activity",
+                              "long" if net >= 0 else "short")
+            if self._activity_close(agent, response, book_id, account, inv, net,
+                                    best_bid, best_ask, vol_dp):
+                return
         desired = self._desired_quotes(agent, validator, book_id, account, inv, net,
                                        best_bid, best_ask, mid, volume_cap, now, vol_dp, st)
         self._reconcile(agent, response, account, book_id, desired)
@@ -1244,14 +1209,12 @@ class _MakerMode(_Mode):
             slip = MK_IOC_SLIPPAGE_BPS / 1e4
         pdp = agent._price_decimals
         if net > 0:
-            ts0, _, px0, _ = inv.longs[0]
+            ts, _, px0, _ = inv.longs[0]
             underwater = (px0 - best_bid) / px0 * 1e4 if px0 > 0 else 0.0
-            timed_out = (now - ts0) >= agent.mk_max_hold_ns
-            if underwater < MK_STOP_LOSS_BPS and not timed_out:   # hold for revert ONLY within BOTH the 15bps stop
-                st.mk_ioc_miss_count = 0                          # AND the max-hold; else force-cut (never hold forever)
+            if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
+                st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
-            reason = "time" if (timed_out and underwater < MK_STOP_LOSS_BPS) else "cut"
             q = round(min(agent._long_qty(inv), agent._avail(account.base_balance)), vol_dp)
             if q < agent.exch_min:
                 st.mk_ioc_miss_count = 0
@@ -1264,19 +1227,17 @@ class _MakerMode(_Mode):
                     f"[AdaptiveRouterV2 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
-            self._tag_close(agent, validator, book_id, reason)
+            self._tag_close(agent, validator, book_id, "cut")
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.SELL, q,
                                 round(best_bid * (1.0 - slip), pdp), ioc=True, post_only=False)
         else:
-            ts0, _, px0, _ = inv.shorts[0]
+            ts, _, px0, _ = inv.shorts[0]
             underwater = (best_ask - px0) / px0 * 1e4 if px0 > 0 else 0.0
-            timed_out = (now - ts0) >= agent.mk_max_hold_ns
-            if underwater < MK_STOP_LOSS_BPS and not timed_out:   # hold for revert ONLY within BOTH the 15bps stop
-                st.mk_ioc_miss_count = 0                          # AND the max-hold; else force-cut (never hold forever)
+            if not (now - ts >= agent.mk_giveup_ns or underwater >= MK_STOP_LOSS_BPS):
+                st.mk_ioc_miss_count = 0
                 st.mk_ioc_prev_net = 0.0
                 return False
-            reason = "time" if (timed_out and underwater < MK_STOP_LOSS_BPS) else "cut"
             buy_px = best_ask * (1.0 + slip)
             q_max = agent._avail(account.quote_balance) / buy_px if buy_px > 0 else agent._short_qty(inv)
             q = round(min(agent._short_qty(inv), q_max), vol_dp)
@@ -1291,7 +1252,7 @@ class _MakerMode(_Mode):
                     f"[AdaptiveRouterV2 uid={agent.uid}] {label} book={book_id} "
                     f"miss={st.mk_ioc_miss_count} slip={slip*1e4:.0f}bps"
                 )
-            self._tag_close(agent, validator, book_id, reason)
+            self._tag_close(agent, validator, book_id, "cut")
             agent._cancel_all(response, account, book_id)
             agent._submit_limit(response, book_id, OrderDirection.BUY, q,
                                 round(best_ask * (1.0 + slip), pdp), ioc=True, post_only=False,
@@ -1357,19 +1318,20 @@ class _MakerMode(_Mode):
         return desired
 
     def _reduce_price(self, is_long, px0, age_ns, touch_inside, base_target, pdp, agent) -> float:
-        # V2 NEVER-CUT: walk the reduce limit from the profit target toward BREAKEVEN (px0) with lot age
-        # — never to the touch, never below entry. A late passive fill nets ~0 (covers fees); a lot that
-        # can't fill at breakeven is HELD for reversion and exits only via the stop IOC in
-        # _managed_exit (uw >= MK_STOP_LOSS_BPS = 15bps). This is the core of the maker: the resting
-        # reduce can never realize a loss; only a genuine ~15bps trend does.
+        # Walk the reduce limit from the profit target toward the touch as the lot ages, but FLOOR
+        # the realized loss at the stop: a resting reduce quote must never fill worse than the IOC
+        # cut would. Without this, an aged underwater lot's reduce walks all the way to the touch and
+        # fills there on a gap, locking a loss many times the stop (kappa-3 cubes that tail). Anything
+        # below the floor is left to _managed_exit's bounded IOC instead.
         w = self._exit_walk(age_ns, agent)
+        stop = MK_STOP_LOSS_BPS / 1e4
         if is_long:
-            target_px = max(touch_inside, px0 * (1.0 + base_target))   # sell at/above the target
-            px = target_px + (px0 - target_px) * w                     # walk target -> breakeven
-            return round(max(px, px0), pdp)                            # never sell below entry
-        target_px = min(touch_inside, px0 * (1.0 - base_target))       # buy at/below the target
-        px = target_px + (px0 - target_px) * w                         # walk target -> breakeven
-        return round(min(px, px0), pdp)                                # never buy above entry
+            ideal = max(touch_inside, px0 * (1.0 + base_target))
+            px = ideal + (touch_inside - ideal) * w
+            return round(max(px, px0 * (1.0 - stop)), pdp)
+        ideal = min(touch_inside, px0 * (1.0 - base_target))
+        px = ideal + (touch_inside - ideal) * w
+        return round(min(px, px0 * (1.0 + stop)), pdp)
 
     @staticmethod
     def _exit_walk(age_ns, agent) -> float:

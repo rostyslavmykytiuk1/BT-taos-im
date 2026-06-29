@@ -1,0 +1,139 @@
+{
+  "known": {
+    "22": {
+      "hotkey": "5H17g1U5Yb2PGt1UTQ8jeJ2NgEwUrFeVNoQFbf7Gy2f2BpZX",
+      "reg_block": 8508914
+    },
+    "28": {
+      "hotkey": "5C7k57FTkyUvVdzpQt8bjqXzEug8UsNCzNv2TUQ45waAwuyK",
+      "reg_block": 8499435
+    },
+    "39": {
+      "hotkey": "5Ecc23vLCHdcRDtk44dswio6V3ivtiWpMQ68Z9smFA5psutP",
+      "reg_block": 8497128
+    },
+    "43": {
+      "hotkey": "5FvkqdNJ8wUmRvi5qgr47QSBoQeS7NBLZmJE1Ysa6tegpXC8",
+      "reg_block": 8508075
+    },
+    "50": {
+      "hotkey": "5CFeNKT5SfSV84FdZ6JKPkVncRKtDy1GUJsLkaaJcer2Nek7",
+      "reg_block": 8504954
+    },
+    "52": {
+      "hotkey": "5Hmtu6YGxVz76voeq55pegGMiZgKGeJes4G1GC9VFZbj5r6o",
+      "reg_block": 8504592
+    },
+    "56": {
+      "hotkey": "5F1gFNkhe4bhoJAWETk2PcYb9TVBoHoJW7G3RDREfgW7gMtw",
+      "reg_block": 8509274
+    },
+    "76": {
+      "hotkey": "5HEAZv4gZ6gsJsWaQrrEBogQcvVZ44vQBrhziWwCBAV3HxGX",
+      "reg_block": 8497729
+    },
+    "86": {
+      "hotkey": "5FYukyRMkxeEoVgU7AwXgbBjppfRQaE5gqSfYBMS7ZT3m9AF",
+      "reg_block": 8498956
+    },
+    "94": {
+      "hotkey": "5DenA1Wmc7zJrcCnrL2e3KJqJjmMTnGedxtLXasF11MxzWZL",
+      "reg_block": 8508674
+    },
+    "101": {
+      "hotkey": "5DAEM85azbK3WQAhmDcjz3wXdDYLHmtGCTpZcM7m21Pb4f61",
+      "reg_block": 8508315
+    },
+    "105": {
+      "hotkey": "5Gxhwjtgq3h6bZz1wdUQpmMWidnQgXyS9hbNk3F8vbocqGSP",
+      "reg_block": 8509153
+    },
+    "106": {
+      "hotkey": "5E1rdq5RefdSo6rSNDePReBDxb14otkQLNxwUNkoK1zxg9YF",
+      "reg_block": 8499076
+    },
+    "109": {
+      "hotkey": "5FPF2QTF5ET1eLLjbBS2WBJK66FeydGSHTKFN8ktQ59ibXhL",
+      "reg_block": 8503752
+    },
+    "120": {
+      "hotkey": "5E9Nm4to7aTe3RnzN8Wu9WSduxuqTweFnRb1mSNKQRmNvvJo",
+      "reg_block": 8498836
+    },
+    "150": {
+      "hotkey": "5GeEHB8hXCCssDinugNNozVMFNqZxhjUDd1mVoc5ctu7qkYL",
+      "reg_block": 8496802
+    },
+    "157": {
+      "hotkey": "5FvoXntNurdZZkwKnvaBMk1sfcbDoQJhNnCnyUXL3td7peyW",
+      "reg_block": 8505073
+    },
+    "158": {
+      "hotkey": "5C5CJkv8R5PbVELSUXHEpj62wWMF4xeFsCv4PNKnrY6DD4ze",
+      "reg_block": 8508194
+    },
+    "181": {
+      "hotkey": "5FvN3q8GrH5rSxW6uRPtsMBmicvBVjV45snvKRiHEoSPVviM",
+      "reg_block": 8497007
+    },
+    "189": {
+      "hotkey": "5CoAKx7f7hy6JegnC9T1BPxW4CxSQ1ERbyuddGqoqzfGQkrW",
+      "reg_block": 8503874
+    },
+    "197": {
+      "hotkey": "5HgYXitTT3auCv1Nkyb8nvpp1rjKhuduom4WiJhERt6ZwX4a",
+      "reg_block": 8497608
+    },
+    "203": {
+      "hotkey": "5HGuaYnyceKzKGYcrgkNUekEAU7kUZyxAxEDDR7iyfVK5jms",
+      "reg_block": 8508555
+    },
+    "211": {
+      "hotkey": "5GGjWBRHbtJWif4trKnTTi7sWFpiaoMBRYk6xJrQ1X73XDhK",
+      "reg_block": 8503633
+    },
+    "219": {
+      "hotkey": "5FhXxjeLW4FAGRJhsCGK3cXPViNAkgaZ3po3dFyA6r1BH5P4",
+      "reg_block": 8508435
+    },
+    "228": {
+      "hotkey": "5Ec5pXE3bgRi44PpMLuvMKpAWjKgGYs9Rbzt2pwh1YtCwqbZ",
+      "reg_block": 8502513
+    },
+    "235": {
+      "hotkey": "5CMhDcd47DieFvbRWRScMgdrw7RKuvBhvHWugeYwNai5fDV1",
+      "reg_block": 8509033
+    },
+    "238": {
+      "hotkey": "5E4MvTxUzqbjD3wxdzJ5dX5UzHVL4dBJ1Phk4ptxsuFEqudK",
+      "reg_block": 8496922
+    },
+    "241": {
+      "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
+      "reg_block": 8503994
+    },
+    "251": {
+      "hotkey": "5DDQkqHHU8wzAAyPdwJcpjLmLuVyDbKzRQqfd7yUa42vFuYq",
+      "reg_block": 8500276
+    },
+    "254": {
+      "hotkey": "5HgxLGwN4VMeswwdfPLg5GWagCDRLT3r8LyEXq1EJ9dt1SYg",
+      "reg_block": 8497368
+    },
+    "255": {
+      "hotkey": "5E2ZCJwUMPbjCDD4eXiNbqHimMrwbtTxzPgueRwQvQp9eD8X",
+      "reg_block": 8490676
+    }
+  },
+  "pending": [
+    {
+      "uid": 56,
+      "hotkey": "5F1gFNkhe4bhoJAWETk2PcYb9TVBoHoJW7G3RDREfgW7gMtw",
+      "reg_block": 8509274,
+      "reg_ts": "2026-06-29T03:32:00.958124+00:00",
+      "detected_ts": 1782704012.108127,
+      "classify_after": 1782705172.7220962
+    }
+  ],
+  "seeded": true
+}
