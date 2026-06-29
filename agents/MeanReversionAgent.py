@@ -379,8 +379,16 @@ class MeanReversionAgent(FinanceSimulationAgent):
         return (ask.price * bid.quantity + bid.price * ask.quantity) / denom
 
     def _book_imbalance(self, book) -> float:
-        bq = sum(l.quantity for l in book.bids[: self.imbalance_depth])
-        aq = sum(l.quantity for l in book.asks[: self.imbalance_depth])
+        bq = 0.0
+        aq = 0.0
+        for i, level in enumerate(book.bids):
+            if i >= self.imbalance_depth:
+                break
+            bq += level.quantity
+        for i, level in enumerate(book.asks):
+            if i >= self.imbalance_depth:
+                break
+            aq += level.quantity
         denom = bq + aq
         return (bq - aq) / denom if denom > 0 else 0.0
 
