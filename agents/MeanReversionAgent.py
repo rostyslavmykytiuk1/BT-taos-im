@@ -1,9 +1,10 @@
 """
-MeanReversionAgent (v1)
-=======================
+MeanReversionAgent
+==================
 
 Contrarian range-fader for Subnet 79 (MVTRX / taos), tuned for **Kappa-3**.
-Frozen baseline — use ``MeanReversionAgentV2`` for ping fix + top-miner tuning.
+Simple, reliable, long-only maker-fade with a low-churn activity backstop. Per-validator
+state + simulation-reset handling, FIFO-safe (always buys in-sim before selling).
 
 Why this design
 ---------------
@@ -35,7 +36,10 @@ Per book, each step:
 
   if holding -> exit on TP / SL / time  (wider TP / longer hold post-crash)
   elif flat and not over the volume cap:
-      * activity PING when no round-trip in ~8 min (min lot; separate from fades)
+      * activity backstop: only when no round-trip in ~25 min (min lot; separate from fades).
+        The validator needs >=3 RTs/book inside the 3h kappa lookback to score a book, and the
+        activity factor decays only ~2% over a 25-min gap, so we keep ~7 RTs/3h (>2x the floor)
+        instead of churning every 10 min and injecting marginal fee-loss RTs into the kappa.
       * during an active cliff -> DO NOT catch the knife (block new longs)
       * post-crash floor / grind-up -> fade LONG with recovery asymmetry
       * normal dip below ref -> fade LONG (maker-first entry)
@@ -48,6 +52,7 @@ Run (local proxy test):
 Tune strategy here (pm2 restart picks up changes; no .env / --agent.params needed):
 """
 
+import gc
 import math
 import traceback
 from collections import deque
@@ -66,8 +71,13 @@ from taos.im.protocol.models import OrderDirection, OrderCurrency, STP, TimeInFo
 # ---------------------------------------------------------------------------
 
 # --- position size ---
-QUOTE_NOTIONAL = 1800.0         # QUOTE size per new entry (e.g. ~1800 USDT notional)
+# Small clip, matched to the top single-mode makers (~0.30 BASE). A big clip does NOT help
+# kappa (MAD-normalizes magnitude away) but it DOES hurt: market exits walk the book, so a
+# large clip realizes meaningfully worse than mid (slippage drags realized PnL -> drags kappa),
+# and it multiplies inventory risk if many books dip at once and never revert. Keep it tiny.
+QUOTE_NOTIONAL = 105.0          # QUOTE per entry -> ~0.35 BASE at price 300 (was 1800 = 6.0 BASE)
 MIN_ORDER_SIZE = 0.25           # smallest BASE order the sim accepts on a book
+PING_LOT_SIZE = 0.26            # activity backstop open/close size (slightly above min lot)
 
 # --- entry signal: "ref" + band ---
 MEAN_WINDOW_S = 300.0           # seconds of trade prints for rolling mean (ref); matches dashboard blue 5m line
@@ -106,14 +116,21 @@ KNIFE_MIN_DROP_BPS = 20.0       # knife only after price has already dumped this
 KNIFE_STEP_BPS = 8.0            # …and this step still falls ≥8 bps (falling knife → block longs)
 KNIFE_BLOCK_S = 8.0             # how long to block new longs after a knife trigger
 
-# --- activity ping (separate from fade entries; keeps Activity=1 on each book) ---
-# Fires only when no completed round-trip in PING_INTERVAL_S. Uses one min lot at a
-# time so it never drains a normal fade position in a burst.
-PING_INTERVAL_S = 480.0         # ~8 min (well under the 600 s activity sampling window)
+# --- activity backstop (separate from fade entries; guarantees the book stays scored) ---
+# The validator needs >= min_realized_observations (3) completed round-trips per book inside
+# the kappa lookback (3h) for that book to receive a kappa at all; below 3 the book is dropped
+# (kappa=None). The activity FACTOR decays very gently when idle (base ~0.9999 per 5s scoring
+# tick, impact=0), so a ~25-min gap only costs ~2% on a book's factor -- there is NO need to
+# churn every 10 min. We therefore only ping a flat book when it has gone PING_INTERVAL_S
+# without a round-trip, which yields ~7 RTs/3h (>2x the floor of 3) while keeping the factor
+# ~0.98+. Fewer forced market RTs also means fewer small fee-losses dragging the cubic kappa.
+PING_INTERVAL_S = 1500.0        # 25 min: >=3 RTs/3h with margin, NOT 10-min churn (was 480)
 PING_SUBMIT_COOLDOWN_S = 5.0    # min gap between ping orders on the same book
 
 # --- order routing ---
 ENTRY_EXPIRY_S = 8.0            # maker limit entries expire after N seconds (GTT)
+ENTRY_REPOST_GAP_S = 8.0        # don't re-post a fade bid within this gap (anti-stack: one
+                                # resting bid at a time, matches the GTT lifetime)
 MAX_TAKER_FEE = 0.0             # only market/taker when fee ≤ this (0 = rebate or zero fee only)
 
 # --- volume cap (hard constraint; volume does not boost score today) ---
@@ -130,7 +147,8 @@ class _Position:
     qty: float = 0.0          # signed BASE (>0 long, <0 short)
     avg: float = 0.0          # volume-weighted average entry price
     entry_ts: int = 0         # sim timestamp (ns) current exposure opened
-    post_crash: bool = False  # entered during a post-crash recovery window
+    post_crash: bool = False  # entered during a post-crash recovery window (set on FILL)
+    via_ping: bool = False    # opened by the activity backstop (closed by ping, not TP/SL)
 
 
 @dataclass
@@ -143,8 +161,11 @@ class _BookState:
     crash_until: int = 0      # post-crash recovery window end (ns)
     knife_until: int = 0        # block new longs during active dump (ns)
     cooldown_until: int = 0   # pause after a stop-loss (ns)
+    seen_ns: int = 0          # sim time (ns) this book was first handled (cold-start anchor)
+    ping_phase_ns: int = 0    # per-book phase offset so books don't all ping on the same tick
     last_rt_ns: int = 0           # sim time (ns) of last completed round-trip
     last_ping_submit_ns: int = 0  # sim time (ns) of last ping order submit (anti-burst)
+    last_entry_ns: int = 0        # sim time (ns) of last fade-entry submit (anti-stack)
     ping_awaiting_open: bool = False  # open ping leg in flight; block fade until fill/timeout
     vol_log: list = field(default_factory=list)  # (ts, quote_volume) round-trip cost
 
@@ -156,6 +177,7 @@ class MeanReversionAgent(FinanceSimulationAgent):
 
         self.quote_notional = QUOTE_NOTIONAL
         self.min_order_size = MIN_ORDER_SIZE
+        self.ping_lot_size = PING_LOT_SIZE
         self.mean_window_s = MEAN_WINDOW_S
         self.min_samples = MIN_SAMPLES
         self.k_entry = K_ENTRY
@@ -186,10 +208,15 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.ping_interval_ns = int(self.ping_interval_s * 1e9)
         self.ping_submit_cooldown_ns = int(self.ping_submit_cooldown_s * 1e9)
         self.entry_expiry_s = ENTRY_EXPIRY_S
+        self.entry_repost_gap_ns = int(ENTRY_REPOST_GAP_S * 1e9)
         self.max_taker_fee = MAX_TAKER_FEE
         self.turnover_cap = CAPITAL_TURNOVER_CAP
         self.volume_safety = VOLUME_SAFETY
         self.volume_assessment_ns = VOLUME_ASSESSMENT_NS
+
+        # Never read self.history — skip framework deep-copy of the full 128-book state each tick.
+        self.history_len = 0
+        self._tune_gc()
 
         # Per-UID jitter (±8%): fleet miners get slightly different k_entry / crash_bps
         # so they don't all hit the same book at the same threshold.
@@ -206,8 +233,8 @@ class MeanReversionAgent(FinanceSimulationAgent):
         self.positions: dict[str, dict[int, _Position]] = {}
         self.books_state: dict[str, dict[int, _BookState]] = {}
         self._sim_id: dict[str, str] = {}
-        self._exit_reason: dict[tuple[str, int], str] = {}
         self._step_ts_ns: int = 0
+        self._cur_validator: str | None = None  # validator currently being processed in update()
 
 
         bt.logging.info(
@@ -220,17 +247,46 @@ class MeanReversionAgent(FinanceSimulationAgent):
             f"ping={self.ping_interval_s}s long_only"
         )
 
+    def _tune_gc(self) -> None:
+        """Reduce GC pauses during handle() — same approach as AdaptiveRouterV2Agent."""
+        try:
+            gc.collect()
+            gc.freeze()
+            gc.set_threshold(50_000, 500, 500)
+            bt.logging.info(
+                f"[MeanReversion uid={self.uid}] gc tuned: frozen={gc.get_freeze_count()} "
+                f"thresholds={gc.get_threshold()} history_len=0"
+            )
+        except Exception as ex:
+            bt.logging.warning(f"[MeanReversion uid={self.uid}] gc tune skipped: {ex}")
+
     # --------------------------------------------------------------- lifecycle
+    def _reset_validator(self, validator: str | None) -> None:
+        """Drop all per-book state for ONE validator (new simulation). Other validators'
+        live positions are left untouched -- critical when serving multiple validators."""
+        if validator is None:
+            return
+        self.positions.pop(validator, None)
+        self.books_state.pop(validator, None)
+
     def onStart(self, event: SimulationStartEvent) -> None:
-        self.positions.clear()
-        self.books_state.clear()
-        self._sim_id.clear()
-        self._exit_reason.clear()
-        bt.logging.info(f"[MeanReversion uid={self.uid}] simulation start: reset state")
+        # onStart is dispatched from inside update() while processing ONE validator's state,
+        # but the event carries no validator id. Use the validator update() stamped for us and
+        # reset only that one -- never a global wipe (that would clear other validators' books).
+        validator = self._cur_validator
+        self._reset_validator(validator)
+        if validator is not None:
+            # Force respond()'s sim_id guard to re-arm for this validator on the next tick.
+            self._sim_id.pop(validator, None)
+        bt.logging.info(
+            f"[MeanReversion uid={self.uid}] simulation start: reset state for validator={validator}"
+        )
 
     def update(self, state: MarketSimulationStateUpdate) -> None:
-        # Stamp the current simulation time so fills are tracked on sim-time.
+        # Stamp the current sim time + validator so onStart/onTrade (dispatched inside
+        # super().update()) act on the correct validator and on sim-time.
         self._step_ts_ns = int(state.timestamp)
+        self._cur_validator = state.dendrite.hotkey
         super().update(state)
 
     # ------------------------------------------------------------- fill tracking
@@ -259,41 +315,51 @@ class MeanReversionAgent(FinanceSimulationAgent):
             return
         self._bstate(validator, book_id).vol_log.append((ts_ns, vol))
 
-    def _rolled_quote_volume(self, validator, book_id, now_ns) -> float:
-        st = self._bstate(validator, book_id)
-        if not st.vol_log:
-            return 0.0
+    def _prune_vol_log(self, st: _BookState, now_ns: int) -> None:
         cutoff = now_ns - self.volume_assessment_ns
         st.vol_log = [(t, v) for t, v in st.vol_log if t >= cutoff]
+
+    def _rolled_quote_volume(self, validator, book_id, now_ns) -> float:
+        st = self._bstate(validator, book_id)
+        self._prune_vol_log(st, now_ns)
         return sum(v for _, v in st.vol_log)
 
     def _apply_fill(self, validator, book_id, direction, qty, price, ts) -> None:
         pos = self._book_positions(validator).setdefault(book_id, _Position())
+        st = self._bstate(validator, book_id)
         signed = qty if direction == OrderDirection.BUY else -qty
         prev = pos.qty
         entry_avg = pos.avg
         entry_ts = pos.entry_ts
         if prev == 0 or (prev > 0) == (signed > 0):
             # Open or add in the same direction -> blend the average.
+            opening = prev == 0
+            was_ping = st.ping_awaiting_open  # capture BEFORE we clear it below
             total = abs(prev) + qty
             pos.avg = (pos.avg * abs(prev) + price * qty) / total if total > 0 else price
             pos.qty = prev + signed
-            if prev == 0:
+            if opening:
                 pos.entry_ts = ts
+                # Bug1 fix: classify the position at FILL time, not at submit time (an unfilled
+                # resting bid must never leave post_crash stuck on a later, unrelated entry).
+                pos.post_crash = ts < st.crash_until
+                # Bug2 fix: remember whether this open was the activity-ping leg, so the ping
+                # closer only ever touches ping lots -- never a real fade position.
+                pos.via_ping = bool(was_ping)
             if direction == OrderDirection.BUY:
-                self._bstate(validator, book_id).ping_awaiting_open = False
+                st.ping_awaiting_open = False
         else:
             # Reduce / close / flip -> realize a round-trip on the closed amount.
-            # Partial closes (activity-ping slice) count as RTs for scoring.
             closed_qty = min(qty, abs(prev))
             if closed_qty >= self.min_order_size / 2 and entry_avg > 0:
-                self._exit_reason.pop((validator, book_id), None)
-                self._bstate(validator, book_id).last_rt_ns = ts
+                st.last_rt_ns = ts
             pos.qty = prev + signed
             if abs(pos.qty) < 1e-12:
-                pos.qty, pos.avg, pos.entry_ts, pos.post_crash = 0.0, 0.0, 0, False
+                pos.qty, pos.avg, pos.entry_ts = 0.0, 0.0, 0
+                pos.post_crash, pos.via_ping = False, False
             elif (prev > 0) != (pos.qty > 0):
                 pos.avg, pos.entry_ts = price, ts
+                pos.post_crash, pos.via_ping = False, False
 
     # ----------------------------------------------------------------- features
     @staticmethod
@@ -335,6 +401,7 @@ class MeanReversionAgent(FinanceSimulationAgent):
         while st.grind_mids and st.grind_mids[0][0] < grind_cut:
             st.grind_mids.popleft()
         st.ema_long = mid if st.ema_long <= 0 else st.ema_long + self.trend_alpha * (mid - st.ema_long)
+        self._prune_vol_log(st, now)
 
     def _ref_and_band(self, st: _BookState) -> tuple[float | None, float]:
         """Rolling mean (ref) and per-book entry band in bps from dispersion."""
@@ -390,10 +457,10 @@ class MeanReversionAgent(FinanceSimulationAgent):
         validator = state.dendrite.hotkey
         cfg = self.simulation_config
 
+        # Authoritative per-validator reset: if this validator's simulation_id changed (new sim,
+        # possibly without us seeing the ESS event), wipe ONLY this validator's state.
         if self._sim_id.get(validator) != cfg.simulation_id:
-            self._book_positions(validator).clear()
-            self.books_state.pop(validator, None)
-            self._exit_reason = {k: v for k, v in self._exit_reason.items() if k[0] != validator}
+            self._reset_validator(validator)
             self._sim_id[validator] = cfg.simulation_id
 
         price_dp = cfg.priceDecimals
@@ -418,7 +485,8 @@ class MeanReversionAgent(FinanceSimulationAgent):
         free = account.base_balance.free
         if pos.qty > 0:
             if free < self.min_order_size / 2:
-                pos.qty, pos.avg, pos.entry_ts, pos.post_crash = 0.0, 0.0, 0, False
+                pos.qty, pos.avg, pos.entry_ts = 0.0, 0.0, 0
+                pos.post_crash, pos.via_ping = False, False
             elif free < pos.qty - self.min_order_size / 4:
                 pos.qty = round(free, vol_dp)
 
@@ -433,20 +501,55 @@ class MeanReversionAgent(FinanceSimulationAgent):
             return
 
         st = self._bstate(validator, book_id)
-        self._ingest(st, book, mid, now)
-        ref, band_bps = self._ref_and_band(st)
-        bid = book.bids[0].price if book.bids else None
-        ask = book.asks[0].price if book.asks else None
-        imb = self._book_imbalance(book)
         pos = self._book_positions(validator).setdefault(book_id, _Position())
         self._reconcile_position(account, pos, vol_dp)
 
+        if st.seen_ns == 0:
+            # Cold-start anchor: a freshly-seen book is NOT immediately ping-due (prevents a
+            # 128-book ping storm at sim start/refresh). A per-book phase (0..ping_interval)
+            # also staggers the very first ping so quiet books don't all fire on one tick.
+            st.seen_ns = now
+            st.ping_phase_ns = ((book_id * 2654435761) % 1000) * self.ping_interval_ns // 1000
+
         # Flatten accidental shorts (should not happen on a long-only agent).
         if pos.qty < -self.min_order_size / 2:
-            self._exit_reason[(validator, book_id)] = "short_flatten"
             st.last_ping_submit_ns = now
             self._flatten(response, account, book_id, pos, vol_dp)
             return
+
+        # ---- fast path: open long — only mid + timestamps (skip rolling features) ----
+        if pos.qty >= self.min_order_size / 2 and pos.avg > 0:
+            if self._ping_close_due(st, pos, now):
+                if self._submit_ping_close(response, validator, book_id, account, pos, st,
+                                           vol_dp, now):
+                    return
+
+            # Exit PnL on mid — matches the chart and avoids microprice/spread false stops.
+            pnl_bps = (mid - pos.avg) / pos.avg * 1e4
+            tp = self.tp_bps
+            sl = self.sl_bps
+            hold_ns = self.max_hold_s * 1e9
+            if pos.post_crash:
+                tp *= self.recovery_tp_mult
+                hold_ns *= self.recovery_hold_mult
+            timed_out = (now - pos.entry_ts) >= hold_ns if pos.entry_ts else False
+            if pnl_bps >= tp:
+                self._flatten(response, account, book_id, pos, vol_dp)
+            elif pnl_bps <= -sl:
+                st.cooldown_until = now + int(self.cooldown_s * 1e9)
+                self._flatten(response, account, book_id, pos, vol_dp)
+            elif timed_out:
+                self._flatten(response, account, book_id, pos, vol_dp)
+            return
+
+        # ---- flat: ping open before feature ingest (activity leg needs no ref/band) ----
+        if self._ping_open_due(st, pos.qty, now):
+            self._submit_ping_open(response, validator, book_id, account, st, book, mid, now)
+            return
+
+        self._ingest(st, book, mid, now)
+        ref, band_bps = self._ref_and_band(st)
+        imb = self._book_imbalance(book)
 
         # --- crash / knife state (asymmetric §3B.5 handling) ---
         drop_bps = self._crash_drop_bps(st, mid)
@@ -460,52 +563,10 @@ class MeanReversionAgent(FinanceSimulationAgent):
         in_recovery = now < st.crash_until
         knife_active = now < st.knife_until
 
-        # trend filter
         trend_bps = ((ref - st.ema_long) / st.ema_long * 1e4) if (ref and st.ema_long > 0) else 0.0
         downtrend = trend_bps < -self.trend_gate_bps
 
-        # ---- 1) manage an open long (market exit guarantees realization) ----
-        if pos.qty >= self.min_order_size / 2 and pos.avg > 0:
-            # Activity ping close: one min lot only — never flatten a fade position.
-            if self._ping_close_due(st, pos.qty, now):
-                if self._submit_ping_close(response, validator, book_id, account, pos, st,
-                                           mid, bid, ask, trend_bps, imb, vol_dp, cap, now):
-                    return
-
-            # Exit PnL on mid — matches the chart and avoids microprice/spread false stops.
-            pnl_bps = (mid - pos.avg) / pos.avg * 1e4
-            tp = self.tp_bps
-            sl = self.sl_bps
-            hold_ns = self.max_hold_s * 1e9
-            if pos.post_crash:
-                tp *= self.recovery_tp_mult
-                hold_ns *= self.recovery_hold_mult
-            timed_out = (now - pos.entry_ts) >= hold_ns if pos.entry_ts else False
-            if pnl_bps >= tp:
-                self._exit_reason[(validator, book_id)] = "tp"
-                exit_action = "exit_tp"
-                self._flatten(response, account, book_id, pos, vol_dp)
-            elif pnl_bps <= -sl:
-                self._exit_reason[(validator, book_id)] = "sl"
-                st.cooldown_until = now + int(self.cooldown_s * 1e9)
-                exit_action = "exit_sl"
-                self._flatten(response, account, book_id, pos, vol_dp)
-            elif timed_out:
-                self._exit_reason[(validator, book_id)] = "time"
-                exit_action = "exit_time"
-                self._flatten(response, account, book_id, pos, vol_dp)
-            else:
-                exit_action = "manage"
-            return
-
-        # ---- 2) flat: activity ping open, then optional fade long ----
-        if self._ping_open_due(st, pos.qty, now):
-            self._submit_ping_open(response, validator, book_id, account, pos, st, book,
-                                   mid, bid, ask, trend_bps, imb, cap, now)
-            return
-
         if ref is None or now < st.cooldown_until or st.ping_awaiting_open:
-            label = "warmup" if ref is None else ("cooldown" if now < st.cooldown_until else "ping_wait")
             return
 
         if self._rolled_quote_volume(validator, book_id, now) >= cap:
@@ -530,34 +591,34 @@ class MeanReversionAgent(FinanceSimulationAgent):
                 fade_long = True
 
         if not fade_long:
-            if knife_active:
-                label = "knife"
-            elif in_recovery and mid > st.ema_long and grind_rise_bps >= self.grind_rise_min_bps:
-                label = "grind_up"
-            elif in_recovery:
-                label = "recover"
-            else:
-                label = "flat"
             return
 
         qty = round(self.quote_notional / mid, vol_dp)
         if qty < self.min_order_size:
             return
 
+        # Anti-stack: a maker entry rests up to ENTRY_EXPIRY_S (GTT). Don't pile on another
+        # bid while the previous one is still live, or we burn the 5-instruction/book budget
+        # and build more inventory than one intended clip.
+        if st.last_entry_ns and (now - st.last_entry_ns) < self.entry_repost_gap_ns:
+            return
+
         take_ok = self._taker_allowed(account)
-        action = (
-            "fade_long_grind" if grind_long
-            else "fade_long_recover" if in_recovery
-            else "fade_long"
-        )
-        self._enter(response, account, book_id, qty,
-                    book, price_dp, take_ok, mark_post_crash=in_recovery, pos=pos)
+        # Bug4 fix: only arm the anti-stack timer if an order is actually submitted (an entry
+        # aborted on insufficient balance must not block the book for ENTRY_REPOST_GAP_S).
+        if self._enter(response, account, book_id, qty, book, price_dp, take_ok):
+            st.last_entry_ns = now
 
 
     # ----------------------------------------------------------- activity ping
     def _rt_due(self, st: _BookState, now: int) -> bool:
-        """True when this book needs a round-trip for the activity window."""
-        return (st.last_rt_ns == 0) or ((now - st.last_rt_ns) >= self.ping_interval_ns)
+        """True when this book needs a round-trip for the activity window. Before the first RT
+        we anchor on seen_ns (+ per-book phase) so a freshly-seen book is not instantly due --
+        this prevents the cold-start / sim-refresh ping storm across all 128 books."""
+        if st.last_rt_ns == 0:
+            anchor = st.seen_ns if st.seen_ns else now
+            return (now - anchor) >= (self.ping_interval_ns + st.ping_phase_ns)
+        return (now - st.last_rt_ns) >= self.ping_interval_ns
 
     def _submit_cooldown_ok(self, st: _BookState, now: int) -> bool:
         return (st.last_ping_submit_ns == 0) or (
@@ -573,38 +634,38 @@ class MeanReversionAgent(FinanceSimulationAgent):
         return (inv_qty < self.min_order_size / 2 and self._rt_due(st, now)
                 and self._submit_cooldown_ok(st, now))
 
-    def _ping_close_due(self, st: _BookState, inv_qty: float, now: int) -> bool:
-        """Holding book: close leg of a mandatory activity round-trip."""
-        return (inv_qty >= self.min_order_size / 2 and self._rt_due(st, now)
-                and self._submit_cooldown_ok(st, now))
+    def _ping_close_due(self, st: _BookState, pos: _Position, now: int) -> bool:
+        """Close leg of a mandatory activity round-trip. ONLY for a ping-opened lot -- a real
+        fade position is never sliced by the ping; it exits via TP/SL/time (which also records
+        the round-trip), so fade books stay active without ping interference."""
+        return (pos.via_ping and pos.qty >= self.ping_lot_size / 2
+                and self._rt_due(st, now) and self._submit_cooldown_ok(st, now))
 
-    def _submit_ping_open(self, response, validator, book_id, account, pos, st, book,
-                          mid, bid, ask, trend_bps, imb, cap, now) -> None:
-        """Market-buy exactly one min lot (open leg). Separate from fade entries."""
-        qty = self.min_order_size
+    def _submit_ping_open(self, response, validator, book_id, account, st, book,
+                          mid, now) -> None:
+        """Market-buy the ping lot (open leg). Separate from fade entries."""
+        qty = self.ping_lot_size
         ask_px = book.asks[0].price if book.asks else mid
         if account.quote_balance.free < qty * ask_px:
             return
         st.last_ping_submit_ns = now
         st.ping_awaiting_open = True
-        self._exit_reason[(validator, book_id)] = "ping_open"
         response.market_order(book_id=book_id, direction=OrderDirection.BUY,
                               quantity=qty, currency=OrderCurrency.BASE,
                               stp=STP.CANCEL_OLDEST)
 
     def _submit_ping_close(self, response, validator, book_id, account, pos, st,
-                           mid, bid, ask, trend_bps, imb, vol_dp, cap, now) -> bool:
-        """Market-sell exactly one min lot (close leg). Leaves fade positions intact."""
+                           vol_dp, now) -> bool:
+        """Market-sell the WHOLE ping lot (it is a single min lot) to complete the round-trip.
+        Closing the full lot avoids leaving an unmanaged dust remainder."""
         if pos.qty <= 0:
             return False
-        slice_qty = round(min(self.min_order_size, pos.qty,
-                              account.base_balance.free if account.base_balance else pos.qty),
-                          vol_dp)
-        if slice_qty < self.min_order_size:
+        free = account.base_balance.free if account.base_balance else pos.qty
+        q = round(min(pos.qty, free), vol_dp)
+        if q < self.min_order_size / 2:
             return False
         st.last_ping_submit_ns = now
-        self._exit_reason[(validator, book_id)] = "ping_active"
-        self._market_close_slice(response, account, book_id, pos, slice_qty, vol_dp)
+        self._market_close_slice(response, account, book_id, pos, q, vol_dp)
         return True
 
     # ------------------------------------------------------------------ orders
@@ -619,14 +680,14 @@ class MeanReversionAgent(FinanceSimulationAgent):
         except (TypeError, ValueError):
             return False
 
-    def _enter(self, response, account, book_id, qty, book,
-               price_dp, take_ok, mark_post_crash, pos) -> None:
-        """Maker-first long entry; taker fallback only when the fee regime pays takers."""
+    def _enter(self, response, account, book_id, qty, book, price_dp, take_ok) -> bool:
+        """Maker-first long entry; taker fallback only when the fee regime pays takers.
+        Returns True iff an order was actually submitted. post_crash / via_ping are classified
+        on the resulting FILL (see _apply_fill), never here at submit time."""
         expiry_ns = int(self.entry_expiry_s * 1e9)
         price = round(book.bids[0].price, price_dp)
         if account.quote_balance.free < qty * (book.asks[0].price or price):
-            return
-        pos.post_crash = bool(mark_post_crash)
+            return False
         if take_ok:
             response.market_order(book_id=book_id, direction=OrderDirection.BUY, quantity=qty,
                                   currency=OrderCurrency.BASE, stp=STP.CANCEL_OLDEST)
@@ -634,6 +695,7 @@ class MeanReversionAgent(FinanceSimulationAgent):
             response.limit_order(book_id=book_id, direction=OrderDirection.BUY, quantity=qty,
                                  price=price, postOnly=True, timeInForce=TimeInForce.GTT,
                                  expiryPeriod=expiry_ns, stp=STP.CANCEL_OLDEST)
+        return True
 
     def _market_close_slice(self, response, account, book_id, pos, qty, vol_dp) -> None:
         """Market-close up to `qty` BASE of a long (partial allowed for activity ping)."""

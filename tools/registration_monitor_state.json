@@ -33,8 +33,8 @@
       "reg_block": 8497729
     },
     "86": {
-      "hotkey": "5FYukyRMkxeEoVgU7AwXgbBjppfRQaE5gqSfYBMS7ZT3m9AF",
-      "reg_block": 8498956
+      "hotkey": "5CvcJ7T3bjAUpVLkKqVM75cw7fGFcw4dico179o4YY5bNj5F",
+      "reg_block": 8510103
     },
     "94": {
       "hotkey": "5DenA1Wmc7zJrcCnrL2e3KJqJjmMTnGedxtLXasF11MxzWZL",
@@ -97,8 +97,8 @@
       "reg_block": 8508435
     },
     "228": {
-      "hotkey": "5Ec5pXE3bgRi44PpMLuvMKpAWjKgGYs9Rbzt2pwh1YtCwqbZ",
-      "reg_block": 8502513
+      "hotkey": "5HgxLGwN4VMeswwdfPLg5GWagCDRLT3r8LyEXq1EJ9dt1SYg",
+      "reg_block": 8510221
     },
     "235": {
       "hotkey": "5CMhDcd47DieFvbRWRScMgdrw7RKuvBhvHWugeYwNai5fDV1",
@@ -123,17 +123,16 @@
     "255": {
       "hotkey": "5E2ZCJwUMPbjCDD4eXiNbqHimMrwbtTxzPgueRwQvQp9eD8X",
       "reg_block": 8490676
+    },
+    "136": {
+      "hotkey": "5FvN3q8GrH5rSxW6uRPtsMBmicvBVjV45snvKRiHEoSPVviM",
+      "reg_block": 8509861
+    },
+    "6": {
+      "hotkey": "5Ecc23vLCHdcRDtk44dswio6V3ivtiWpMQ68Z9smFA5psutP",
+      "reg_block": 8509981
     }
   },
-  "pending": [
-    {
-      "uid": 56,
-      "hotkey": "5F1gFNkhe4bhoJAWETk2PcYb9TVBoHoJW7G3RDREfgW7gMtw",
-      "reg_block": 8509274,
-      "reg_ts": "2026-06-29T03:32:00.958124+00:00",
-      "detected_ts": 1782704012.108127,
-      "classify_after": 1782705172.7220962
-    }
-  ],
+  "pending": [],
   "seeded": true
 }
