@@ -23,6 +23,7 @@ Usage:
   python3 tools/registration_monitor.py --reclassify           # re-run mode check for all known uids now
 """
 import argparse
+import atexit
 import json
 import os
 import re
@@ -99,10 +100,38 @@ def save_state(s):
 
 
 # --------------------------------------------------------------- chain
+# Reuse one Subtensor + metagraph across sweeps. Previously each fetch_metagraph()
+# constructed a new Subtensor every --interval seconds without close(), leaking
+# websocket/substrate handles until RSS hit many GB over ~24h.
+_sub: bt.Subtensor | None = None
+_meta = None
+
+
+def _get_chain():
+    global _sub, _meta
+    if _sub is None:
+        _sub = bt.Subtensor(network=ENDPOINT)
+        _meta = _sub.metagraph(NETUID, lite=True)
+        atexit.register(_close_chain)
+    else:
+        _meta.sync(subtensor=_sub, lite=True)
+    return _sub, _meta
+
+
+def _close_chain():
+    global _sub, _meta
+    if _sub is not None:
+        try:
+            _sub.close()
+        except Exception:
+            pass
+        _sub = None
+        _meta = None
+
+
 def fetch_metagraph():
     """Return (rows, current_block) where rows = {uid: {hotkey, ip, reg_block}} for ALL uids at TARGET_IP."""
-    sub = bt.Subtensor(network=ENDPOINT)
-    meta = sub.metagraph(NETUID)
+    sub, meta = _get_chain()
     cur = sub.get_current_block()
     n = len(meta.uids)
     reg = getattr(meta, "block_at_registration", None)
@@ -131,18 +160,24 @@ def block_to_ts(reg_block, cur_block):
 
 
 # --------------------------------------------------------------- trades / mode
-def _parse_trades(text):
-    grouped = {}
-    for line in text.splitlines():
+def _iter_trade_fills(resp):
+    """Yield completed trade records from a streaming Prometheus trades response."""
+    pending = {}
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("trades{"):
             continue
         m = _LINE.match(line)
         if not m:
             continue
         labels = dict(_LABEL.findall(m.group(1)))
-        grouped.setdefault((labels.get("book_id"), labels.get("slot")), {})[
-            labels.get("trade_gauge_name", "")] = m.group(2)
-    return grouped
+        key = (labels.get("book_id"), labels.get("slot"))
+        slot = pending.setdefault(key, {})
+        slot[labels.get("trade_gauge_name", "")] = m.group(2)
+        if "trade_id" in slot and "maker_agent_id" in slot and "taker_agent_id" in slot:
+            yield slot
+            del pending[key]
+    pending.clear()
 
 
 def classify_mode(uid):
@@ -154,25 +189,28 @@ def classify_mode(uid):
     start = time.time()
     while ok < CLASSIFY_POLL_OK and (time.time() - start) < CLASSIFY_POLL_BUDGET_S:
         try:
-            text = urllib.request.urlopen(TRADES_URL, timeout=9).read().decode("utf-8", "replace")
+            resp = urllib.request.urlopen(TRADES_URL, timeout=9)
         except Exception:
             time.sleep(1.5)
             continue
         ok += 1
-        for _, g in _parse_trades(text).items():
-            tid = g.get("trade_id")
-            if tid is None or tid in seen_trades:
-                continue
-            try:
-                mk = int(float(g.get("maker_agent_id")))
-                tk = int(float(g.get("taker_agent_id")))
-            except (TypeError, ValueError):
-                continue
-            seen_trades.add(tid)
-            if mk == uid:
-                maker += 1
-            if tk == uid:
-                taker += 1
+        try:
+            for g in _iter_trade_fills(resp):
+                tid = g.get("trade_id")
+                if tid is None or tid in seen_trades:
+                    continue
+                try:
+                    mk = int(float(g.get("maker_agent_id")))
+                    tk = int(float(g.get("taker_agent_id")))
+                except (TypeError, ValueError):
+                    continue
+                seen_trades.add(tid)
+                if mk == uid:
+                    maker += 1
+                if tk == uid:
+                    taker += 1
+        finally:
+            resp.close()
         time.sleep(2)
 
     tot = maker + taker

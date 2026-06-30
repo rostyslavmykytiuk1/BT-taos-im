@@ -1,7 +1,7 @@
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-[SN-79 REGIME CHANGE] MAKER -> MIXED [no-edge] @ 2026-06-30 01:39:59
-  recommend: no clear edge — hold current mix; AdaptiveRouter (routes per book) is the safe default
-  edge: MIXED 1.00x the other (maker k0.1248 / taker k0.1140)
-  FEES @ MTR 0.484: maker +2.9bps  taker -0.6bps  (+=pay, -=rebate)
+[SN-79 REGIME CHANGE] MIXED -> TAKER [WEAK] @ 2026-06-30 09:52:50
+  recommend: TakerScalperAgent (final) — cross + scalp; favor maker-heavy books / MTR > 0.4 for taker rebate
+  edge: TAKER 1.21x the other (maker k0.0663 / taker k0.0804)
+  FEES @ MTR 0.490: maker +3.4bps  taker -1.1bps  (+=pay, -=rebate)
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

@@ -57,8 +57,8 @@
       "reg_block": 8503752
     },
     "120": {
-      "hotkey": "5E9Nm4to7aTe3RnzN8Wu9WSduxuqTweFnRb1mSNKQRmNvvJo",
-      "reg_block": 8498836
+      "hotkey": "5CaG86J1WLfUgP8d2BHFSgN9AvUNChDX6YYvnKBrWMLPJuHa",
+      "reg_block": 8518111
     },
     "150": {
       "hotkey": "5GeEHB8hXCCssDinugNNozVMFNqZxhjUDd1mVoc5ctu7qkYL",
@@ -105,8 +105,8 @@
       "reg_block": 8509033
     },
     "238": {
-      "hotkey": "5E4MvTxUzqbjD3wxdzJ5dX5UzHVL4dBJ1Phk4ptxsuFEqudK",
-      "reg_block": 8496922
+      "hotkey": "5C7k57FTkyUvVdzpQt8bjqXzEug8UsNCzNv2TUQ45waAwuyK",
+      "reg_block": 8517750
     },
     "241": {
       "hotkey": "5FYukyRMkxeEoVgU7AwXgbBjppfRQaE5gqSfYBMS7ZT3m9AF",
@@ -117,8 +117,8 @@
       "reg_block": 8500276
     },
     "254": {
-      "hotkey": "5HgxLGwN4VMeswwdfPLg5GWagCDRLT3r8LyEXq1EJ9dt1SYg",
-      "reg_block": 8497368
+      "hotkey": "5F9MxxrQrBpJm45JKUdaEoqixc1NfUctshomURZeriMF3DsE",
+      "reg_block": 8517630
     },
     "255": {
       "hotkey": "5E2ZCJwUMPbjCDD4eXiNbqHimMrwbtTxzPgueRwQvQp9eD8X",
@@ -203,16 +203,56 @@
     "11": {
       "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
       "reg_block": 8515974
+    },
+    "88": {
+      "hotkey": "5HmqyTDAS8tyyMdHjKbQx29MAk1E1HkefPCBfTMaDbHrK7yz",
+      "reg_block": 8516093
+    },
+    "155": {
+      "hotkey": "5Eevm8Xj4h6xLnjTmGSrYS99V5FdQxZbTgb1XHybPMHmbgof",
+      "reg_block": 8516214
+    },
+    "129": {
+      "hotkey": "5E9Nm4to7aTe3RnzN8Wu9WSduxuqTweFnRb1mSNKQRmNvvJo",
+      "reg_block": 8516796
+    },
+    "142": {
+      "hotkey": "5DPjyXrwgwtmhpX14YeKRmQ5rMYoxXx35mzxPQw3QdbXuL3P",
+      "reg_block": 8517031
+    },
+    "23": {
+      "hotkey": "5HpjuEKxmEGcns3bUkQD7XK84moyV9i3a44wBMNXSwbRgM4f",
+      "reg_block": 8517270
+    },
+    "3": {
+      "hotkey": "5CMjk8FBAEgQyPXUEtFbNvunn9mHvhsPD8zzoYVfuy5Pg8SZ",
+      "reg_block": 8517391
+    },
+    "69": {
+      "hotkey": "5HVuaC3giHjvLvUZ5pEpt5njNf4kW9fneTKrc12QFHJ1hjJB",
+      "reg_block": 8517871
+    },
+    "119": {
+      "hotkey": "5DL9NkU7tVCHbxLj44wc2gxckL2tKNh4rjk8JFPYyJZTRri1",
+      "reg_block": 8518350
+    },
+    "100": {
+      "hotkey": "5Dw6fRTpzjVCyKZwGjz3yk8Bsmsg1zrNtoi2bxnjEbEruMPC",
+      "reg_block": 8518471
+    },
+    "82": {
+      "hotkey": "5CtNc8v2XhPW1i7zN2qnpvm9Z9hkWDwgrAm9PhoZtMBHHGPz",
+      "reg_block": 8518590
     }
   },
   "pending": [
     {
-      "uid": 11,
-      "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
-      "reg_block": 8515974,
-      "reg_ts": "2026-06-30T02:32:54.396099+00:00",
-      "detected_ts": 1782786929.979844,
-      "classify_after": 1782788126.5957708
+      "uid": 82,
+      "hotkey": "5CtNc8v2XhPW1i7zN2qnpvm9Z9hkWDwgrAm9PhoZtMBHHGPz",
+      "reg_block": 8518590,
+      "reg_ts": "2026-06-30T11:16:16.887493+00:00",
+      "detected_ts": 1782818306.639396,
+      "classify_after": 1782819387.1995437
     }
   ],
   "seeded": true

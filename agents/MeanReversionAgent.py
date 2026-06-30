@@ -248,7 +248,7 @@ class MeanReversionAgent(FinanceSimulationAgent):
         )
 
     def _tune_gc(self) -> None:
-        """Reduce GC pauses during handle() — same approach as AdaptiveRouterV2Agent."""
+        """Reduce GC pauses during handle() — same approach as AdaptiveRouterAgent."""
         try:
             gc.collect()
             gc.freeze()

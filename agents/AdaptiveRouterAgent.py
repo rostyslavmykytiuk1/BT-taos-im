@@ -15,13 +15,23 @@ book's LIVE fee regime, mirroring the proven top miners:
     adverse selection or trending. Stay flat → the book gets Kappa=None and is DROPPED from the
     median (up to ~37.5% are free), which beats bleeding small losses into the median.
 
+Maker-mode hardening (validated from live cut-log study):
+  * Maker gate: enter edge 3.0bps (=6bps round-trip over both fee legs), a REAL always-on maker-fee
+    ceiling (6bps; no fallback bypass), and an absolute half-spread floor (MK_MIN_SPREAD_BPS) so
+    passive capture clears the two-legged fee drag.
+  * Idle overflow NEVER forces a −EV maker book: the fallback only relaxes the edge to 1.5bps and
+    keeps the fee ceiling + spread floor; a book that cannot clear them stays idle (idle=0.0 beats
+    a guaranteed loss, and ≤48 idle books are dropped from the kappa median for free).
+  * Maker cut held longer: stop 30bps (stops firing inside the reverting dump band) and
+    giveup 240s (cut-log study: aged time-cuts cost −0.02 vs −0.11 for early stop-cuts).
+
 Calibrated from the top agents' own trade histories (other agents data/*.csv):
   * They ALL trade 128/128 books — none idle. We raise the maker entry bar above breakeven
-    (MAKER_EDGE_ENTER = 1.5bps) to absorb ~0.8bps adverse-selection drag and idle the rest.
+    (MAKER_EDGE_ENTER = 3.0bps) to absorb adverse-selection drag and idle the rest.
   * They route by FEE REGIME: UID 126 (#1, Kappa 0.263) is 100% taker on rebate books; UID 66
     (Kappa 0.104) is mixed and takes only where the taker side is rebated; UID 109/165 are pure
     makers — 165 makes profitably even at +11.5bps fee. We do the same: take where rebated, make
-    everywhere else, no maker fee ceiling.
+    on spread-rich low-fee books (MAKER_MAX_FEE_BPS ceiling), idle the rest.
   * Kappa rises with FREQUENCY (149 at 1.7 RT/book/10min → Kappa 0.040; 66/109 at ~26 → 0.10),
     because per-book Kappa ≈ (share of step-timestamps closed positive)^(2/3). So we quote
     continuously with short cooldowns, NOT sparse high-target round-trips.
@@ -109,12 +119,22 @@ TARGET_CLIP = 0.26                 # shared per-clip BASE lot. Just ABOVE the 0.
 TAKER_REBATE_ENTER_BPS = 1.5       # route to taker when rebate ≥ 1.5bps; execution gate in
                                    # _TakerMode._open() independently checks 2×rebate > 2×half_spread
 TAKER_REBATE_EXIT_BPS = 0.75       # leave taker when rebate falls below 0.75bps (0.75bps hysteresis)
-MAKER_EDGE_ENTER_BPS = 1.5         # require half_spread − maker_fee ≥ 1.5bps to enter maker;
-                                   # empirically the minimum to survive adverse selection
-MAKER_EDGE_EXIT_BPS = -0.5         # exit maker when edge falls below −0.5bps (2bps hysteresis band)
-MAKER_MAX_FEE_BPS = 1_000.0        # effectively no ceiling — a wide spread redeems a high fee
-MAKER_FALLBACK_EDGE_BPS = 0.5      # when the idle guard fires, promote books with ≥ 0.5bps edge
-                                   # (not zero — quality filter is maintained even in fallback)
+MAKER_EDGE_ENTER_BPS = 3.0         # Require half_spread − maker_fee ≥ 3.0bps to enter maker (was
+                                   # 1.5). edge is a PER-LEG figure, so 3.0 here = a 6bps ROUND-TRIP
+                                   # edge over both fee legs — the fee-drag study showed the old 1.5
+                                   # (3bps round-trip) was below our ~2bps two-legged fee drag, so
+                                   # gross-positive trades closed net-negative.
+MAKER_EDGE_EXIT_BPS = -0.5         # exit maker when edge falls below −0.5bps (hysteresis band)
+MAKER_MAX_FEE_BPS = 6.0            # REAL absolute ceiling, ALWAYS enforced (no cliff/fallback
+                                   # bypass). A high maker fee is adverse-selection territory no matter
+                                   # how wide the spread looks; skip those books (idle is +EV vs a loss).
+MK_MIN_SPREAD_BPS = 5.0            # Absolute half-spread FLOOR for maker entry, independent of the
+                                   # fee-relative edge. A near-zero-fee book can pass the edge gate on a
+                                   # 1bps spread, but there is no room to capture after the round trip —
+                                   # require real spread so passive capture clears the two fee legs.
+MAKER_FALLBACK_EDGE_BPS = 1.5      # When the idle guard fires, relax the enter edge to 1.5bps (the
+                                   # old normal bar) — NOT to zero. The fee ceiling and min-spread floor
+                                   # stay fully enforced in fallback, so we never force a −EV maker book.
 MAX_IDLE_BOOKS = 40                # allow up to 40 idle books before promoting borderline ones to
                                    # maker via fallback; 40 is comfortably below the 48-book
                                    # validator budget (37.5% × 128) where kappa=None is free
@@ -144,7 +164,7 @@ VOLUME_SAFETY = 0.8
 VOLUME_ASSESSMENT_NS = 86_400_000_000_000
 
 # ---- activity backstop: guarantee >=1 RT per book per window, bounded to one lot ----
-ACTIVITY_DEADLINE_S = 480.0        # force a close this long since the last counted RT
+ACTIVITY_DEADLINE_S = 1500.0        # force a close this long since the last counted RT
 
 # ---- TAKER mode (mirrors UID 126) ----
 TK_MIN_HOLD_S = 1.5
@@ -161,9 +181,15 @@ TK_PYRAMID_MIN_REBATE_BPS = 3.0    # only stack while rebate is comfortably abov
 MK_TP_BPS = 10.0                   # target spread capture over the oldest lot
 MK_TP_FEE_MULT = 2.0               # require target >= this * maker_fee + a tick
 MK_QUOTE_EXPIRY_S = 12.0
-MK_EXIT_WALK_START_S = 30.0        # rest reduce at full target below this lot age ...
-MK_EXIT_GIVEUP_S = 180.0           # IOC time-cut at 3min = sharp-dump→revert window (tape: 97% revert by 180s)
-MK_STOP_LOSS_BPS = 20.0            # TRIGGER: catastrophe stop above 20bps dump band, below cube-bomb zone
+MK_EXIT_WALK_START_S = 40.0        # Rest reduce at full target below this lot age (scaled with the
+                                   # longer giveup below, keeping the ~1/6 walk-start:giveup ratio)
+MK_EXIT_GIVEUP_S = 240.0           # IOC time-cut at 4min. Cut-log study: time-driven cuts
+                                   # (aged out) cost −0.02 vs −0.11 for early stop-driven cuts; giving the
+                                   # dump→revert more room converts expensive early cuts into cheap ones.
+MK_STOP_LOSS_BPS = 30.0            # TRIGGER at 30bps. 75% of maker cuts were the 20bps stop firing
+                                   # INSIDE the 20–38bps dump band (mean −0.11) before reversion. 30bps
+                                   # clears the typical dump so reverting lots ride; the streak cooldown +
+                                   # IOC-escalation still bound the genuinely-trending (non-revert) tail.
 MK_IOC_SLIPPAGE_BPS = 4.0          # CEILING: max price concession on the forced IOC cut (distinct
                                    # from the trigger above; bounds realized slippage on the exit)
 MK_IOC_ESCALATE_BPS = 8.0          # escalated slippage after 2+ consecutive IOC misses
@@ -481,10 +507,15 @@ class AdaptiveRouterAgent(FinanceSimulationAgent):
         # gate in _open() already suppresses trading when the spread is temporarily too wide.
         spread_viable = (cur == MODE_TAKER) or (rebate_bps > half_spread_bps)
         taker_ok = (MODE_TAKER in ALLOWED_MODES) and rebate_bps >= taker_min_rebate and spread_viable
-        # Maker requires BOTH a net spread edge AND an absolute fee below the ceiling: a wide spread
-        # on a high-fee book is adverse selection, not opportunity.
+        # Maker requires (1) a net spread edge over the fee, (2) an absolute fee below the ceiling
+        # (always enforced — a wide spread on a high-fee book is adverse selection, not opportunity),
+        # and (3) an absolute half-spread floor so there is real room to capture after the two fee
+        # legs. The floor is an ENTER gate only — an in-position maker is not ejected on a transient
+        # spread dip (mirrors the taker spread bypass); the edge-exit hysteresis governs ejection.
+        maker_spread_ok = (cur == MODE_MAKER) or (half_spread_bps >= MK_MIN_SPREAD_BPS)
         maker_ok = ((MODE_MAKER in ALLOWED_MODES)
                     and maker_fee_bps < MAKER_MAX_FEE_BPS
+                    and maker_spread_ok
                     and maker_edge_bps >= maker_min_edge)
 
         if taker_ok and maker_ok:

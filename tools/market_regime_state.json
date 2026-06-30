@@ -1,8 +1,8 @@
 {
-  "regime": "MIXED",
+  "regime": "TAKER",
   "pending": null,
   "pending_count": 0,
-  "since": "2026-06-30 01:39:59",
-  "last_firm": "MAKER",
+  "since": "2026-06-30 09:52:50",
+  "last_firm": "TAKER",
   "sim_id": "20260628_1342"
 }
