@@ -199,16 +199,20 @@
     "246": {
       "hotkey": "5FYjHJaAXffKegMhLKqz2u7UniMnmCxm5X88uBmvYwDwotr2",
       "reg_block": 8515732
+    },
+    "11": {
+      "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
+      "reg_block": 8515974
     }
   },
   "pending": [
     {
-      "uid": 246,
-      "hotkey": "5FYjHJaAXffKegMhLKqz2u7UniMnmCxm5X88uBmvYwDwotr2",
-      "reg_block": 8515732,
-      "reg_ts": "2026-06-30T01:44:26.195770+00:00",
-      "detected_ts": 1782783971.539275,
-      "classify_after": 1782785001.8753057
+      "uid": 11,
+      "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
+      "reg_block": 8515974,
+      "reg_ts": "2026-06-30T02:32:54.396099+00:00",
+      "detected_ts": 1782786929.979844,
+      "classify_after": 1782788126.5957708
     }
   ],
   "seeded": true

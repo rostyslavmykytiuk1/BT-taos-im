@@ -6,7 +6,6 @@ import json
 import msgpack
 import traceback
 import time
-import csv
 import bittensor as bt
 from threading import Thread
 from abc import ABC, abstractmethod
@@ -14,7 +13,7 @@ from taos.common.agents import SimulationAgent
 from taos.im.protocol import MarketSimulationStateUpdate, FinanceAgentResponse, FinanceEventNotification
 from taos.im.protocol.events import *
 from taos.im.protocol.models import *
-from taos.im.utils import duration_from_timestamp, timestamp_from_duration
+from taos.im.utils import duration_from_timestamp
 
 @dataclass
 class RollingWindow:
@@ -112,7 +111,6 @@ class FinanceSimulationAgent(SimulationAgent):
         # avoid retaining full state copies.
         self.history_len = int(getattr(config, "history_len", 10))
         self.accounts = {}
-        self.event_history : dict[str, AgentEventHistory | None] = {}
         # Optional market-snapshot emitter (OFF unless `market_snapshot_dir` param is set).
         # Dumps a compact per-book mid/spread/fee snapshot for ALL books each tick (throttled),
         # read by tools/market_monitor.py to decide the taker/maker regime from live
@@ -138,224 +136,6 @@ class FinanceSimulationAgent(SimulationAgent):
             self.onEnd(notification.event)
         return notification
     
-    def simulation_output_dir(self, state : MarketSimulationStateUpdate):
-        simulation_output_dir = os.path.join(self.output_dir, state.dendrite.hotkey, state.config.simulation_id)
-        os.makedirs(simulation_output_dir, exist_ok=True)
-        return simulation_output_dir
-    
-    def load_event_history(self, state) -> None:
-        """
-        Load per-agent event history from CSV files into an AgentEventHistory object.
-
-        This method:
-        - Loads CSVs (orders, cancellations, trades).
-        - Constructs event objects directly from CSV columns (no from_json).
-        - Aggregates into an AgentEventHistory instance.
-        - Applies optional retention logic based on `event_lookback_minutes`.
-
-        Populates:
-            self.event_history[state.dendrite.hotkey] (AgentEventHistory | None)
-        """
-        self.event_lookback_minutes = getattr(self.config, "event_lookback_minutes", 60)
-
-        base_dir = self.simulation_output_dir(state)
-
-        def _load_orders(path: str):
-            events = []
-            if os.path.isfile(path):
-                with open(path, newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        try:
-                            if row['price']:
-                                ev = LimitOrderPlacementEvent(
-                                    timestamp=timestamp_from_duration(row["timestamp"]),
-                                    agentId=self.uid,
-                                    bookId=int(row["bookId"]),
-                                    orderId=int(row["orderId"]) if row["orderId"] else None,
-                                    clientOrderId=int(row["clientOrderId"]) if row["clientOrderId"] else None,
-                                    side=int(row["side"]),
-                                    p=float(row["price"]),
-                                    quantity=float(row["quantity"]),
-                                    leverage=float(row["leverage"]),
-                                    settleFlag=row.get("settleFlag"),
-                                    success=row["success"].lower() == "true",
-                                    message=row.get("message", ""),
-                                )
-                            else:
-                                ev = MarketOrderPlacementEvent(
-                                    timestamp=timestamp_from_duration(row["timestamp"]),
-                                    agentId=self.uid,
-                                    bookId=int(row["bookId"]),
-                                    orderId=int(row["orderId"]) if row["orderId"] else None,
-                                    clientOrderId=int(row["clientOrderId"]) if row["clientOrderId"] else None,
-                                    side=int(row["side"]),
-                                    r=(row["currency"] if row["currency"].isnumeric() else OrderCurrency[row["currency"].split('.')[1]]) if "currency" in row and row["currency"] else OrderCurrency.BASE,
-                                    quantity=float(row["quantity"]),
-                                    leverage=float(row["leverage"]),
-                                    settleFlag=row.get("settleFlag"),
-                                    success=row["success"].lower() == "true",
-                                    message=row.get("message", ""),
-                                )
-                            events.append(ev)
-                        except Exception as e:
-                            bt.logging.warning(f"Failed to parse order row: {e}")
-            return events
-
-        def _load_cancellations(path: str):
-            events = []
-            if os.path.isfile(path):
-                with open(path, newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        try:
-                            ev = OrderCancellationEvent(
-                                t=timestamp_from_duration(row["timestamp"]),
-                                b=int(row["bookId"]),
-                                o=int(row["orderId"]),
-                                q=float(row["quantity"]) if row["quantity"] else None,
-                                u=row["success"].lower() == "true",
-                                m=row.get("message", ""),
-                            )
-                            events.append(ev)
-                        except Exception as e:
-                            bt.logging.warning(f"Failed to parse cancellation row: {e}")
-            return events
-
-        def _load_trades(path: str):
-            events = []
-            if os.path.isfile(path):
-                with open(path, newline="") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        try:
-                            ev = TradeEvent(
-                                timestamp=timestamp_from_duration(row["timestamp"]),
-                                agentId=self.uid,
-                                b=int(row["bookId"]) if row["bookId"] else None,
-                                i=int(row["tradeId"]),
-                                c=int(row["clientOrderId"]) if row["clientOrderId"] else None,
-                                Ta=int(row["takerAgentId"]),
-                                Ti=int(row["takerOrderId"]),
-                                Tf=float(row["takerFee"]),
-                                Ma=int(row["makerAgentId"]),
-                                Mi=int(row["makerOrderId"]),
-                                Mf=float(row["makerFee"]),
-                                s=int(row["side"]),
-                                p=float(row["price"]),
-                                q=float(row["quantity"]),
-                            )
-                            events.append(ev)
-                        except Exception as e:
-                            bt.logging.warning(f"Failed to parse trade row: {e}")
-            return events
-
-        # Load everything
-        orders = _load_orders(os.path.join(base_dir, "orders.csv"))
-        cancels = _load_cancellations(os.path.join(base_dir, "cancellations.csv"))
-        trades = _load_trades(os.path.join(base_dir, "trades.csv"))
-
-        all_events = orders + cancels + trades
-        if not all_events:
-            self.event_history[state.dendrite.hotkey] = AgentEventHistory(
-                uid=self.uid,
-                start=state.timestamp - state.config.publish_interval,
-                end=state.timestamp,
-                events=[],
-                publish_interval=self.simulation_config.publish_interval,
-                retention_mins=self.event_lookback_minutes,
-            )
-        else:
-            # Sort by timestamp
-            all_events.sort(key=lambda e: e.timestamp)
-
-            start = all_events[0].timestamp
-            end = all_events[-1].timestamp
-            self.event_history[state.dendrite.hotkey] = AgentEventHistory(
-                uid=self.uid,
-                start=start,
-                end=end,
-                events=all_events,
-                publish_interval=getattr(self.config, "publish_interval", 1_000_000_000),
-                retention_mins=self.event_lookback_minutes,
-            )
-        
-    
-    def log_order_event(self, event : LimitOrderPlacementEvent | MarketOrderPlacementEvent, state : MarketSimulationStateUpdate):
-        """Log LimitOrderPlacementEvent or MarketOrderPlacementEvent to CSV."""
-        orders_log_file = os.path.join(self.simulation_output_dir(state), 'orders.csv')
-        file_exists = os.path.exists(orders_log_file)
-        with open(orders_log_file, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow([
-                    'timestamp', 'bookId', 'orderId', 'clientOrderId',
-                    'side', 'price', 'currency', 'quantity', 'leverage', 'settleFlag',
-                    'success', 'message'
-                ])
-            writer.writerow([
-                duration_from_timestamp(event.timestamp),
-                getattr(event, 'bookId', None),
-                getattr(event, 'orderId', None),
-                getattr(event, 'clientOrderId', None),
-                getattr(event, 'side', None),
-                getattr(event, 'price', None),
-                getattr(event, 'currency', None),
-                getattr(event, 'quantity', None),
-                getattr(event, 'leverage', None),
-                getattr(event, 'settleFlag', None),
-                event.success,
-                event.message
-            ])
-
-    def log_cancellation_event(self, event : OrderCancellationEvent, state : MarketSimulationStateUpdate):
-        """Log OrderCancellationEvent to CSV."""
-        cancellations_log_file = os.path.join(self.simulation_output_dir(state), 'cancellations.csv')
-        file_exists = os.path.exists(cancellations_log_file)
-        with open(cancellations_log_file, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow([
-                    'timestamp', 'bookId', 'orderId', 'quantity', 'success', 'message'
-                ])
-            writer.writerow([
-                duration_from_timestamp(event.timestamp),
-                event.bookId,
-                event.orderId,
-                event.quantity,
-                event.success,
-                event.message
-            ])
-
-    def log_trade_event(self, event : TradeEvent, state : MarketSimulationStateUpdate):
-        """Log TradeEvent to CSV."""
-        trades_log_file = os.path.join(self.simulation_output_dir(state), 'trades.csv')
-        file_exists = os.path.exists(trades_log_file)
-        with open(trades_log_file, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow([
-                    'timestamp', 'bookId', 'tradeId', 'clientOrderId',
-                    'takerAgentId', 'takerOrderId', 'takerFee',
-                    'makerAgentId', 'makerOrderId', 'makerFee',
-                    'side', 'price', 'quantity'
-                ])
-            writer.writerow([
-                duration_from_timestamp(event.timestamp),
-                event.bookId,
-                event.tradeId,
-                event.clientOrderId,
-                event.takerAgentId,
-                event.takerOrderId,
-                event.takerFee,
-                event.makerAgentId,
-                event.makerOrderId,
-                event.makerFee,
-                event.side,
-                event.price,
-                event.quantity
-            ])
-
     def update(self, state : MarketSimulationStateUpdate) -> None:
         """
         Method to update the stored agent data, print relevant state information and trigger handlers for reported events.
@@ -374,10 +154,6 @@ class FinanceSimulationAgent(SimulationAgent):
         self.simulation_config = state.config
         self.accounts = state.accounts[self.uid]
         self.events = state.notices[self.uid]
-        
-        if not state.dendrite.hotkey in self.event_history or not self.event_history[state.dendrite.hotkey]:            
-            self.load_event_history(state)        
-        self.event_history[state.dendrite.hotkey].append(state)
         
         simulation_ended = False
         update_text = ''
@@ -426,13 +202,11 @@ class FinanceSimulationAgent(SimulationAgent):
                     match event.type:
                         case "RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "RDPOL" | "RDPOM":
                             self.onOrderAccepted(event)
-                            self.log_order_event(event, state)
                         case "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_LIMIT" | "ERROR_RESPONSE_DISTRIBUTED_PLACE_ORDER_MARKET" | "ERDPOL" | "ERDPOM":
                             self.onOrderRejected(event)
                         case "RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "RDCO":
                             for cancellation in event.cancellations:
                                 self.onOrderCancelled(cancellation)
-                                self.log_cancellation_event(cancellation, state)
                         case "ERROR_RESPONSE_DISTRIBUTED_CANCEL_ORDERS" | "ERDCO":
                             for cancellation in event.cancellations:
                                 self.onOrderCancellationFailed(cancellation)
@@ -451,7 +225,6 @@ class FinanceSimulationAgent(SimulationAgent):
                             debug_text += f"{trade_text}" + "\n"
                             update_text += f"BOOK {book_id} : {trade_text}" + "\n"
                             self.onTrade(event,state.dendrite.hotkey)
-                            self.log_trade_event(event, state)
                         case _:
                             bt.logging.warning(f"Unknown event : {event}")
             if len(self.events) == 0: 
