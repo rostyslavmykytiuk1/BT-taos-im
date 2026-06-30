@@ -17,8 +17,8 @@
       "reg_block": 8508075
     },
     "50": {
-      "hotkey": "5CFeNKT5SfSV84FdZ6JKPkVncRKtDy1GUJsLkaaJcer2Nek7",
-      "reg_block": 8504954
+      "hotkey": "5GeEHB8hXCCssDinugNNozVMFNqZxhjUDd1mVoc5ctu7qkYL",
+      "reg_block": 8513078
     },
     "52": {
       "hotkey": "5Hmtu6YGxVz76voeq55pegGMiZgKGeJes4G1GC9VFZbj5r6o",
@@ -65,8 +65,8 @@
       "reg_block": 8496802
     },
     "157": {
-      "hotkey": "5FvoXntNurdZZkwKnvaBMk1sfcbDoQJhNnCnyUXL3td7peyW",
-      "reg_block": 8505073
+      "hotkey": "5FPF2QTF5ET1eLLjbBS2WBJK66FeydGSHTKFN8ktQ59ibXhL",
+      "reg_block": 8512365
     },
     "158": {
       "hotkey": "5C5CJkv8R5PbVELSUXHEpj62wWMF4xeFsCv4PNKnrY6DD4ze",
@@ -77,8 +77,8 @@
       "reg_block": 8497007
     },
     "189": {
-      "hotkey": "5CoAKx7f7hy6JegnC9T1BPxW4CxSQ1ERbyuddGqoqzfGQkrW",
-      "reg_block": 8503874
+      "hotkey": "5E4MvTxUzqbjD3wxdzJ5dX5UzHVL4dBJ1Phk4ptxsuFEqudK",
+      "reg_block": 8511172
     },
     "197": {
       "hotkey": "5HgYXitTT3auCv1Nkyb8nvpp1rjKhuduom4WiJhERt6ZwX4a",
@@ -89,8 +89,8 @@
       "reg_block": 8508555
     },
     "211": {
-      "hotkey": "5GGjWBRHbtJWif4trKnTTi7sWFpiaoMBRYk6xJrQ1X73XDhK",
-      "reg_block": 8503633
+      "hotkey": "5ERb6767AhHS45bdrhETTmsFTor6JmhwTtSJ8UpySuXfpwew",
+      "reg_block": 8511645
     },
     "219": {
       "hotkey": "5FhXxjeLW4FAGRJhsCGK3cXPViNAkgaZ3po3dFyA6r1BH5P4",
@@ -109,8 +109,8 @@
       "reg_block": 8496922
     },
     "241": {
-      "hotkey": "5DPujqiw87BvSpJTpocVKuF5CMXm1kwHiSQSGGmLTtLN9WwB",
-      "reg_block": 8503994
+      "hotkey": "5FYukyRMkxeEoVgU7AwXgbBjppfRQaE5gqSfYBMS7ZT3m9AF",
+      "reg_block": 8511291
     },
     "251": {
       "hotkey": "5DDQkqHHU8wzAAyPdwJcpjLmLuVyDbKzRQqfd7yUa42vFuYq",
@@ -131,8 +131,85 @@
     "6": {
       "hotkey": "5Ecc23vLCHdcRDtk44dswio6V3ivtiWpMQ68Z9smFA5psutP",
       "reg_block": 8509981
+    },
+    "72": {
+      "hotkey": "5Hmtu6YGxVz76voeq55pegGMiZgKGeJes4G1GC9VFZbj5r6o",
+      "reg_block": 8512126
+    },
+    "170": {
+      "hotkey": "5GGjWBRHbtJWif4trKnTTi7sWFpiaoMBRYk6xJrQ1X73XDhK",
+      "reg_block": 8512245
+    },
+    "12": {
+      "hotkey": "5CoAKx7f7hy6JegnC9T1BPxW4CxSQ1ERbyuddGqoqzfGQkrW",
+      "reg_block": 8512487
+    },
+    "92": {
+      "hotkey": "5E1rdq5RefdSo6rSNDePReBDxb14otkQLNxwUNkoK1zxg9YF",
+      "reg_block": 8512718
+    },
+    "153": {
+      "hotkey": "5G6EBYLZASsgVPgHYRvKRVXn7kCGVUhFFjAbdqVyMSehfGfd",
+      "reg_block": 8512840
+    },
+    "96": {
+      "hotkey": "5E2ZCJwUMPbjCDD4eXiNbqHimMrwbtTxzPgueRwQvQp9eD8X",
+      "reg_block": 8513319
+    },
+    "207": {
+      "hotkey": "5Ev4ooDUzzwwcxHUVmGiJh3bbhZCTFmmEVPyeLjo2vhQUfP1",
+      "reg_block": 8513439
+    },
+    "41": {
+      "hotkey": "5GxE4PNCE4RJ6Dh1G8y7DH4xFEa6NSowffcZ7d5TQGmrp9MG",
+      "reg_block": 8514032
+    },
+    "173": {
+      "hotkey": "5Ec5pXE3bgRi44PpMLuvMKpAWjKgGYs9Rbzt2pwh1YtCwqbZ",
+      "reg_block": 8514152
+    },
+    "184": {
+      "hotkey": "5CFeNKT5SfSV84FdZ6JKPkVncRKtDy1GUJsLkaaJcer2Nek7",
+      "reg_block": 8514513
+    },
+    "143": {
+      "hotkey": "5FvoXntNurdZZkwKnvaBMk1sfcbDoQJhNnCnyUXL3td7peyW",
+      "reg_block": 8514753
+    },
+    "190": {
+      "hotkey": "5HEAZv4gZ6gsJsWaQrrEBogQcvVZ44vQBrhziWwCBAV3HxGX",
+      "reg_block": 8514872
+    },
+    "51": {
+      "hotkey": "5C5nkTnDg1HeB2ob96xvFsNmsjX73XXPL8RB1p68wtZR57BN",
+      "reg_block": 8514994
+    },
+    "225": {
+      "hotkey": "5CK53ZBFErQHrsQMvryT3eqTAFqYNyWPPE5gPQD8aQUpcKCy",
+      "reg_block": 8515113
+    },
+    "27": {
+      "hotkey": "5CUrhdbDLk3XAhS58dryvao2L8xg3XFcAGg3tVQwZkvVeU4g",
+      "reg_block": 8515372
+    },
+    "31": {
+      "hotkey": "5HgYXitTT3auCv1Nkyb8nvpp1rjKhuduom4WiJhERt6ZwX4a",
+      "reg_block": 8515493
+    },
+    "246": {
+      "hotkey": "5FYjHJaAXffKegMhLKqz2u7UniMnmCxm5X88uBmvYwDwotr2",
+      "reg_block": 8515732
     }
   },
-  "pending": [],
+  "pending": [
+    {
+      "uid": 246,
+      "hotkey": "5FYjHJaAXffKegMhLKqz2u7UniMnmCxm5X88uBmvYwDwotr2",
+      "reg_block": 8515732,
+      "reg_ts": "2026-06-30T01:44:26.195770+00:00",
+      "detected_ts": 1782783971.539275,
+      "classify_after": 1782785001.8753057
+    }
+  ],
   "seeded": true
 }

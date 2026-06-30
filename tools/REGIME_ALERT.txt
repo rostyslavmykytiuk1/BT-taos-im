@@ -1,7 +1,7 @@
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-[SN-79 REGIME CHANGE] MIXED -> MAKER [WEAK] @ 2026-06-29 01:20:39
-  recommend: PureMakerAgent (post liquidity; favor books with taker flow / per-book MTR < 0.4 for rebate+spread)
-  edge: MAKER 1.19x the other (maker k0.0628 / taker k0.0527)
-  FEES @ MTR 0.459: maker +1.4bps  taker +0.9bps  (+=pay, -=rebate)
+[SN-79 REGIME CHANGE] MAKER -> MIXED [no-edge] @ 2026-06-30 01:39:59
+  recommend: no clear edge — hold current mix; AdaptiveRouter (routes per book) is the safe default
+  edge: MIXED 1.00x the other (maker k0.1248 / taker k0.1140)
+  FEES @ MTR 0.484: maker +2.9bps  taker -0.6bps  (+=pay, -=rebate)
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
