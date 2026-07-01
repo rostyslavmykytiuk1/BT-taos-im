@@ -20,16 +20,18 @@ WHY THIS SCORES (verified in taos/im/utils/kappa.py + validator.py + reward.py):
   * Realized PnL is FIFO net of BOTH fee legs and only recorded when a lot is CLOSED — so an unsold
     underwater lot is invisible to the score. We exploit exactly this.
 
-THE BINDING CONSTRAINT is the ACTIVITY FLOOR: every scored book needs >=1 closed RT within the rolling
-  600s sampling window or its activity factor (hence kappa) decays. We keep >=80 books closing RTs;
-  the genuine failure mode is a sustained correlated downtrend where bids never clear the margin — the
-  AGE-TRIGGERED bounded-loss release is the survival mechanism, and we stop accumulating as abandons rise.
+THE BINDING CONSTRAINT is BREADTH: keep >=~80 books each closing >=3 realized RTs per 3h (the kappa gate).
+  The activity factor is ~NEGLIGIBLE (validator decay ~0.01%/tick + a unit bug), so quiet losers are HELD
+  indefinitely, NOT force-traded for cadence. The genuine failure mode is a sustained correlated downtrend
+  where bids never clear the margin; the loss ladder below bounds it (never hold forever) and we stop
+  accumulating as abandons rise.
 
 PER-BOOK STEP (each respond):
-  noise/kappa upkeep -> (A) age-triggered bounded-loss release -> (B) activity backstop (force >=1 RT
-  before the 600s window lapses) -> (C) cadence taker-out (keep density when the resting ask isn't
-  filling) -> (D) resting MAKER reduce ask (primary, passive spread capture) + dip-biased accumulate bid.
-  A/B/C are terminal IOC actions (cancel_all + IOC + return); D is the steady two-sided resting state.
+  mid-EWMA/kappa upkeep -> (B0) 60bps catastrophe stop (past the revert window) -> (B) breadth-protection
+  backstop (bounded <=15bps, only when active breadth is at risk) -> (B2) 3300s hard max-hold (force-realize
+  the oldest lot; never-hold-forever) -> (C) cadence taker-out (density) -> (D1/D2) resting two-sided MAKER
+  reduce-ask + dip-biased accumulate bid. B0/B/B2/C are terminal IOC actions (cancel_all + IOC + return); D
+  is the steady two-sided resting state.
 
 FIFO inventory mirrors the validator's _match_trade_fifo EXACTLY (oldest-lot, net of both fees), so our
   predicted realized PnL equals the scored realized PnL. Zero leverage. Forked from StableMakerV2Agent;
@@ -49,7 +51,6 @@ from taos.im.agents import FinanceSimulationAgent
 from taos.im.protocol import FinanceAgentResponse, MarketSimulationStateUpdate
 from taos.im.protocol.events import TradeEvent
 from taos.im.protocol.models import (
-    LoanSettlementOption,
     OrderDirection,
     STP,
     TimeInForce,
@@ -70,19 +71,49 @@ GLOBAL_BASE_FRAC = 0.60           # hard ceiling on TOTAL base notional outstand
 MID_EWMA_ALPHA = 0.05             # per-book mid-EWMA weight (dip reference)
 
 # ---- realization (sell the FIFO-oldest lot only when net-positive past both fee legs) ----
-REALIZE_MARGIN_BPS = 3.0          # required NET margin (bps of notional) AFTER both fee legs. Small &
-                                   # positive: beats the weak templates' net-negative stream without
-                                   # over-raising (a high margin starves the activity floor). TUNABLE.
+REALIZE_MARGIN_BPS = 1.5          # required NET margin (bps of notional) AFTER both fee legs, measured at the
+                                   # WORST-CASE taker-out fill (best_bid less the IOC slippage). So this is the
+                                   # GUARANTEED floor on every cadence RT even in a thin book -> every realize
+                                   # is strictly positive (counts toward the >=3 nonzero gate, zero downside).
+                                   # Kept low to MAXIMIZE clean-positive DENSITY (the lever to beat uid56);
+                                   # expected fill ~best_bid nets ~MARGIN+slip. TUNABLE.
 REALIZE_TARGET_S = 120.0          # cadence backstop: if no RT closed in this long and a net-positive
                                    # taker-out exists, cross to keep RT DENSITY up (resting ask not filling).
-ACTIVITY_DEADLINE_S = 480.0       # HARD activity backstop (< the validator's 600s decay grace): force
-                                   # >=1 RT before the book's activity factor decays. Prefer profitable;
-                                   # else bounded-loss; else a tiny scratch; else let the book idle.
+REALIZE_MAX_LOTS = 2.0            # cap a single realize at this many lots -> fragments a big lot (e.g. a
+                                   # restart ghost-seed lot) into small realized entries (low kappa variance).
+TAKER_SIDE_MARGIN_BPS = 1.0      # hysteresis cushion for the PER-LEG taker-vs-maker execution choice
+                                 # (taker cheaper than maker on a leg iff spread < maker_fee - taker_fee).
+BACKSTOP_DEADLINE_S = 2700.0      # The activity factor is ~NEGLIGIBLE (validator decay ~0.01%/tick + a unit
+                                   # bug kills the acceleration), so we do NOT force losses for cadence. This
+                                   # is the latest a quiet book may ride before we *consider* a forced RT —
+                                   # set to the ~3-obs/3h kappa-gate cadence (KAPPA_RT_HISTORY_S/4=10800/4) so
+                                   # even a never-winning book keeps >=3 RTs/3h IF we must trade it. Losers are
+                                   # otherwise HELD indefinitely (pure warehouse, like uid56).
+BREADTH_RISK_MARGIN = 8           # only force a bounded loss-RT (to defend the >=80 active-book floor) when
+                                   # the live count of gate-clearing books < MIN_ACTIVE_BOOKS + this margin.
 
 # ---- stuck-lot handling (the downtrend survival mechanism) ----
 STUCK_HOLD_S = 180.0              # hold-for-revert window; past it an underwater oldest lot may be released
 MAX_STUCK_LOSS_BPS = 15.0        # AGE-triggered bounded-loss release cap to clear a FIFO lockup (kappa-safe)
-SCRATCH_LOSS_BPS = 4.0           # tiny bounded loss to keep a needed book active when nothing is profitable
+MK_STOP_BPS = 60.0               # BIG catastrophe stop-loss (the OTHER half of never-hold-forever): once a lot
+                                  # has cleared the sharp-dump-revert window (STUCK_HOLD_S) AND is still this far
+                                  # underwater at the MARKET, it's a genuine sustained adverse move (normal dip
+                                  # noise is <=~30bps), so force-realize -> the tail loss is bounded ~60bps, not
+                                  # the ~600bps a fast trender would reach by the time the max-hold cuts it.
+MK_MAX_HOLD_S = 3300.0           # HARD per-book max-hold (owner's PERMANENT never-hold-forever rule): past
+                                  # this the FIFO-oldest lot is force-realized REGARDLESS of breadth or loss
+                                  # magnitude. Set < lookback/3 (10800/3=3600) so a one-way-drift book still
+                                  # turns >=3 RTs/3h (breadth can't silently collapse), and bounds every hold
+                                  # (no position forever). Breaks the sustained-drift deadlock where a
+                                  # >15bps-underwater book had NO realize path. One/book/~MAX_HOLD, jitter-
+                                  # spread -> no cluster (a lone larger loss is cbrt+MAD damped).
+CUT_COOLDOWN_S = 600.0           # after a LOSS realize on a book, rate-limit: no further loss-cut (B0 stop /
+                                  # B- backstop) AND no re-accumulation on that book for this long. Stops the
+                                  # per-STEP flood where a deeply-underwater lot (e.g. an inherited ghost, or a
+                                  # downtrend re-accum churn) gets chunk-stoplossed every tick -> kappa-tanking
+                                  # loss cluster + over-trade. Holds the loser instead (warehouse thesis), which
+                                  # ALSO gives the market time to revert (-> sold as a WINNER). The hard max-hold
+                                  # (B2) is NOT cooldown-gated, so never-hold-forever still holds.
 TAKER_OUT_SLIPPAGE_BPS = 5.0     # IOC price concession so a taker-out crosses a FALLING book (else the stale
                                  # best_bid limit no longer crosses and the close silently expires)
 
@@ -106,7 +137,6 @@ KAPPA_TAU = 0.0
 KAPPA_MIN_OBS = 3
 KAPPA_MIN_LOOKBACK_S = 5400.0
 KAPPA_RT_HISTORY_S = 10_800.0
-RT_WINDOW_S = 570.0
 
 MAIN_VALIDATOR = "5EWwdZB7qCCMaAso5Mzcks4UUcPxKYvpAj32t5Mg1v6HSxoF"
 
@@ -124,11 +154,10 @@ class _BookState:
     rt_events: list[tuple[int, float]] = field(default_factory=list)
     kappa3: float | None = None
     vol_log: list[tuple[int, float]] = field(default_factory=list)
-    last_mid: float = 0.0
     mid_ewma: float = 0.0
-    noise_bps: float = 0.0
     abandoned: bool = False               # deeply-stuck book: stop quoting, let it idle (free budget)
     loss_streak: int = 0                  # consecutive loss-realizes without a positive RT (per-book guard)
+    last_cut_ns: int = 0                  # last LOSS realize on this book; rate-limits loss cuts + re-accum
 
 
 class WarehouseRealizerAgent(FinanceSimulationAgent):
@@ -150,14 +179,16 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         self.realize_margin_bps = REALIZE_MARGIN_BPS * (0.9 + 0.2 * jitter)
         self.accum_dip_bps = ACCUM_DIP_BPS * (0.9 + 0.2 * jitter)
         realize_target_s = REALIZE_TARGET_S * (0.9 + 0.2 * jitter)
-        activity_s = ACTIVITY_DEADLINE_S * (0.92 + 0.08 * jitter)
+        backstop_s = BACKSTOP_DEADLINE_S * (0.92 + 0.08 * jitter)
         stuck_hold_s = STUCK_HOLD_S * (0.9 + 0.2 * jitter)
+        max_hold_s = MK_MAX_HOLD_S * (0.92 + 0.08 * jitter)
+        self.cut_cooldown_ns = int(CUT_COOLDOWN_S * (0.9 + 0.2 * jitter) * _NS)
 
         self.quote_expiry_ns = int(QUOTE_EXPIRY_S * _NS)
         self.realize_target_ns = int(realize_target_s * _NS)
-        self.activity_deadline_ns = int(activity_s * _NS)
+        self.backstop_deadline_ns = int(backstop_s * _NS)
         self.stuck_hold_ns = int(stuck_hold_s * _NS)
-        self.rt_window_ns = int(RT_WINDOW_S * _NS)
+        self.max_hold_ns = int(max_hold_s * _NS)
         self.kappa_rt_history_ns = int(KAPPA_RT_HISTORY_S * _NS)
         self.kappa_min_lookback_ns = int(KAPPA_MIN_LOOKBACK_S * _NS)
 
@@ -166,13 +197,15 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         self._sim_id: dict[str, str] = {}
         self._step_ts_ns: dict[str, int] = {}
         self._active_validator: str | None = None
+        self._cap_remaining = float("inf")  # per-step base-cap budget, recomputed every respond() before use
 
         bt.logging.info(
             f"[WarehouseRealizer uid={self.uid}] WHR lot={QUOTE_LOT} accum_target={ACCUM_TARGET_LOTS}lots "
             f"global_base={GLOBAL_BASE_FRAC:.0%} dip={self.accum_dip_bps:.1f}bps "
             f"realize_margin={self.realize_margin_bps:.1f}bps(net) realize_target={realize_target_s:.0f}s "
-            f"activity={activity_s:.0f}s stuck_hold={stuck_hold_s:.0f}s "
-            f"stuck_cut<={MAX_STUCK_LOSS_BPS:.0f}bps scratch<={SCRATCH_LOSS_BPS:.0f}bps "
+            f"backstop={backstop_s:.0f}s(breadth-gated) stuck_hold={stuck_hold_s:.0f}s "
+            f"stuck_cut<={MAX_STUCK_LOSS_BPS:.0f}bps maxhold={max_hold_s:.0f}s stop={MK_STOP_BPS:.0f}bps "
+            f"cut_cooldown={self.cut_cooldown_ns/_NS:.0f}s "
             f"min_active={MIN_ACTIVE_BOOKS} edge_gate={'ON' if EDGE_GATE_ENABLED else 'OFF'} "
             f"leverage=0 rt_log={MAIN_VALIDATOR[:8]}"
         )
@@ -217,7 +250,6 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         cfg = self.simulation_config
         self._sync_precision(cfg.priceDecimals, cfg.volumeDecimals)
 
-        vol_dp = cfg.volumeDecimals
         volume_cap = CAPITAL_TURNOVER_CAP * cfg.miner_wealth * VOLUME_SAFETY
         now = state.timestamp
 
@@ -225,7 +257,16 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         gate_min_edge = self._compute_gate_min_edge(state)
         base_out = self._base_notional(validator)
         can_open_globally = base_out < GLOBAL_BASE_FRAC * cfg.miner_wealth
+        # running per-step base-cap budget: the DETERMINISTIC taker-buys could otherwise overshoot the global
+        # base cap within one correlated-dip step (the once-per-step can_open snapshot would be breached).
+        self._cap_remaining = GLOBAL_BASE_FRAC * cfg.miner_wealth - base_out
         abandoned_n = self._abandoned_count(validator)
+        # Breadth guard: count books currently clearing the >=3-obs kappa gate. We HOLD losers indefinitely
+        # (pure warehouse) UNLESS this active count is near the 80-floor — only then do we allow bounded
+        # loss-RTs to defend the cliff. (The activity factor is ~negligible, so cadence never forces a loss.)
+        active_count = sum(1 for s in self.books_state.get(validator, {}).values()
+                           if sum(1 for _, p in s.rt_events if p != 0.0) >= KAPPA_MIN_OBS)
+        breadth_at_risk = active_count < (MIN_ACTIVE_BOOKS + BREADTH_RISK_MARGIN)
         # kappa proxy is logging-only AND MAIN_VALIDATOR-only: build the dense RT timestamp axis ONCE per
         # step (not once per book) so each per-book refresh is O(E) not O(B*E) — avoids the axon timeout.
         main_v = (validator == MAIN_VALIDATOR)
@@ -237,8 +278,8 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
             if book is None or account is None:
                 continue
             try:
-                self._step_book(response, validator, book_id, book, account, vol_dp,
-                                volume_cap, now, gate_min_edge, can_open_globally, abandoned_n, main_v, rt_ts)
+                self._step_book(response, validator, book_id, book, account, volume_cap, now,
+                                gate_min_edge, can_open_globally, abandoned_n, main_v, rt_ts, breadth_at_risk)
             except Exception as ex:
                 bt.logging.warning(f"[WarehouseRealizer uid={self.uid}] step {book_id}: {ex}")
 
@@ -246,9 +287,9 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
 
     # ------------------------------------------------------------------ per-book
     def _step_book(
-        self, response, validator: str, book_id: int, book, account, vol_dp: int,
+        self, response, validator: str, book_id: int, book, account,
         volume_cap: float, now: int, gate_min_edge: float, can_open_globally: bool, abandoned_n: int,
-        main_v: bool, rt_ts: list[int] | None,
+        main_v: bool, rt_ts: list[int] | None, breadth_at_risk: bool,
     ) -> None:
         if not book.bids or not book.asks:
             return
@@ -264,15 +305,10 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         if first_seen:
             st.seen_ns = now
 
-        # per-book mid noise + EWMA upkeep
-        if st.last_mid > 0.0:
-            inst = abs(mid - st.last_mid) / st.last_mid * 1e4
-            st.noise_bps = (((1.0 - MID_EWMA_ALPHA) * st.noise_bps + MID_EWMA_ALPHA * inst)
-                            if st.noise_bps > 0.0 else inst)
-        st.last_mid = mid
+        # per-book mid-EWMA upkeep (the dip reference for accumulation)
         st.mid_ewma = mid if st.mid_ewma <= 0.0 else (1.0 - MID_EWMA_ALPHA) * st.mid_ewma + MID_EWMA_ALPHA * mid
-        self._prune_rt_events(st, now)           # bound memory on every validator
-        self._prune_vol_log(st, now)             # was only pruned via the (often-skipped) cadence branch
+        self._prune_rt_events(st, now)           # bound rt_events memory on every validator
+        self._prune_vol_log(st, now)             # bound vol_log memory (the volume-cap input)
         if main_v:
             self._refresh_book_kappa(validator, book_id, now, rt_ts)
 
@@ -294,44 +330,78 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         base_avail = self._avail(account.base_balance)
         activity_ref = st.last_rt_ns if st.last_rt_ns > 0 else st.seen_ns
 
-        # NOTE: Mode-B HARVEST (a fresh both-legs-taker RT on books where spread < 2*taker_rebate) is a
-        # DEFERRED enhancement (see DEVPLAN §12 / code-review #4) — it's the largest/riskiest path-adding
-        # change and is gated behind the kappa-replay dryrun. Until then, tight-spread/taker-rebate books are
-        # handled adequately by the taker-out paths below (which use the rebate and fire on a small +move).
+        # Execution side is chosen PER LEG below (see taker_side_good): taker in tight spreads (cheaper basis +
+        # certain fill), maker in wide spreads (spread capture). No separate "harvest mode".
         # ============================ EXIT LADDER (terminal IOC actions) ============================
         if long_qty >= self.exch_min and inv.longs:
             o_ts, o_qty, o_px, o_fee = inv.longs[0]
             age = now - o_ts
-            open_fee_bps = (o_fee / (o_qty * o_px) * 1e4) if (o_qty > 0 and o_px > 0) else maker_bps
-            # NET realized bps if we taker-out (cross to the bid) the oldest lot now:
-            taker_net = (best_bid - o_px) / o_px * 1e4 - open_fee_bps - taker_bps
-            loss_bps = (o_px - best_bid) / o_px * 1e4      # >0 when underwater vs the oldest lot
-            # Bundle a sub-exch_min FIFO-head stub with the next lot so it can't freeze the book; still
-            # ~one-lot (fragmented) on a normal oldest lot. (validator FIFO closes oldest-first regardless.)
-            sell_qty = round(min(long_qty, base_avail, max(o_qty, self.exch_min)), vdp)
+            # Bundle a sub-exch_min FIFO-head stub with the next lot so it can't freeze the book; cap at
+            # REALIZE_MAX_LOTS so a big (e.g. ghost) lot fragments. (validator FIFO closes oldest-first.)
+            sell_qty = round(min(long_qty, base_avail,
+                                 max(o_qty, self.exch_min), REALIZE_MAX_LOTS * self.quote_lot), vdp)
+            # CRITICAL: gate every realize on the AGGREGATE net across the WHOLE sell_qty span (NOT the oldest
+            # lot alone) — else a profitable head stub spilling into a higher-basis underwater lot would leak an
+            # UNGUARDED negative realize via the cadence/activity-positive paths (the negative-skew kappa-tank
+            # this agent exists to prevent). span_net mirrors _match_fifo across every lot the sell would touch.
+            # Gate every taker-out realize on the price the IOC ACTUALLY crosses at (best_bid less the IOC
+            # slippage concession), NOT the raw best_bid snapshot — else a thin top-of-book lets the fill slip
+            # below the snapshot so a "profit" (B+) or a <=15bps bounded-loss (B-/cadence) gate leaks an
+            # UNGUARDED or over-cap negative realize. close_rate biases to a + cost when the taker fee is
+            # unknown (None -> 0 would overstate net and leak a marginal loss through the winners-only gates).
+            close_rate = taker_fee if taker_fee is not None else 0.0004
+            # Round to the SAME tick _taker_out submits at, so the GATE price == the executed IOC fill floor:
+            # a sub-tick down-round then can't push a span_net>=0 "backstop+" realize negative.
+            sell_px_taker = self._taker_out_px(best_bid)
+            span_net = self._span_net_bps(inv, sell_qty, sell_px_taker, close_rate)   # REALIZABLE net (B/C)
+            loss_bps = max(0.0, -span_net)
+            span_net_mkt = self._span_net_bps(inv, sell_qty, best_bid, close_rate)    # true MARKET depth
 
-            # Deep-stuck: aged AND underwater beyond the bounded-loss cap -> STOP accumulating (hold the bag,
-            # let the book idle in the free budget); cleared on the next closing fill (_apply_fill).
-            st.abandoned = (age >= self.stuck_hold_ns and loss_bps > MAX_STUCK_LOSS_BPS)
+            # Deep-stuck: aged AND deeply underwater at the MARKET -> STOP accumulating (don't average down
+            # into a falling bag). The lot is HELD (unleveraged -> never liquidatable); idles in the free budget.
+            st.abandoned = (age >= self.stuck_hold_ns and max(0.0, -span_net_mkt) > MAX_STUCK_LOSS_BPS)
 
-            # (A) AGE-TRIGGERED BOUNDED-LOSS RELEASE — clear a FIFO lockup in a fall (the survival valve).
-            if (age >= self.stuck_hold_ns and loss_bps > 0.0 and loss_bps <= MAX_STUCK_LOSS_BPS
-                    and sell_qty >= self.exch_min and self._allow_loss_realize(st, now)):
-                self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "stuck", loss_bps)
+            # (B0) BIG CATASTROPHE STOP-LOSS — the magnitude half of never-hold-forever. Past the sharp-dump
+            #      revert window (stuck_hold), a lot still > MK_STOP_BPS underwater is a genuine sustained
+            #      adverse move (not normal dip noise) -> force-realize REGARDLESS of breadth so the tail loss
+            #      is bounded ~60bps instead of running to the max-hold's ~600bps. (B0/B2 together = the rule.)
+            if (age >= self.stuck_hold_ns and -span_net_mkt >= MK_STOP_BPS and sell_qty >= self.exch_min
+                    and (now - st.last_cut_ns) >= self.cut_cooldown_ns):
+                self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "stoploss", loss_bps)
                 return
 
-            # (B) ACTIVITY BACKSTOP — force >=1 RT before the 600s window lapses (keep the book scored).
-            if (now - activity_ref) >= self.activity_deadline_ns and sell_qty >= self.exch_min:
-                if taker_net >= 0.0:
-                    self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "activity+", 0.0)
+            # WAREHOUSE THESIS: NO early loss-cut on NORMAL (<60bps) dips — a small underwater lot is HELD to
+            # wait for the bounce (-> sold as a WINNER by C); kappa needs only ~3 RTs/3h so we have huge slack.
+            # Loss realizers are the breadth backstop (B), the hard max-hold (B2), and the catastrophe stop (B0
+            # above). This patience is the whole point of beating the warehouse competitor (uid56).
+
+            # (B) BREADTH-PROTECTION BACKSTOP — the activity factor is ~negligible, so we do NOT force losses
+            #     for cadence; losers are HELD indefinitely (pure warehouse, wait for the bounce). The ONLY
+            #     time we cut a loser is to defend the >=80 active-book floor: if breadth is AT RISK and this
+            #     book has gone quiet past the 3-obs-gate cadence, realize ONE RT to keep it scored — a profit
+            #     if available, else a small bounded (<=15bps, median-guarded) loss. Else the loser just rides.
+            if (breadth_at_risk and (now - activity_ref) >= self.backstop_deadline_ns
+                    and sell_qty >= self.exch_min):
+                if span_net >= 0.0:
+                    self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "backstop+", 0.0)
                     return
-                if loss_bps <= MAX_STUCK_LOSS_BPS and self._allow_loss_realize(st, now):
-                    self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "activity-", loss_bps)
+                if (0.0 < loss_bps <= MAX_STUCK_LOSS_BPS and self._allow_loss_realize(st, now)
+                        and (now - st.last_cut_ns) >= self.cut_cooldown_ns):
+                    self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "backstop-", loss_bps)
                     return
-                # else: nothing acceptable to realize -> let this book idle (counts toward the 48 free)
+
+            # (B2) HARD MAX-HOLD — the owner's PERMANENT never-hold-forever rule [feedback_never-hold-forever]:
+            #      once the FIFO-oldest lot has been held past MK_MAX_HOLD_S, force-realize it REGARDLESS of
+            #      breadth or loss magnitude. This is the ONLY realizer that fires for a >15bps-underwater book
+            #      (B caps at 15bps, C/D1 need a profit), so it breaks the sustained-drift deadlock, bounds
+            #      every hold, and (MAX_HOLD < lookback/3) guarantees >=3 RTs/3h so breadth can't silently
+            #      collapse in a one-way market. A lone larger loss here is cbrt+MAD damped; jitter de-syncs it.
+            if age >= self.max_hold_ns and sell_qty >= self.exch_min:
+                self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "maxhold", loss_bps)
+                return
 
             # (C) CADENCE TAKER-OUT — keep RT density up when the resting ask isn't getting lifted.
-            if (taker_net >= self.realize_margin_bps and sell_qty >= self.exch_min
+            if (span_net >= self.realize_margin_bps and sell_qty >= self.exch_min
                     and (now - st.last_rt_ns) >= self.realize_target_ns
                     and self._rolled_quote_volume(validator, book_id, now) < volume_cap):
                 self._taker_out(response, account, book_id, sell_qty, best_bid, st, now, "cadence", 0.0)
@@ -345,21 +415,36 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         if bid_inside >= ask_inside:
             bid_inside, ask_inside = round(best_bid, pdp), round(best_ask, pdp)
 
+        # PER-LEG execution choice (the unification that replaces "harvest mode"): taker is cheaper than maker
+        # on a leg exactly when the spread is tighter than the fee gap, because
+        #   taker_basis - maker_basis = spread - (maker_fee - taker_fee).
+        # So taker is the better execution iff spread < (maker_fee - taker_fee). Applied to BUY (D2) and
+        # SELL (D1 vs the taker-out) identically. The market can move while we hold; this is re-evaluated
+        # every step from the live per-book fees, regardless of how a lot was originally bought.
+        spread_bps = spread / mid * 1e4
+        taker_side_good = ((maker_bps - taker_bps) - spread_bps) > TAKER_SIDE_MARGIN_BPS
+
         desired: dict[int, tuple[float, float]] = {}
 
-        # (D1) PRIMARY REALIZE — a passive MAKER reduce ask on the oldest lot, priced so a fill nets >= margin.
-        #      Captures the spread when lifted; this is the income channel the winners run (100% maker).
-        if long_qty >= self.exch_min and inv.longs:
+        # (D1) SELL via the MAKER leg — in WIDE spreads, rest a passive reduce ask priced so a fill nets >=
+        #      margin (captures the spread; the winners' 100%-maker income channel). In TIGHT spreads
+        #      (taker_side_good) we SKIP the resting ask and sell via the exit-ladder TAKER-OUT instead
+        #      (cheaper + certain), so the sell leg picks its side symmetrically with the buy leg.
+        if (not taker_side_good) and long_qty >= self.exch_min and inv.longs:
             o_ts, o_qty, o_px, o_fee = inv.longs[0]
-            open_fee_bps = (o_fee / (o_qty * o_px) * 1e4) if (o_qty > 0 and o_px > 0) else maker_bps
-            min_ask = o_px * (1.0 + (open_fee_bps + maker_bps + self.realize_margin_bps) / 1e4)
+            q = round(min(long_qty, base_avail,
+                          max(o_qty, self.exch_min), REALIZE_MAX_LOTS * self.quote_lot), vdp)
+            # Price the ask so EVERY lot in the q-span nets >= margin when lifted (NOT just the oldest), so a
+            # multi-lot fill can't realize a loss on a higher-basis lot behind a stub (same span-leak guard).
+            min_ask = self._span_min_sell_px(inv, q, maker_bps, self.realize_margin_bps)
             sell_px = round(max(ask_inside, min_ask), pdp)
-            q = round(min(long_qty, base_avail, max(o_qty, self.exch_min)), vdp)
             if q >= self.exch_min and sell_px > 0:
                 desired[OrderDirection.SELL] = (sell_px, q)
 
         # (D2) ACCUMULATE / REPLENISH — passive dip-biased maker buy, up to the per-book target & global cap.
-        if not st.abandoned:
+        # Suppressed during the post-cut cooldown: don't re-buy a book we just loss-cut (breaks the downtrend
+        # buy->stoploss->rebuy churn; also lets a just-cut inherited ghost settle instead of re-accumulating).
+        if not st.abandoned and (now - st.last_cut_ns) >= self.cut_cooldown_ns:
             target_qty = ACCUM_TARGET_LOTS * self.quote_lot
             want_more = long_qty < target_qty - self._flat_eps
             seed = long_qty < ACCUM_MIN_LOTS * self.quote_lot - self._flat_eps
@@ -369,17 +454,44 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
                     and self._gate_ok(best_bid, best_ask, mid, maker_fee, gate_min_edge)):
                 q = round(self.quote_lot, vdp)
                 free_quote = account.quote_balance.free if account.quote_balance else 0.0
-                if q >= self.exch_min and free_quote >= q * bid_inside:
+                # Don't use the CERTAIN taker-fill to average DOWN into a falling book — there, fall back to
+                # the patient maker bid whose uncertain fill naturally THROTTLES accumulation into a fall (the
+                # brake the old probabilistic-bid design relied on). taker-buy only when flat or in-profit.
+                under_water = bool(inv.longs) and best_bid < inv.longs[0][2]
+                if (taker_side_good and not under_water and q >= self.exch_min
+                        and free_quote >= q * best_ask
+                        and q * best_ask <= self._cap_remaining
+                        and self._rolled_quote_volume(validator, book_id, now) < volume_cap):
+                    # TIGHT spread, not averaging into a loss -> BUY via taker (cheaper basis + certain fill).
+                    self._submit_limit(response, book_id, OrderDirection.BUY, q, round(best_ask, pdp),
+                                       ioc=True, post_only=False)
+                    self._cap_remaining -= q * best_ask       # reserve within this step's base budget
+                elif (q >= self.exch_min and free_quote >= q * bid_inside
+                        and self._rolled_quote_volume(validator, book_id, now) < volume_cap):
+                    # WIDE spread OR tight-but-underwater -> patient MAKER bid (uncertain fill = throttle).
+                    # NOT reserved against _cap_remaining: the maker bid's fill is UNCERTAIN, and reserving it
+                    # against the shared per-step budget starved high-book-id books near the cap (the ascending
+                    # book loop let low-ids eat the budget first -> breadth skew + per-step cancel churn). The
+                    # 0.60 ceiling is held by the can_open_globally snapshot + the next-step base_out recompute;
+                    # only the DETERMINISTIC same-step taker-buy leg reserves. Volume-gated like the taker leg.
                     desired[OrderDirection.BUY] = (bid_inside, q)
 
         self._reconcile_quotes(response, account, book_id, desired)
 
     # ------------------------------------------------------------------ taker-out helper (terminal)
+    def _taker_out_px(self, best_bid: float) -> float:
+        """The exact price a taker-out IOC crosses at (best_bid less the slippage concession, rounded to the
+        tick). SINGLE source of truth: the realize GATE (span_net at this px) and the submitted order MUST
+        use the identical value for FIFO-parity — the gated net then equals the worst-case executed net."""
+        return round(best_bid * (1.0 - TAKER_OUT_SLIPPAGE_BPS / 1e4), self._price_decimals)
+
     def _taker_out(self, response, account, book_id: int, qty: float, bid_px: float,
                    st: _BookState, now: int, reason: str, loss_bps: float) -> None:
         """Cross to the bid (IOC) to close one oldest FIFO lot. Cancel resting orders first so the IOC and a
         stale resting ask can't both fire. onTrade records the realized RT (updates last_rt_ns / kappa)."""
-        px = round(bid_px * (1.0 - TAKER_OUT_SLIPPAGE_BPS / 1e4), self._price_decimals)
+        px = self._taker_out_px(bid_px)
+        if loss_bps > 0.0:
+            st.last_cut_ns = now       # start the per-book cooldown (rate-limits loss cuts + re-accumulation)
         self._cancel_all(response, account, book_id)
         self._submit_limit(response, book_id, OrderDirection.SELL, qty, px, ioc=True, post_only=False)
         bt.logging.info(
@@ -387,18 +499,62 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
             f"reason={reason} loss_bps={loss_bps:.1f} streak={st.loss_streak}"
         )
 
+    def _span_net_bps(self, inv: _Inv, qty: float, sell_px: float, close_rate: float | None) -> float:
+        """Aggregate NET realized (bps of filled notional) for selling `qty` at `sell_px` across the FIFO lots
+        it would span, net of each lot's open fee and the close fee at `close_rate` (signed: + cost, - rebate).
+        Mirrors _match_fifo's accounting EXACTLY (same full/partial close-fee branches) WITHOUT mutating, so
+        the gate equals the SCORED realized. Gating realizes on this (not the oldest lot alone) stops a
+        profitable head stub from leaking a loss on a higher-basis lot behind it."""
+        if qty <= self._flat_eps or sell_px <= 0:
+            return 0.0
+        fee = qty * sell_px * (close_rate or 0.0)      # the trade's total close fee (mirrors the event fee)
+        qinv = 1.0 / qty
+        remaining = qty
+        gross = open_fees = close_fees = filled = 0.0
+        for o_ts, o_qty, o_px, o_fee in inv.longs:
+            if remaining <= self._flat_eps:
+                break
+            take = min(o_qty, remaining)
+            gross += (sell_px - o_px) * take
+            if o_qty <= remaining + self._flat_eps:    # FULL close — mirror _match_fifo exactly
+                close_fees += fee * o_qty * qinv
+                open_fees += o_fee
+            else:                                       # PARTIAL close
+                close_fees += fee
+                open_fees += o_fee * (take / o_qty)
+            filled += take
+            remaining -= take
+        if filled <= self._flat_eps:
+            return 0.0
+        return (gross - open_fees - close_fees) / (filled * sell_px) * 1e4
+
+    def _span_min_sell_px(self, inv: _Inv, qty: float, close_bps: float, margin_bps: float) -> float:
+        """Lowest ask at which selling `qty` nets >= margin on EVERY spanned FIFO lot (so a multi-lot fill can't
+        realize a loss on a higher-basis lot) = max over spanned lots of lot_px*(1+(open_fee+close+margin))."""
+        remaining = qty
+        px = 0.0
+        for o_ts, o_qty, o_px, o_fee in inv.longs:
+            if remaining <= self._flat_eps:
+                break
+            ofb = (o_fee / (o_qty * o_px) * 1e4) if (o_qty > 0 and o_px > 0) else close_bps
+            px = max(px, o_px * (1.0 + (ofb + close_bps + margin_bps) / 1e4))
+            remaining -= min(o_qty, remaining)
+        return px
+
     def _allow_loss_realize(self, st: _BookState, now: int) -> bool:
-        """Median-positive guard: only realize a (bounded) loss if the book's recent realized stream is still
-        net-positive (or has no history yet) and it isn't already on a fresh loss streak. Protects the
-        per-book kappa from a CLUSTER of losses on one chronically-falling book (the real -0.0156 failure
-        mode). The streak DECAYS once the book has been quiet so the downtrend survival valve can re-arm."""
-        if st.last_rt_ns > 0 and (now - st.last_rt_ns) >= self.activity_deadline_ns:
-            st.loss_streak = 0
+        """Cluster guard for the bounded-loss backstop — the real defense against the -0.0156 "many losses on
+        one falling book" failure. Realize a forced loss ONLY if (a) the book hasn't already taken 3
+        consecutive losses with no intervening winner, AND (b) its recent realized stream is still
+        median-positive. loss_streak is a TRUE consecutive-loss counter (reset on a winner / incremented on a
+        loss in _apply_fill) — do NOT decay it on a timer here: the old decay keyed on backstop_deadline_ns,
+        the SAME predicate that arms the backstop, so the >=3 guard could never trip (dead code). A
+        thin-history book (<3 obs) is NOT yet gate-clearing, so a forced loss only SEEDS a negative without
+        defending breadth -> hold it (return False); it earns its first obs from WINNERS, not manufactured losses."""
         if st.loss_streak >= 3:
             return False
         pnls = [p for _, p in st.rt_events]
         if len(pnls) < KAPPA_MIN_OBS:
-            return True
+            return False
         return self._median(pnls) > 0.0
 
     # ------------------------------------------------------------------ breadth gate (reused)
@@ -461,11 +617,16 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
             if side == OrderDirection.BUY:
                 self._submit_limit(response, book_id, OrderDirection.BUY, qty, px, post_only=True)
             else:
-                short_sale = self._avail(account.base_balance) < qty
-                self._submit_limit(
-                    response, book_id, OrderDirection.SELL, qty, px, post_only=True,
-                    settlement=self._loan_settlement(account) if short_sale else LoanSettlementOption.NONE,
-                )
+                # LONG-ONLY / ZERO-LEVERAGE: never rest a sell for more base than we own -> a reduce-ask can
+                # NEVER open a short (the whole never-liquidatable warehouse thesis). Clamp to held base and
+                # drop the inherited loan-settled short_sale path entirely.
+                owned = self._avail(account.base_balance)
+                # FLOOR (not round) to the vol tick so the clamp can't creep a half-ULP ABOVE owned and rest a
+                # marginally-short reduce-ask: int() truncates toward zero -> sell_qty <= min(qty, owned) always.
+                scale = 10 ** self._volume_decimals
+                sell_qty = int(min(qty, owned) * scale) / scale
+                if sell_qty >= self.exch_min:
+                    self._submit_limit(response, book_id, OrderDirection.SELL, sell_qty, px, post_only=True)
 
     # ------------------------------------------------------------------ events (reused)
     def onTrade(self, event: TradeEvent, validator: str | None = None) -> None:
@@ -483,6 +644,11 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         else:
             return
         ts_ns = int(event.timestamp) if event.timestamp else self._step_ts_ns.get(validator, 0)
+        if ts_ns <= 0:
+            # No usable timestamp (event before the first step, both event.timestamp and _step_ts_ns unset):
+            # skip rather than stamp a lot with ts=0, which would make age = now-0 huge and instantly trip the
+            # B0/B2 age cuts. The ghost-seed reconciles any resulting FIFO/exchange gap on the book's first step.
+            return
         self._record_trade_volume(validator, event.bookId, event.quantity, event.price, ts_ns)
         self._apply_fill(validator, event.bookId, is_buy, event.quantity, event.price, fee, ts_ns)
 
@@ -510,10 +676,6 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
     @staticmethod
     def _long_qty(inv: _Inv) -> float:
         return sum(q for _, q, _, _ in inv.longs)
-
-    @staticmethod
-    def _short_qty(inv: _Inv) -> float:
-        return sum(q for _, q, _, _ in inv.shorts)
 
     @staticmethod
     def _avail(balance) -> float:
@@ -570,12 +732,14 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
 
     def _match_fifo(self, inv: _Inv, is_buy: bool, qty: float, price: float, fee: float,
                     ts: int) -> tuple[float, float, int | None, float]:
+        if qty <= 0:                                 # degenerate fill: nothing to match (silent fee=0 would
+            return 0.0, 0.0, None, 0.0               # under-charge and break parity) -> no-op, loudly nothing.
         close_book = inv.shorts if is_buy else inv.longs
         open_book = inv.longs if is_buy else inv.shorts
         realized = gross = rtv = 0.0
         remaining = qty
         matched_ts: int | None = None
-        qinv = 1.0 / qty if qty > 0 else 0.0
+        qinv = 1.0 / qty
 
         while remaining > self._flat_eps and close_book:
             o_ts, o_qty, o_px, o_fee = close_book[0]
@@ -601,11 +765,9 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         return realized, rtv, matched_ts, gross
 
     # ------------------------------------------------------------------ kappa-3 proxy (logging only, reused)
-    def _prune_rt_events(self, st: _BookState, now: int) -> bool:
+    def _prune_rt_events(self, st: _BookState, now: int) -> None:
         cutoff = now - self.kappa_rt_history_ns
-        before = len(st.rt_events)
         st.rt_events = [(t, p) for t, p in st.rt_events if t >= cutoff]
-        return len(st.rt_events) != before
 
     def _record_rt_close(self, validator: str, book_id: int, ts: int, net_pnl: float) -> None:
         # append only; the kappa proxy is refreshed once per step in _step_book (logging-only, MAIN_VALIDATOR)
@@ -623,9 +785,7 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         return sorted(ts_set)
 
     def _book_pnl_series(self, validator: str, book_id: int, now: int,
-                         timestamps: list[int] | None = None) -> list[float]:
-        if timestamps is None:
-            timestamps = self._global_rt_timestamps(validator, now)
+                         timestamps: list[int]) -> list[float]:
         if not timestamps:
             return []
         cutoff = now - self.kappa_rt_history_ns
@@ -662,10 +822,8 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
 
     def _refresh_book_kappa(self, validator: str, book_id: int, now: int,
                             timestamps: list[int] | None = None) -> None:
-        if validator != MAIN_VALIDATOR:
-            return
         st = self._bstate(validator, book_id)
-        if timestamps is None:
+        if timestamps is None:                       # direct callers (e.g. the dryrun) may not pre-build it
             timestamps = self._global_rt_timestamps(validator, now)
         if len(timestamps) < 2 or timestamps[-1] - timestamps[0] < self.kappa_min_lookback_ns:
             st.kappa3 = None
@@ -673,11 +831,6 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
         st.kappa3 = self._kappa3_raw(self._book_pnl_series(validator, book_id, now, timestamps))
 
     # ------------------------------------------------------------------ helpers (reused)
-    @staticmethod
-    def _loan_settlement(account) -> LoanSettlementOption:
-        quote_loan = getattr(account, "quote_loan", 0.0) or 0.0
-        return LoanSettlementOption.FIFO if quote_loan > 0 else LoanSettlementOption.NONE
-
     def _maker_fee_rate(self, account) -> float | None:
         fees = getattr(account, "fees", None)
         rate = getattr(fees, "maker_fee_rate", None) if fees is not None else None
@@ -699,8 +852,8 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
             response.cancel_orders(book_id, [o.id for o in account.orders])
 
     def _submit_limit(self, response, book_id: int, direction: int, qty: float, price: float,
-                      *, post_only: bool = True, ioc: bool = False,
-                      settlement: LoanSettlementOption = LoanSettlementOption.NONE) -> None:
+                      *, post_only: bool = True, ioc: bool = False) -> None:
+        # long-only warehouse: no loan/short settlement -> orders are always default (NONE) settlement.
         kwargs: dict[str, Any] = {
             "book_id": book_id, "direction": direction, "quantity": qty,
             "price": price, "stp": STP.CANCEL_OLDEST,
@@ -711,8 +864,6 @@ class WarehouseRealizerAgent(FinanceSimulationAgent):
             kwargs["postOnly"] = post_only
             kwargs["timeInForce"] = TimeInForce.GTT
             kwargs["expiryPeriod"] = self.quote_expiry_ns
-        if settlement != LoanSettlementOption.NONE:
-            kwargs["settlement_option"] = settlement
         response.limit_order(**kwargs)
 
 

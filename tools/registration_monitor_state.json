@@ -53,8 +53,8 @@
       "reg_block": 8499076
     },
     "109": {
-      "hotkey": "5FPF2QTF5ET1eLLjbBS2WBJK66FeydGSHTKFN8ktQ59ibXhL",
-      "reg_block": 8503752
+      "hotkey": "5CkVdBKTqX3sRZpSa6AgRBwy2LF58XeN1KuN5DFHHybsrzF2",
+      "reg_block": 8518832
     },
     "120": {
       "hotkey": "5CaG86J1WLfUgP8d2BHFSgN9AvUNChDX6YYvnKBrWMLPJuHa",
@@ -69,8 +69,8 @@
       "reg_block": 8512365
     },
     "158": {
-      "hotkey": "5C5CJkv8R5PbVELSUXHEpj62wWMF4xeFsCv4PNKnrY6DD4ze",
-      "reg_block": 8508194
+      "hotkey": "5DenA1Wmc7zJrcCnrL2e3KJqJjmMTnGedxtLXasF11MxzWZL",
+      "reg_block": 8524152
     },
     "181": {
       "hotkey": "5FvN3q8GrH5rSxW6uRPtsMBmicvBVjV45snvKRiHEoSPVviM",
@@ -93,8 +93,8 @@
       "reg_block": 8511645
     },
     "219": {
-      "hotkey": "5FhXxjeLW4FAGRJhsCGK3cXPViNAkgaZ3po3dFyA6r1BH5P4",
-      "reg_block": 8508435
+      "hotkey": "5EP7jVqecZ3bBNsCJvqU8XfCC4538r6bdbuftgAaFtkkPhPq",
+      "reg_block": 8523432
     },
     "228": {
       "hotkey": "5HgxLGwN4VMeswwdfPLg5GWagCDRLT3r8LyEXq1EJ9dt1SYg",
@@ -117,8 +117,8 @@
       "reg_block": 8500276
     },
     "254": {
-      "hotkey": "5F9MxxrQrBpJm45JKUdaEoqixc1NfUctshomURZeriMF3DsE",
-      "reg_block": 8517630
+      "hotkey": "5Gxhwjtgq3h6bZz1wdUQpmMWidnQgXyS9hbNk3F8vbocqGSP",
+      "reg_block": 8524985
     },
     "255": {
       "hotkey": "5E2ZCJwUMPbjCDD4eXiNbqHimMrwbtTxzPgueRwQvQp9eD8X",
@@ -177,8 +177,8 @@
       "reg_block": 8514753
     },
     "190": {
-      "hotkey": "5HEAZv4gZ6gsJsWaQrrEBogQcvVZ44vQBrhziWwCBAV3HxGX",
-      "reg_block": 8514872
+      "hotkey": "5DhW3ngQUEqmnmqMhDX38kw9gMaejkAjDyFUzi2zpj971HmB",
+      "reg_block": 8522160
     },
     "51": {
       "hotkey": "5C5nkTnDg1HeB2ob96xvFsNmsjX73XXPL8RB1p68wtZR57BN",
@@ -229,8 +229,8 @@
       "reg_block": 8517391
     },
     "69": {
-      "hotkey": "5HVuaC3giHjvLvUZ5pEpt5njNf4kW9fneTKrc12QFHJ1hjJB",
-      "reg_block": 8517871
+      "hotkey": "5FvoXntNurdZZkwKnvaBMk1sfcbDoQJhNnCnyUXL3td7peyW",
+      "reg_block": 8525106
     },
     "119": {
       "hotkey": "5DL9NkU7tVCHbxLj44wc2gxckL2tKNh4rjk8JFPYyJZTRri1",
@@ -243,16 +243,80 @@
     "82": {
       "hotkey": "5CtNc8v2XhPW1i7zN2qnpvm9Z9hkWDwgrAm9PhoZtMBHHGPz",
       "reg_block": 8518590
+    },
+    "188": {
+      "hotkey": "5FcWxv3PhquaP4EtuVLoBGNSQVKa5DpDSJGCQxfKDeZdb3ju",
+      "reg_block": 8519368
+    },
+    "80": {
+      "hotkey": "5GEVtGFgkxTRXnWTE9SnbXE5D61fEjmrKvnxWdfQcZST8HZt",
+      "reg_block": 8519607
+    },
+    "47": {
+      "hotkey": "5DDQkqHHU8wzAAyPdwJcpjLmLuVyDbKzRQqfd7yUa42vFuYq",
+      "reg_block": 8519728
+    },
+    "200": {
+      "hotkey": "5ECdmiUYfpLahmECy8swj2ECC1nZDNuCXfcRDMvVU3W6ExeG",
+      "reg_block": 8520686
+    },
+    "240": {
+      "hotkey": "5DcNKTp8TntQ1SRxBWSjU3j5HnfjikoteUuj194JGKqLhriU",
+      "reg_block": 8520960
+    },
+    "137": {
+      "hotkey": "5G69eyCEBxS4tYkg1AK7udPM9vqweNiCeEyaUteXKttpQZH2",
+      "reg_block": 8521079
+    },
+    "55": {
+      "hotkey": "5CDdadk5ppNvKAtgBew8T4uyMhjePVsw7ozRGwaZzCMqXGLc",
+      "reg_block": 8521799
+    },
+    "128": {
+      "hotkey": "5G4mBmux3Xz6HgLP8ZhsH5JmKKgVUovkmeJjZux32CmTg1VZ",
+      "reg_block": 8521920
+    },
+    "148": {
+      "hotkey": "5HEAZv4gZ6gsJsWaQrrEBogQcvVZ44vQBrhziWwCBAV3HxGX",
+      "reg_block": 8522726
+    },
+    "206": {
+      "hotkey": "5Fudx1k5b8toiD2QQLdYdYd8CSZYToFBKsc43rx6BgNaRZhE",
+      "reg_block": 8522966
+    },
+    "114": {
+      "hotkey": "5D4mQaZ8hahKh67fJomTv59HU4XAbjZPBvJ4DDoJpoqvyYZJ",
+      "reg_block": 8523085
+    },
+    "209": {
+      "hotkey": "5FjqbeRXpzRyjT31KnK28Y4nmyryfkkG5zn4UB3Yp1fEcQm8",
+      "reg_block": 8523310
+    },
+    "147": {
+      "hotkey": "5EKu5wfhTrg341xTxrJzfTmSECWNF5B68jS9FnAW2UyaxW1n",
+      "reg_block": 8524271
+    },
+    "21": {
+      "hotkey": "5DAEM85azbK3WQAhmDcjz3wXdDYLHmtGCTpZcM7m21Pb4f61",
+      "reg_block": 8524745
     }
   },
   "pending": [
     {
-      "uid": 82,
-      "hotkey": "5CtNc8v2XhPW1i7zN2qnpvm9Z9hkWDwgrAm9PhoZtMBHHGPz",
-      "reg_block": 8518590,
-      "reg_ts": "2026-06-30T11:16:16.887493+00:00",
-      "detected_ts": 1782818306.639396,
-      "classify_after": 1782819387.1995437
+      "uid": 254,
+      "hotkey": "5Gxhwjtgq3h6bZz1wdUQpmMWidnQgXyS9hbNk3F8vbocqGSP",
+      "reg_block": 8524985,
+      "reg_ts": "2026-07-01T08:35:53.541644+00:00",
+      "detected_ts": 1782895011.0584397,
+      "classify_after": 1782896645.6280074
+    },
+    {
+      "uid": 69,
+      "hotkey": "5FvoXntNurdZZkwKnvaBMk1sfcbDoQJhNnCnyUXL3td7peyW",
+      "reg_block": 8525106,
+      "reg_ts": "2026-07-01T09:00:13.702258+00:00",
+      "detected_ts": 1782896495.6280074,
+      "classify_after": 1782896795.6280074
     }
   ],
   "seeded": true
